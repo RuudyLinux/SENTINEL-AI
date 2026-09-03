@@ -1,0 +1,24 @@
+# Backend
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/sentinel.db
+backend/server.log
+backend/install.log
+backend/uploads/
+backend/evidence_store/
+backend/*.pt
+*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/dev.log
+frontend/next-env.d.ts
+frontend/AGENTS.md
+frontend/CLAUDE.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+frontend/tsconfig.tsbuildinfo
