@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -132,11 +133,23 @@ async def _on_shutdown():
     # the rest, nor propagate out of shutdown and fail whatever caller is
     # waiting on it — same defensive stance worker.py already takes
     # everywhere else around per-camera cleanup.
+    # Audit finding: stop_worker() only requests cancellation via
+    # task.cancel() — the task's own `finally: source.release()` only runs
+    # once it's next scheduled, which isn't guaranteed before uvicorn tears
+    # down the event loop unless this actually awaits it. Collected here
+    # (rather than trusting return_exceptions elsewhere) so a shutdown
+    # deterministically waits for every camera's real cleanup, not just the
+    # cancellation request.
+    pending_tasks = []
     for camera_id in list(RUNNING.keys()):
         try:
-            stop_worker(camera_id)
+            task = stop_worker(camera_id)
+            if task is not None:
+                pending_tasks.append(task)
         except Exception:
             logger.exception("shutdown: stop_worker failed for camera %s, continuing", camera_id)
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 @app.get("/api/health")

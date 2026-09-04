@@ -162,3 +162,45 @@ def test_anpr_watchlist_snapshot_path_unchanged_evidence_not_duplicated(monkeypa
     assert len(alerts) == 1
     evidence_rows = db_session.query(models.Evidence).filter(models.Evidence.alert_id == alerts[0].id).all()
     assert len(evidence_rows) == 1  # exactly one — no duplication
+
+
+def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_session):
+    """Final-demo-readiness-phase finding, discovered via live browser
+    verification: a real CRITICAL watchlist-match Evidence row (created by
+    rules_engine.evaluate's own incident_evidence, NOT worker.py's
+    backfill block below it) showed "Alert: —" in the UI — that code path
+    never set alert_id/detection_id/event_type/source_timestamp, unlike the
+    identical Evidence model's OTHER real creation site (worker.py's
+    backfill), which does. Matched to that existing shape."""
+    from app.pipeline import rules_engine
+
+    camera = models.Camera(
+        camera_code=f"C-EVIDENCE-CRITICAL-{uuid.uuid4().hex[:8]}", name="Critical Evidence Test Cam",
+        source_type="mock_vms", source_uri="", status="online",
+    )
+    db_session.add(camera)
+    db_session.flush()
+    vehicle = models.Vehicle(plate_text="GJ01ZZ9999", watchlist_flag=True)
+    db_session.add(vehicle)
+    db_session.flush()
+    detection = models.Detection(
+        camera_id=camera.id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4],
+        snapshot_path="/tmp/fake-real-snapshot.jpg",
+    )
+    db_session.add(detection)
+    db_session.commit()
+
+    rules_engine._last_alert_at.clear()
+    alerts = asyncio.run(rules_engine.evaluate(db_session, camera, detection, 640, 480, vehicle))
+    assert len(alerts) == 1
+    assert alerts[0].severity == "CRITICAL"
+
+    incident = db_session.query(models.Incident).filter(models.Incident.alert_id == alerts[0].id).first()
+    assert incident is not None
+    evidence = db_session.query(models.Evidence).filter(models.Evidence.incident_id == incident.id).first()
+    assert evidence is not None
+    assert evidence.alert_id == alerts[0].id  # the missing field
+    assert evidence.detection_id == detection.id
+    assert evidence.event_type == "watchlist_match"
+    assert evidence.camera_id == camera.id
+    assert evidence.file_path == "/tmp/fake-real-snapshot.jpg"

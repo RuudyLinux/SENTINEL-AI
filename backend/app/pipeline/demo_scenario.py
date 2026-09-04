@@ -40,17 +40,47 @@ from ..audit import log_action
 from .correlate import upsert_vehicle_for_plate, get_route
 from .rules_engine import evaluate
 from .anpr import passes_anpr_gate
+from .db_retry import safe_commit, safe_flush
 from . import worker, clips
 
 DEMO_MODEL_VERSION = "demo-fixture"
 
 
-def _save_demo_snapshot(camera_id: str, camera_code: str) -> str | None:
+DEMO_FRAME_WAIT_TIMEOUT_S = 3.0  # bounded — see _wait_for_live_frame
+
+
+async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -> bytes | None:
+    """A camera worker started moments ago (POST /demo/reset now starts the
+    two demo cameras — see routers/system.py) needs a brief real interval to
+    open uploads/car-detection.mp4 and decode its first frame before
+    worker.LATEST_FRAMES has anything in it. Polls briefly rather than
+    either fabricating a frame or giving up instantly — bounded, so a
+    genuinely non-running camera still returns None (honest "no frame")
+    within a few seconds, never hangs.
+
+    `timeout_s` reads the module-level DEMO_FRAME_WAIT_TIMEOUT_S at CALL
+    time (not as a function-signature default, which would bind at import
+    time) specifically so tests can `monkeypatch.setattr(demo_scenario,
+    "DEMO_FRAME_WAIT_TIMEOUT_S", ...)` and have it actually take effect."""
+    if timeout_s is None:
+        timeout_s = DEMO_FRAME_WAIT_TIMEOUT_S
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        frame = worker.LATEST_FRAMES.get(camera_id)
+        if frame:
+            return frame
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(0.1)
+
+
+async def _save_demo_snapshot(camera_id: str, camera_code: str) -> str | None:
     """Saves the camera's current real MJPEG frame as evidence, if the
     camera is actually running. Returns None (no fake snapshot) if not —
     the caller then simply has no snapshot for this sighting, same as the
     live pipeline when nothing has decoded yet."""
-    jpeg_bytes = worker.LATEST_FRAMES.get(camera_id)
+    jpeg_bytes = await _wait_for_live_frame(camera_id)
     if not jpeg_bytes:
         return None
     fname = f"{camera_code}_demo_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
@@ -87,22 +117,52 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
     results = []
     for camera_code, ts, sighting_confidence in (("C-014", t0, 0.85), ("C-019", t0 + timedelta(minutes=4), 0.90)):
         camera = by_code[camera_code]
-        snapshot_path = _save_demo_snapshot(camera.id, camera.camera_code)
+        snapshot_path = await _save_demo_snapshot(camera.id, camera.camera_code)
         det = models.Detection(
             camera_id=camera.id, cls="car", confidence=0.91, bbox=[10, 10, 200, 150],
             timestamp=ts, source_timestamp=ts, model_version=DEMO_MODEL_VERSION,
             snapshot_path=snapshot_path,
         )
         db.add(det)
-        db.flush()
-        vehicle = upsert_vehicle_for_plate(db, plate, sighting_confidence)
-        db.add(models.Plate(
+        # Root-cause fix (found live): this and the commit below were bare
+        # db.flush()/db.commit() calls, unguarded against SQLite lock
+        # contention — the exact bug class PR #1 fixed in worker.py, just
+        # never applied here. Caught in practice: triggering the demo
+        # scenario while the two demo cameras' real workers were actively
+        # writing (heartbeats, frame processing) produced a genuine
+        # unhandled 500. Same bounded retry contract as the rest of the
+        # pipeline now applies here too.
+        await safe_flush(db, "demo_scenario", reapply=lambda _det=det: db.add(_det))
+        vehicle = await upsert_vehicle_for_plate(db, plate, sighting_confidence)
+        plate_row = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera.id, detection_id=det.id,
             plate_text_raw=plate, plate_text_normalized=plate,
             confidence=sighting_confidence, timestamp=ts,
             snapshot_path=snapshot_path,
-        ))
-        db.commit()
+        )
+        db.add(plate_row)
+
+        vehicle_target_last_seen = vehicle.last_seen
+        vehicle_target_confidence = vehicle.plate_confidence
+
+        def _reapply_plate_commit(_det=det, _plate_row=plate_row, _vehicle=vehicle):
+            # `det` and `plate_row` are freshly db.add()'d (never committed
+            # before this point in the loop) — a rollback only detaches
+            # them, so re-add() alone restores them. `vehicle` may instead
+            # be a pre-existing PERSISTENT row whose last_seen/
+            # plate_confidence were only FLUSHED (not committed) by
+            # upsert_vehicle_for_plate just above — a rollback here expires
+            # those back to their last-committed value, so they're
+            # explicitly reassigned from the locals captured right after
+            # that call, never by re-reading vehicle.* (same reasoning as
+            # worker.py's identical reapply pattern).
+            db.add(_det)
+            db.add(_plate_row)
+            db.add(_vehicle)
+            _vehicle.last_seen = vehicle_target_last_seen
+            _vehicle.plate_confidence = vehicle_target_confidence
+
+        await safe_commit(db, "demo_scenario", reapply=_reapply_plate_commit)
         alerts = await evaluate(db, camera, det, 640, 480, vehicle)
         for alert in alerts:
             incident = db.query(models.Incident).filter(models.Incident.alert_id == alert.id).first()

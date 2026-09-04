@@ -91,13 +91,21 @@ def _self_heal_camera_id(camera_code: str) -> str | None:
     return None
 
 
-async def _db_self_heal_on_result(camera_code: str, op_name: str):
+def _db_self_heal_on_result(camera_code: str, op_name: str):
     """Builds the `on_result` hook passed to safe_commit/safe_flush —
     records a Self-Heal event ONLY when a lock actually happened (the
     overwhelming common case is a clean first-try write, which would be
     pure noise to log every time). See self_heal/engine.py's module
     docstring for why this observes rather than re-implements db_retry.py's
-    real retry logic."""
+    real retry logic.
+
+    Final-review audit finding: this used to be declared `async def` purely
+    to build and return a plain closure (it performs no `await` itself),
+    forcing an unnecessary coroutine creation + await on EVERY commit/flush
+    across every running camera — a real hot path this same PR's own
+    concurrency work targets. Now a plain sync function; the returned
+    closure itself is still `async def` (it genuinely awaits
+    self_heal.record_event) and is `await`ed normally by db_retry.py."""
     async def _on_result(attempt: int, max_attempts: int, success: bool, was_lock: bool, duration_s: float):
         if not was_lock:
             return
@@ -116,12 +124,12 @@ async def _safe_commit(db: Session, camera_code: str, reapply=None) -> bool:
     module for the full rationale (retry-with-reapply on a transient SQLite
     lock, verified empirically; no retry without `reapply`, to avoid a
     retry-with-nothing-pending silently reporting success on a lost write)."""
-    return await safe_commit(db, f"camera {camera_code}", reapply=reapply, on_result=await _db_self_heal_on_result(camera_code, "commit"))
+    return await safe_commit(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "commit"))
 
 
 async def _safe_flush(db: Session, camera_code: str, reapply=None) -> bool:
     """Same as _safe_commit above, for db.flush() — see db_retry.safe_flush."""
-    return await safe_flush(db, f"camera {camera_code}", reapply=reapply, on_result=await _db_self_heal_on_result(camera_code, "flush"))
+    return await safe_flush(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "flush"))
 
 
 async def _open_with_timeout(source: "CameraSource", camera_id: str | None = None) -> bool:
@@ -325,7 +333,7 @@ async def _process_frame(
                 if passes_anpr_gate(normalized, conf):
                     snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
                     det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
-                    vehicle = upsert_vehicle_for_plate(db, normalized, conf)
+                    vehicle = await upsert_vehicle_for_plate(db, normalized, conf)
                     plate_row = models.Plate(
                         vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
                         plate_text_raw=raw, plate_text_normalized=normalized,
@@ -726,7 +734,19 @@ def start_worker(camera_id: str) -> None:
     RUNNING[camera_id] = asyncio.create_task(_camera_loop_supervised(camera_id))
 
 
-def stop_worker(camera_id: str) -> None:
+def stop_worker(camera_id: str) -> "asyncio.Task[None] | None":
+    """Cancels the camera's task and releases its per-camera resources.
+
+    Returns the cancelled task (or None if it wasn't running) so a caller
+    that needs a DETERMINISTIC guarantee that cleanup actually finished —
+    e.g. process shutdown — can `await asyncio.gather(...)` on it.
+    `task.cancel()` alone only *requests* cancellation; the task's own
+    `finally: source.release()` (see _camera_loop) only runs once the task
+    is next scheduled, which never happens on its own if nothing yields
+    control back to it before the event loop is torn down (audit finding:
+    confirmed neither the previous _on_shutdown nor stop_supervisor actually
+    awaited this, so a shutdown racing the ASGI server's own teardown could
+    leave a camera's asyncio task/cv2.VideoCapture orphaned)."""
     task = RUNNING.pop(camera_id, None)
     if task:
         task.cancel()
@@ -743,3 +763,4 @@ def stop_worker(camera_id: str) -> None:
     # actually knows the operator asked to stop.
     if camera_id in CAMERA_STATS:
         _set_grid_state(camera_id, "DISCONNECTED")
+    return task

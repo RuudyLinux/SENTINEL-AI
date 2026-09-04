@@ -24,6 +24,15 @@ class _FakeTask:
     def cancel(self) -> None:
         self._done = True
 
+    def __await__(self):
+        # Final-review audit finding: stop_worker() now returns the task it
+        # cancelled so callers (stop_supervisor/_on_shutdown) can genuinely
+        # await its cleanup via asyncio.gather — this fake must therefore be
+        # awaitable too, or gather() itself raises TypeError. A real
+        # asyncio.Task's cancellation eventually completes; this immediately
+        # resolves, standing in for "already finished" for this test's purposes.
+        return iter(())
+
 
 @pytest.fixture(autouse=True)
 def _clean_supervisor_state(monkeypatch):
@@ -168,7 +177,16 @@ def test_stop_supervisor_cleans_up_while_a_sweep_is_mid_stagger(monkeypatch):
 
     started, stopped = [], []
     monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: (started.append(cid), worker.RUNNING.__setitem__(cid, _FakeTask(done=False))))
-    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: (stopped.append(cid), worker.RUNNING.pop(cid, None)))
+
+    def _fake_stop_worker(cid):
+        # Real stop_worker() returns the cancelled task (or None) so a
+        # caller can await its cleanup — mirror that contract here rather
+        # than the old side-effect-tuple stand-in, which broke
+        # stop_supervisor's new asyncio.gather(*tasks) with a plain tuple.
+        stopped.append(cid)
+        return worker.RUNNING.pop(cid, None)
+
+    monkeypatch.setattr(supervisor.worker, "stop_worker", _fake_stop_worker)
 
     async def _run():
         supervisor.start_supervisor()
@@ -382,3 +400,63 @@ def test_discover_and_register_skips_network_call_when_not_configured(monkeypatc
 
     asyncio.run(supervisor.discover_and_register())
     assert called == []
+
+
+# --- restart() — real fix for the PR #1 review finding: a Sentinel Grid ---
+# camera restarted via raw stop_worker/start_worker silently dropped out of
+# the 24/7 auto-reconnect supervisor (never in AUTO_MANAGED, and if the
+# operator had ever disconnected it, still stuck in OPERATOR_DISCONNECTED
+# forever). These prove the REAL state transition, not just that the code
+# runs — the exact concern this fix and Part 2's audit both raised.
+
+def test_restart_on_sentinel_grid_camera_rejoins_auto_managed_and_clears_operator_disconnected(monkeypatch, db_session):
+    cam = _grid_camera(db_session)
+    started, stopped = [], []
+    monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: (started.append(cid), worker.RUNNING.__setitem__(cid, _FakeTask(done=False))))
+    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: (stopped.append(cid), worker.RUNNING.pop(cid, None))[1])
+
+    # Simulates the realistic precondition: the operator had explicitly
+    # disconnected this camera at some point before the restart.
+    supervisor.OPERATOR_DISCONNECTED.add(cam.id)
+    supervisor.AUTO_MANAGED.discard(cam.id)
+
+    supervisor.restart(cam.id, cam.source_type)
+
+    # The real invariant under test: restart must leave the camera in
+    # EXACTLY the state a fresh Connect would — eligible for the 24/7
+    # auto-reconnect sweep going forward — not merely "worker restarted".
+    assert cam.id not in supervisor.OPERATOR_DISCONNECTED
+    assert cam.id in supervisor.AUTO_MANAGED
+    assert stopped == [cam.id]  # old worker actually stopped first...
+    assert started == [cam.id]  # ...before the new one was started (not skipped by start_worker's dedup guard)
+
+
+def test_restart_on_sentinel_grid_camera_that_was_never_disconnected_still_ends_auto_managed(monkeypatch, db_session):
+    """Same fix, the more common real path: a grid camera that was already
+    running gets an operator Restart (not a reconnect-after-disconnect) —
+    must still end up AUTO_MANAGED afterward, same as any other Connect."""
+    cam = _grid_camera(db_session)
+    monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: worker.RUNNING.__setitem__(cid, _FakeTask(done=False)))
+    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: worker.RUNNING.pop(cid, None))
+    supervisor.AUTO_MANAGED.add(cam.id)  # already running/managed, the common case
+
+    supervisor.restart(cam.id, cam.source_type)
+
+    assert cam.id in supervisor.AUTO_MANAGED
+    assert cam.id not in supervisor.OPERATOR_DISCONNECTED
+
+
+def test_restart_on_a_non_grid_camera_never_touches_supervisor_bookkeeping(monkeypatch, db_session):
+    """Regression safety: a plain webcam/video_file camera's restart must
+    behave exactly as before this fix — no AUTO_MANAGED/OPERATOR_DISCONNECTED
+    side effects, since supervisor.py only ever manages sentinel_grid rows."""
+    started, stopped = [], []
+    monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
+    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: stopped.append(cid))
+
+    supervisor.restart("cam_plain_video_file", "video_file")
+
+    assert started == ["cam_plain_video_file"]
+    assert stopped == ["cam_plain_video_file"]
+    assert "cam_plain_video_file" not in supervisor.AUTO_MANAGED
+    assert "cam_plain_video_file" not in supervisor.OPERATOR_DISCONNECTED

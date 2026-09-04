@@ -13,15 +13,35 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from .appearance import similarity
+from .db_retry import safe_flush
 
 
-def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidence: float) -> models.Vehicle:
+async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidence: float) -> models.Vehicle:
+    """Final-demo-readiness-phase finding: this function's own `db.flush()`
+    was unguarded against SQLite lock contention — the same root-cause class
+    PR #1 fixed in worker.py's detection insert, just in a different, shared
+    call site (both worker.py's real live pipeline AND demo_scenario.py call
+    this). Caught live: a real concurrent-camera-write lock here surfaced as
+    an unhandled 500 from the demo-scenario endpoint. Now retried with the
+    same bounded rollback -> reapply -> backoff contract as every other
+    write in the pipeline (db_retry.safe_flush)."""
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == normalized_plate).first()
     now = datetime.utcnow()
     if vehicle:
-        vehicle.last_seen = now
-        if confidence > vehicle.plate_confidence:
-            vehicle.plate_confidence = confidence
+        target_last_seen = now
+        target_confidence = max(confidence, vehicle.plate_confidence)
+        vehicle.last_seen = target_last_seen
+        vehicle.plate_confidence = target_confidence
+
+        def reapply():
+            # `vehicle` is already PERSISTENT here — a rollback expires its
+            # mutated attributes back to their last-committed value, so
+            # reapply must reassign from these captured locals, never from
+            # re-reading vehicle.* (same reasoning as db_retry.py's module
+            # docstring / worker.py's own reapply callbacks).
+            db.add(vehicle)
+            vehicle.last_seen = target_last_seen
+            vehicle.plate_confidence = target_confidence
     else:
         watchlisted = db.query(models.WatchlistEntry).filter(
             models.WatchlistEntry.entity_type == "plate",
@@ -36,7 +56,14 @@ def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidence: flo
             watchlist_flag=bool(watchlisted),
         )
         db.add(vehicle)
-    db.flush()
+
+        def reapply():
+            # `vehicle` is still TRANSIENT (never committed) — rollback only
+            # detaches it; its already-set attributes (including the
+            # client-generated PK) survive, so re-add() alone restores it.
+            db.add(vehicle)
+
+    await safe_flush(db, "upsert_vehicle_for_plate", reapply=reapply)
     return vehicle
 
 

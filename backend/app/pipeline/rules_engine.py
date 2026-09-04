@@ -194,11 +194,23 @@ async def evaluate(
         db.add(incident)
         db.flush()
         if detection.snapshot_path:
+            # Final-demo-readiness-phase finding: this Evidence row omitted
+            # alert_id/detection_id/event_type/source_timestamp — fields
+            # worker.py's OWN evidence-backfill block (the other real path
+            # that creates an Evidence row) already sets for the identical
+            # model. Found live: a real CRITICAL watchlist-match evidence
+            # record showed "Alert: —" in the UI despite a real alert
+            # having triggered it. Matched to worker.py's shape, not
+            # inventing new fields.
             incident_evidence = models.Evidence(
                 incident_id=incident.id,
                 evidence_type="snapshot",
                 camera_id=camera.id,
                 file_path=detection.snapshot_path,
+                alert_id=alert.id,
+                detection_id=detection.id,
+                event_type="watchlist_match" if vehicle else "zone_entry",
+                source_timestamp=detection.source_timestamp,
                 verification_status="unverified",
             )
             db.add(incident_evidence)

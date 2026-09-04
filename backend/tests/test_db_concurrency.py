@@ -26,6 +26,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app import models
 from app.pipeline.db_retry import safe_commit, safe_flush
+from app.pipeline.correlate import upsert_vehicle_for_plate
 
 
 def _make_short_timeout_engine(db_path: str):
@@ -271,3 +272,54 @@ def test_safe_flush_without_reapply_fails_fast_rather_than_retrying():
 
     assert ok is False
     assert elapsed < 1.0
+
+
+def test_upsert_vehicle_for_plate_retries_through_a_real_sqlite_lock():
+    """Final-demo-readiness-phase regression test: found live — triggering
+    the demo scenario while the two demo cameras' real workers were writing
+    concurrently produced a genuine unhandled 500 from this function's own
+    unguarded `db.flush()`. Shared by BOTH the real live pipeline
+    (worker.py) and demo_scenario.py — fixing it here covers both callers.
+    Same real-second-connection-holds-a-real-lock harness as the tests
+    above, for the NEW-vehicle path (inserts a fresh, never-before-committed
+    Vehicle row)."""
+    tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
+    db_path = os.path.join(tmp_dir, "vehicle_lock_test.db").replace("\\", "/")
+
+    engine = _make_short_timeout_engine(db_path)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+    db = Session()
+    lock_hold_seconds = 0.6
+
+    def _hold_lock():
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE IF NOT EXISTS _lock_probe (id INTEGER)")
+        conn.execute("INSERT INTO _lock_probe (id) VALUES (1)")
+        time.sleep(lock_hold_seconds)
+        conn.commit()
+        conn.close()
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    time.sleep(0.15)
+
+    try:
+        vehicle = asyncio.run(upsert_vehicle_for_plate(db, "GJ01LOCKTEST", 0.9))
+        assert vehicle is not None
+        vehicle_id = vehicle.id
+        db.commit()
+    finally:
+        holder.join()
+        db.close()
+
+    verify_db = Session()
+    try:
+        reloaded = verify_db.query(models.Vehicle).filter(models.Vehicle.id == vehicle_id).first()
+        assert reloaded is not None  # durably persisted despite the real lock
+        assert reloaded.plate_text == "GJ01LOCKTEST"
+    finally:
+        verify_db.close()
+    engine.dispose()
