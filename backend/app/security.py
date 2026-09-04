@@ -64,3 +64,32 @@ def require_roles(*allowed_roles: str):
             raise HTTPException(status_code=403, detail=f"Role '{role_name}' not permitted for this action")
         return user
     return dependency
+
+
+# --- Resource tokens (P0-E) ---------------------------------------------
+# Short-lived, scoped-to-one-resource signed tokens for the handful of
+# endpoints browsers hit via plain <img src>/<a href> navigation, which
+# can't attach an Authorization: Bearer header. The client fetches a token
+# via a normal authenticated (RBAC-checked) request first, then appends it
+# as `?token=` on the actual file/stream URL. Reuses the same JWT secret —
+# no new dependency, no server-side session state.
+
+def create_resource_token(resource: str, resource_id: str, user: models.User, ttl_seconds: int) -> str:
+    expire = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    payload = {"sub": user.id, "scope": f"{resource}:{resource_id}", "exp": expire}
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def get_user_from_resource_token(resource: str, resource_id: str, token: str, db: Session) -> models.User:
+    credentials_exc = HTTPException(status_code=401, detail="Invalid or expired resource token")
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        raise credentials_exc
+    if payload.get("scope") != f"{resource}:{resource_id}":
+        raise credentials_exc
+    user_id = payload.get("sub")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None or not user.active:
+        raise credentials_exc
+    return user

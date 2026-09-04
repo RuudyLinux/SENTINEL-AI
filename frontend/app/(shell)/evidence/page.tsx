@@ -7,11 +7,13 @@ import ErrorState from "@/components/ErrorState";
 export default function EvidenceLibraryPage() {
   const router = useRouter();
   const { data: evidence, error, reload } = useApiData<any[]>("/api/evidence");
+  const { data: camerasData } = useApiData<any[]>("/api/cameras");
+  const cameras = camerasData || [];
 
   const columns: Column<any>[] = [
     { key: "id", label: "Evidence ID" },
     { key: "evidence_type", label: "Type" },
-    { key: "camera_id", label: "Source Camera", render: (e) => e.camera_id || "—" },
+    { key: "camera_id", label: "Source Camera", render: (e) => e.camera_id ? (cameras.find((c) => c.id === e.camera_id)?.camera_code || e.camera_id) : "—" },
     { key: "incident_id", label: "Case", render: (e) => e.incident_id || "—" },
     { key: "verification_status", label: "Status" },
     { key: "created_at", label: "Captured", render: (e) => new Date(e.created_at).toLocaleString() },

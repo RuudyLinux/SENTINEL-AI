@@ -1,6 +1,6 @@
 """Pydantic request/response schemas."""
 from datetime import datetime
-from typing import Optional, List, Any
+from typing import Optional, List
 from pydantic import BaseModel
 
 
@@ -52,11 +52,27 @@ class CameraCreate(BaseModel):
     location: str = ""
     lat: float = 0.0
     lng: float = 0.0
-    source_type: str  # webcam | video_file | rtsp
+    source_type: str  # webcam | video_file | rtsp | mock_vms | onvif (interface stub — see pipeline/adapters.py)
     source_uri: str  # "0" for webcam index, filename for video_file, url for rtsp
     ai_person: bool = True
     ai_vehicle: bool = True
     ai_anpr: bool = True
+    camera_group: str = ""  # free-form grouping/tag, e.g. "North Zone" — client-side filterable
+
+
+class CameraUpdate(BaseModel):
+    """PATCH payload — every field optional, only fields actually present in the
+    request are applied (see routers/cameras.py `model_dump(exclude_unset=True)`).
+    Deliberately excludes source_type/source_uri: changing a camera's source is a
+    reconnect operation (stop/re-add), not an in-place edit."""
+    name: Optional[str] = None
+    location: Optional[str] = None
+    camera_group: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    ai_person: Optional[bool] = None
+    ai_vehicle: Optional[bool] = None
+    ai_anpr: Optional[bool] = None
 
 
 class CameraOut(BaseModel):
@@ -76,7 +92,22 @@ class CameraOut(BaseModel):
     ai_person: bool
     ai_vehicle: bool
     ai_anpr: bool
+    camera_group: str = ""
     last_frame_at: Optional[datetime] = None
+    # Catalogue linkage — informational only. Deliberately no `source_uri`
+    # here: the RTSP URL may carry embedded credentials and must never reach
+    # the frontend/logs (see P0-E from Phase 1 and pipeline/catalog.py).
+    external_catalog_id: Optional[str] = None
+    catalog_codec: str = ""
+    catalog_live_status: str = ""
+    catalog_synced_at: Optional[datetime] = None
+    catalog_stale: bool = False
+    # Unlike source_uri, these ARE meant for the client — WHEP is for a
+    # browser preview player, HLS for dashboard/mobile/restricted-network
+    # fallback (per the official spec). Neither is required; both stay
+    # null when the catalogue didn't supply one.
+    whep_url: Optional[str] = None
+    hls_url: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -85,7 +116,8 @@ class CameraOut(BaseModel):
 class DetectionOut(BaseModel):
     id: str
     camera_id: str
-    timestamp: datetime
+    timestamp: datetime  # PROCESSING time
+    source_timestamp: Optional[datetime] = None  # SOURCE time — see models.Detection
     cls: str
     confidence: float
     bbox: List[float]
@@ -103,6 +135,7 @@ class PlateOut(BaseModel):
     plate_text_normalized: str
     confidence: float
     timestamp: datetime
+    source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
 
     class Config:
@@ -170,6 +203,7 @@ class ZoneCreate(BaseModel):
     y2: float = 1.0
     schedule_start: str = "00:00"
     schedule_end: str = "23:59"
+    loitering_seconds: Optional[float] = None  # None = no loitering check on this zone
 
 
 class ZoneOut(ZoneCreate):
@@ -182,7 +216,7 @@ class ZoneOut(ZoneCreate):
 
 class AlertRuleCreate(BaseModel):
     name: str
-    rule_type: str  # watchlist_plate | zone_entry
+    rule_type: str  # watchlist_plate | zone_entry | loitering
     zone_id: Optional[str] = None
     priority: str = "HIGH"
 
@@ -205,6 +239,7 @@ class AlertOut(BaseModel):
     confidence: float
     reasons: List[str]
     timestamp: datetime
+    source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
 
     class Config:
@@ -254,6 +289,10 @@ class EvidenceOut(BaseModel):
     sha256: Optional[str] = None
     verification_status: str
     created_at: datetime
+    alert_id: Optional[str] = None
+    detection_id: Optional[str] = None
+    event_type: str = ""
+    source_timestamp: Optional[datetime] = None
 
     class Config:
         from_attributes = True

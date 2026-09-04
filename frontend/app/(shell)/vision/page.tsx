@@ -1,5 +1,6 @@
 "use client";
 import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useApiData } from "@/lib/useApiData";
 import DataTable, { Column } from "@/components/DataTable";
 import KpiCard from "@/components/KpiCard";
@@ -8,6 +9,7 @@ import ErrorState from "@/components/ErrorState";
 const CLASSES = ["all", "person", "car", "truck", "bus", "motorbike"];
 
 export default function AiVisionPage() {
+  const router = useRouter();
   const [cls, setCls] = useState("all");
   const { data: cams } = useApiData<any[]>("/api/cameras");
   const cameras = useMemo(() => Object.fromEntries((cams || []).map((c) => [c.id, c])), [cams]);
@@ -25,6 +27,18 @@ export default function AiVisionPage() {
     { key: "cls", label: "Class" },
     { key: "track_id", label: "Track ID", render: (d) => d.track_id ?? "—" },
     { key: "confidence", label: "Confidence", render: (d) => `${(d.confidence * 100).toFixed(0)}%` },
+    {
+      key: "actions", label: "",
+      render: (d) =>
+        d.cls === "person" ? (
+          <button
+            onClick={(e) => { e.stopPropagation(); router.push(`/persons/tracking?detection_id=${d.id}`); }}
+            className="text-xs text-accent hover:underline"
+          >
+            Find similar
+          </button>
+        ) : null,
+    },
   ];
 
   return (

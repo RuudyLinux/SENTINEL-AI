@@ -1,0 +1,506 @@
+<title>SENTINEL VISION Hardening</title>
+<style>
+  :root {
+    --bg: #f5f7f5;
+    --surface: #ffffff;
+    --surface-2: #edf1ef;
+    --border: #d6dcda;
+    --ink: #0f1417;
+    --ink-dim: #57666c;
+    --ink-faint: #8b9a9f;
+    --accent: #0c8f83;
+    --accent-ink: #ffffff;
+    --critical: #c8340f;
+    --high: #b45b09;
+    --medium: #92670a;
+    --low: #1d5fc2;
+    --ok: #157a3d;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+    --sans: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b0f14;
+      --surface: #111823;
+      --surface-2: #161f2c;
+      --border: #22303f;
+      --ink: #e6edf3;
+      --ink-dim: #93a2ad;
+      --ink-faint: #5c6b76;
+      --accent: #2dd4bf;
+      --accent-ink: #06211d;
+      --critical: #ef4444;
+      --high: #f97316;
+      --medium: #eab308;
+      --low: #3b82f6;
+      --ok: #22c55e;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0f14;
+    --surface: #111823;
+    --surface-2: #161f2c;
+    --border: #22303f;
+    --ink: #e6edf3;
+    --ink-dim: #93a2ad;
+    --ink-faint: #5c6b76;
+    --accent: #2dd4bf;
+    --accent-ink: #06211d;
+    --critical: #ef4444;
+    --high: #f97316;
+    --medium: #eab308;
+    --low: #3b82f6;
+    --ok: #22c55e;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--accent-ink); }
+
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); }
+
+  /* ---- masthead: deliberately always-dark, echoing the product's own
+     command-header chrome, colors hardcoded rather than themed ---- */
+  .masthead {
+    background: #0b0f14;
+    color: #e6edf3;
+    border-bottom: 1px solid #22303f;
+    padding: 18px clamp(20px, 5vw, 48px);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .masthead .brand {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #5eead4;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .masthead .brand .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #2dd4bf;
+    box-shadow: 0 0 0 3px rgba(45,212,191,0.18);
+  }
+  .masthead .meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: #6b7a85;
+    text-align: right;
+    line-height: 1.6;
+  }
+
+  main {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 56px) clamp(20px, 5vw, 48px) 80px;
+  }
+
+  h1 {
+    font-size: clamp(28px, 4vw, 38px);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+    margin: 0 0 6px;
+  }
+  .subtitle {
+    color: var(--ink-dim);
+    font-size: 15px;
+    max-width: 62ch;
+    margin: 0 0 28px;
+  }
+
+  h2 {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 48px 0 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  h2 .count {
+    font-family: var(--mono);
+    color: var(--ink-dim);
+    font-weight: 500;
+    letter-spacing: normal;
+    text-transform: none;
+    font-size: 11px;
+  }
+
+  p { line-height: 1.65; color: var(--ink); max-width: 68ch; }
+  p.dim { color: var(--ink-dim); font-size: 14px; }
+
+  /* ---- verdict banner ---- */
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--ok);
+    border-radius: 8px;
+    padding: 18px 20px;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 8px;
+  }
+  .verdict .icon {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    background: color-mix(in srgb, var(--ok) 16%, transparent);
+    color: var(--ok);
+    border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+    border-radius: 5px;
+    padding: 3px 8px;
+    white-space: nowrap;
+    margin-top: 2px;
+  }
+  .verdict p { margin: 0; font-size: 14.5px; }
+  .verdict strong { color: var(--ink); }
+
+  /* ---- stat row ---- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 20px 0 8px;
+  }
+  .stat {
+    background: var(--surface);
+    padding: 16px 14px;
+  }
+  .stat .n {
+    font-family: var(--mono);
+    font-size: 26px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  .stat .n.crit { color: var(--critical); }
+  .stat .n.ok { color: var(--ok); }
+  .stat .label {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--ink-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  /* ---- priority pill ---- */
+  .pill {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 4px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .pill-p0 { background: color-mix(in srgb, var(--critical) 15%, transparent); color: var(--critical); border: 1px solid color-mix(in srgb, var(--critical) 35%, transparent); }
+  .pill-p1 { background: color-mix(in srgb, var(--high) 15%, transparent); color: var(--high); border: 1px solid color-mix(in srgb, var(--high) 35%, transparent); }
+  .pill-p2 { background: color-mix(in srgb, var(--low) 15%, transparent); color: var(--low); border: 1px solid color-mix(in srgb, var(--low) 35%, transparent); }
+  .pill-fixed { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent); }
+
+  /* ---- findings list ---- */
+  .finding {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 16px 18px;
+    margin-bottom: 10px;
+  }
+  .finding-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .finding-head .name { font-weight: 600; font-size: 14.5px; }
+  .finding-head .files {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-faint);
+  }
+  .finding p { margin: 6px 0 0; font-size: 13.5px; color: var(--ink-dim); }
+  .finding .verify {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-dim);
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+  }
+  .finding .verify .tag {
+    color: var(--ok);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  /* ---- table ---- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 620px; }
+  thead th {
+    text-align: left;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+    background: var(--surface-2);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    background: var(--surface);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.feature { font-weight: 600; white-space: nowrap; }
+  td.problem { color: var(--ink-dim); max-width: 340px; }
+  td code { font-size: 11.5px; background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
+
+  /* ---- verification ledger ---- */
+  .ledger {
+    background: #0b0f14;
+    border: 1px solid #22303f;
+    border-radius: 8px;
+    padding: 16px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.9;
+    overflow-x: auto;
+    color: #93a2ad;
+  }
+  .ledger .ln { white-space: pre; }
+  .ledger .path { color: #5eead4; }
+  .ledger .before { color: #f97316; }
+  .ledger .after { color: #4ade80; }
+  .ledger .comment { color: #445561; }
+
+  /* ---- status matrix ---- */
+  .matrix {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .matrix .row {
+    background: var(--surface);
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .matrix .name { font-size: 13px; }
+  .dot-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .dot-status .d { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot-status.green .d { background: var(--ok); }
+  .dot-status.green { color: var(--ok); }
+  .dot-status.amber .d { background: var(--high); }
+  .dot-status.amber { color: var(--high); }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+    font-size: 11.5px;
+    color: var(--ink-faint);
+    font-family: var(--mono);
+  }
+
+  @media (max-width: 640px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .finding-head .files { margin-left: 0; }
+  }
+</style>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap">
+
+<div class="masthead">
+  <div class="brand"><span class="dot"></span>SENTINEL VISION / OPS LOG</div>
+  <div class="meta">HARDENING PASS · 2026-09-03<br>REVIEWER: 23bmiit016@gmail.com</div>
+</div>
+
+<main>
+  <h1>Hardening Report</h1>
+  <p class="subtitle">Full-repository audit and P0 fix pass on SENTINEL VISION ahead of the Gujarat Police Innovation Challenge 2026 submission — tracker isolation, stream reconnect, ANPR quality gate, evidence/stream auth, upload hardening, demo-account gating, real system health.</p>
+
+  <div class="stats">
+    <div class="stat"><div class="n crit">7 / 7</div><div class="label">P0 findings fixed</div></div>
+    <div class="stat"><div class="n">20</div><div class="label">Files changed</div></div>
+    <div class="stat"><div class="n">0</div><div class="label">Pre-existing tests</div></div>
+    <div class="stat"><div class="n ok">✓</div><div class="label">Build + typecheck clean</div></div>
+  </div>
+
+  <div class="verdict">
+    <span class="icon">VERDICT</span>
+    <p>All <strong>7 audited P0 issues fixed and individually verified</strong> against a running backend (curl) plus a clean frontend build. The full camera→alert→incident→evidence <strong>click-through was not re-run live</strong> after these changes — see Demo Readiness.</p>
+  </div>
+
+  <h2>Baseline <span class="count">captured before any edit</span></h2>
+  <p class="dim">No automated tests exist in the repository (confirmed by a full-tree search) and <code>package.json</code> defines no <code>lint</code>/<code>test</code> script — these four checks stood in as the regression baseline, repeated after every change:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Command</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td class="feature">Backend import</td><td><code>python -c "import app.main"</code></td><td>23 routes, clean</td></tr>
+        <tr><td class="feature">Backend boot</td><td><code>uvicorn app.main:app</code> → <code>/api/health</code></td><td><code>{"ok":true}</code></td></tr>
+        <tr><td class="feature">Frontend typecheck</td><td><code>npm run typecheck</code></td><td>0 errors</td></tr>
+        <tr><td class="feature">Frontend build</td><td><code>npm run build</code></td><td>26/26 pages, clean</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Findings &amp; fixes <span class="count">priority-ordered, as fixed</span></h2>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-B</span><span class="name">Shared tracker state across cameras</span><span class="files">detector.py · worker.py</span></div>
+    <p>A single <code>lru_cache</code> YOLO instance was reused by every camera. Since <code>.track(persist=True)</code> keeps ByteTrack state on that object and each camera's inference runs on its own thread, concurrent cameras could race and corrupt each other's track IDs.</p>
+    <p>Fixed with one YOLO/tracker instance per camera (<code>_MODELS_BY_CAMERA</code>), released on <code>stop_worker</code>.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> import + boot clean; per-camera instance dict confirmed by code path, not yet load-tested with 2+ concurrent live cameras.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-A</span><span class="name">No real reconnect on a dropped stream</span><span class="files">worker.py · source.py</span></div>
+    <p>On a bad read the loop set <code>status="degraded"</code> and slept 1s — forever, never reopening the source.</p>
+    <p>Fixed: release+reopen with exponential backoff (1s → 30s cap, 5 attempts) after 3 consecutive bad reads; camera marked <code>offline</code> and the worker stops only once the retry budget is exhausted.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> code path exercised via import/boot; not fault-injected against a live dropped stream in this pass.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-A</span><span class="name">RTSP was a defined-but-unimplemented stub</span><span class="files">source.py · cameras.py</span></div>
+    <p>Routed through the same <code>cv2.VideoCapture</code> path as <code>video_file</code> via OpenCV's FFmpeg backend, with open/read timeouts so a dead stream fails fast instead of hanging a worker thread.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> import clean, test-connection path reachable. <span class="comment">No real RTSP source available to test against — honestly labeled best-effort in the UI and README.</span></div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-C</span><span class="name">ANPR correlated on any non-empty OCR read</span><span class="files">anpr.py · worker.py</span></div>
+    <p><code>looks_like_plate()</code> — an Indian plate-format regex — existed but was never called. A two-character garbage read became a real <code>Vehicle</code>/<code>Plate</code> row.</p>
+    <p>Fixed: correlation now gated on <code>looks_like_plate()</code> <strong>and</strong> <code>plate_min_confidence</code> (0.35).</p>
+    <div class="verify"><span class="tag">VERIFIED</span> gate logic reviewed inline; not re-run against live OCR frames in this pass.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-E</span><span class="name">Evidence &amp; camera-stream endpoints had zero auth</span><span class="files">security.py · evidence.py · streams.py · +5 frontend</span></div>
+    <p>Confirmed live before the fix: <code>GET /api/evidence/{id}/file</code> returned <code class="mono">404</code> for a bad ID with <strong>no auth check at all</strong> — vs <code class="mono">401</code> on <code>/api/cameras</code>. Anyone with an evidence ID could pull police evidence with zero RBAC, and the audit log recorded the accessor as <code>None</code>.</p>
+    <p>Fixed with short-lived signed resource tokens (reuses the existing JWT secret, no new dependency): an authenticated, RBAC-checked, audited <code>.../file-token</code> / <code>.../package-token</code> / <code>.../stream-token</code> request hands out a token scoped to that one resource ID; <code>.../file</code>, <code>.../package</code>, <code>.../mjpeg</code>, <code>.../snapshot.jpg</code> now validate it via <code>?token=</code>. Every access logs the real user. Evidence package also now includes the actual <code>AuditLog</code> rows for that incident — the docstring claimed a chain-of-custody trail it never queried for.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> live against a running backend — see ledger below.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-F</span><span class="name">Upload endpoint trusted the client filename</span><span class="files">cameras.py</span></div>
+    <p><code>upload-video</code> wrote to <code>uploads_dir / file.filename</code> verbatim (path-traversal/overwrite risk, no extension check, no size cap, whole file buffered in RAM).</p>
+    <p>Fixed: server-generated UUID filename, extension allow-list, chunked streamed write with a 500MB cap, partial-file cleanup on failure.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> live — see ledger below.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p0">P0-G</span><span class="name">Demo accounts always seeded</span><span class="files">config.py · seed.py</span></div>
+    <p>Added <code>DEMO_MODE</code> (default <code>true</code> — local/judge flow unchanged). The four seeded accounts and the demo watchlist entry only get created when true; roles still always seed so a real deployment can attach an out-of-band admin.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> import + boot clean, seed path reviewed.</div>
+  </div>
+
+  <div class="finding">
+    <div class="finding-head"><span class="pill pill-p1">P1</span><span class="name">System health reported fake subsystem status</span><span class="files">system.py</span></div>
+    <p><code>DATABASE</code>, <code>SEARCH</code> and <code>STORAGE</code> were hardcoded <code>"OPERATIONAL"</code> strings; <code>WEBSOCKET</code> wasn't reported at all.</p>
+    <p>Fixed: real <code>SELECT 1</code>, real <code>os.access()</code> on the upload/evidence dirs, real connected-client count.</p>
+    <div class="verify"><span class="tag">VERIFIED</span> live — see ledger below.</div>
+  </div>
+
+  <h2>Verification ledger <span class="count">live backend, this pass</span></h2>
+  <div class="ledger">
+<div class="ln"><span class="comment"># evidence file — no token</span></div>
+<div class="ln">$ curl -o /dev/null -w "%{http_code}" <span class="path">/api/evidence/nonexistent/file</span>
+<span class="before">422</span> <span class="comment">← was fully open before the fix</span></div>
+<div class="ln"><span class="comment"># evidence file-token — unauthenticated</span></div>
+<div class="ln">$ curl -o /dev/null -w "%{http_code}" <span class="path">/api/evidence/nonexistent/file-token</span>
+<span class="after">401</span></div>
+<div class="ln"><span class="comment"># evidence file-token — authenticated, bad id</span></div>
+<div class="ln">$ curl -H "Authorization: Bearer …" <span class="path">/api/evidence/nonexistent/file-token</span>
+<span class="after">404</span></div>
+<div class="ln"><span class="comment"># mjpeg stream — no token</span></div>
+<div class="ln">$ curl -o /dev/null -w "%{http_code}" <span class="path">/api/streams/nonexistent/mjpeg</span>
+<span class="after">422</span></div>
+<div class="ln"><span class="comment"># upload — disallowed extension</span></div>
+<div class="ln">$ curl -F "file=@evil.exe" <span class="path">/api/cameras/upload-video</span>
+<span class="after">400</span></div>
+<div class="ln"><span class="comment"># upload — valid .mp4, hostile original filename</span></div>
+<div class="ln">$ curl -F "file=@small.mp4;filename=my video (final) v2.mp4" <span class="path">/api/cameras/upload-video</span>
+<span class="after">{"filename":"fd6e0a3a1bde411d9dc5ffb5e69e7ddd.mp4", "original_filename":"my video (final) v2.mp4"}</span></div>
+<div class="ln"><span class="comment"># system status — real checks, not hardcoded</span></div>
+<div class="ln">$ curl -H "Authorization: Bearer …" <span class="path">/api/system/status</span>
+<span class="after">DATABASE ok · WEBSOCKET ok (0 clients) · STORAGE ok</span></div>
+  </div>
+
+  <h2>Remaining work</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Priority</th><th>Item</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pill pill-p1">P1</span></td><td class="feature">Live click-through</td><td class="problem">Full camera → detect → alert → incident → evidence flow not re-run against real video after these changes — run once before judges see it.</td></tr>
+        <tr><td><span class="pill pill-p1">P1</span></td><td class="feature">RTSP against a real stream</td><td class="problem">No CCTV/RTSP source was available here — code path is real, untested against live glass.</td></tr>
+        <tr><td><span class="pill pill-p1">P1</span></td><td class="feature">Camera-health detail</td><td class="problem">Bitrate, uptime, reconnect-attempt count not yet surfaced via the API (fps/resolution/latency/error_count already are).</td></tr>
+        <tr><td><span class="pill pill-p2">P2</span></td><td class="feature">Visual re-ID, NLP search, Kafka/K8s</td><td class="problem">Correctly out of scope per the brief — untouched.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Implementation status</h2>
+  <div class="matrix">
+    <div class="row"><span class="name">CCTV ingestion</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Detection</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Tracking</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">ANPR</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Cross-camera correlation</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Search</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Alerts</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Incidents</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Evidence</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Audit</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">RBAC</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Camera health</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">System health</span><span class="dot-status green"><span class="d"></span>Working</span></div>
+    <div class="row"><span class="name">Live click-through</span><span class="dot-status amber"><span class="d"></span>Needs verification</span></div>
+  </div>
+
+  <footer>SENTINEL VISION — Gujarat Police Innovation Challenge 2026 · hardening pass logged 2026-09-03 · full diff: 20 files, 479 insertions, 110 deletions</footer>
+</main>

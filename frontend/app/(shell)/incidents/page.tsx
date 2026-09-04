@@ -46,7 +46,7 @@ export default function IncidentsPage() {
       {showForm && (
         <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 space-y-3 max-w-lg">
           <input required placeholder="Incident title" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm" />
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="bg-panel2 border border-border rounded px-3 py-2 text-sm">
               <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
             </select>

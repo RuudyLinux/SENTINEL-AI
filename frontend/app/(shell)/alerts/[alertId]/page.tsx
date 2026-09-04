@@ -59,7 +59,7 @@ export default function AlertDetailPage() {
         <span className="text-xs text-slate-500 ml-auto">{alert.status.toUpperCase()}</span>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 text-sm bg-panel border border-border rounded-lg p-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm bg-panel border border-border rounded-lg p-4">
         <div><span className="text-slate-500">What happened?</span><br />{alert.reasons[0]}</div>
         <div><span className="text-slate-500">Where?</span><br />{camera?.camera_code || alert.camera_id} — {camera?.location || "location unavailable"}</div>
         <div><span className="text-slate-500">When?</span><br />{new Date(alert.timestamp).toLocaleString()}</div>

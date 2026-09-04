@@ -1,8 +1,9 @@
 # Backend
+backend/.env
 backend/.venv/
 backend/__pycache__/
 backend/**/__pycache__/
-backend/sentinel.db
+backend/sentinel.db*
 backend/server.log
 backend/install.log
 backend/uploads/
@@ -22,3 +23,6 @@ frontend/CLAUDE.md
 .DS_Store
 Thumbs.db
 frontend/tsconfig.tsbuildinfo
+
+# Tooling output (Playwright MCP browser-QA logs/snapshots — not project source)
+.playwright-mcp/

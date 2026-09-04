@@ -39,9 +39,12 @@ export default function AiRulesPage() {
     <div className="space-y-4">
       <h1 className="text-lg font-semibold">AI Rule Engine</h1>
       <p className="text-xs text-slate-500 max-w-2xl">
-        Two rule types drive the real alert pipeline: <code>watchlist_plate</code> (fires when an ANPR read matches an
-        active watchlist plate) and <code>zone_entry</code> (fires when a detection's bounding-box center falls inside
-        a restricted zone on the linked camera). Both are evaluated live against real detections — see
+        Three rule types drive the real alert pipeline: <code>watchlist_plate</code> (fires when an ANPR read matches
+        an active watchlist plate), <code>zone_entry</code> (fires when a detection's bounding-box center falls
+        inside a restricted zone on the linked camera), and <code>loitering</code> (fires when the same tracked
+        object dwells continuously inside a zone past its configured threshold — set the zone's loitering seconds
+        on the Map screen's Restricted Zones tab first). All three respect the zone's schedule window
+        (schedule_start/schedule_end) and are evaluated live against real detections — see
         backend/app/pipeline/rules_engine.py.
       </p>
 
@@ -55,16 +58,26 @@ export default function AiRulesPage() {
           <select value={form.rule_type} onChange={(e) => setForm({ ...form, rule_type: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
             <option value="watchlist_plate">Watchlist Plate Match</option>
             <option value="zone_entry">Restricted Zone Entry</option>
+            <option value="loitering">Loitering (dwell time)</option>
           </select>
         </div>
-        {form.rule_type === "zone_entry" && (
+        {(form.rule_type === "zone_entry" || form.rule_type === "loitering") && (
           <div>
             <label className="text-xs text-slate-400">Zone</label>
             <select required value={form.zone_id} onChange={(e) => setForm({ ...form, zone_id: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
               <option value="">Select zone...</option>
-              {zones.map((z) => <option key={z.id} value={z.id}>{z.name}</option>)}
+              {zones.map((z) => (
+                <option key={z.id} value={z.id}>
+                  {z.name}{form.rule_type === "loitering" && !z.loitering_seconds ? " (no loitering threshold set)" : ""}
+                </option>
+              ))}
             </select>
             {zonesError && <div className="text-xs text-critical mt-1">Zone list unavailable: {zonesError}</div>}
+            {form.rule_type === "loitering" && (
+              <div className="text-xs text-slate-500 mt-1">
+                Zones with no threshold set won't fire — set one on Map → Restricted Zones first.
+              </div>
+            )}
           </div>
         )}
         <div>

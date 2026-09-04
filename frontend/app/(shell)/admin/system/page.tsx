@@ -16,7 +16,7 @@ export default function SystemStatusPage() {
           <ErrorState message={`Backend is unreachable — status cannot be confirmed: ${error}`} onRetry={reload} />
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-2 text-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
               {status?.subsystems.map((s: any) => (
                 <div key={s.name} className="flex justify-between border-b border-border/50 py-1.5">
                   <span>{s.name}</span>
@@ -33,9 +33,10 @@ export default function SystemStatusPage() {
 
       <div className="bg-panel border border-border rounded-lg p-4 text-xs text-slate-400 space-y-2">
         <div className="text-sm font-medium text-slate-200 mb-1">Scope & Honesty Notes</div>
-        <p>This build runs a real detection pipeline (YOLOv8 + ByteTrack + EasyOCR) against a webcam or an uploaded
-          video file — there is no real CCTV/RTSP/VMS source available in this environment. The camera adapter is
-          written so an RTSP/ONVIF source can be added later without touching detection, ANPR, correlation, or the
+        <p>This build runs a real detection pipeline (YOLOv8 + ByteTrack + EasyOCR) against a webcam, an uploaded
+          video file, or an RTSP URL (best-effort via OpenCV/FFmpeg — no ONVIF discovery or vendor-specific auth,
+          and no real CCTV/VMS was available to test against in this environment). The camera adapter is written so
+          a dedicated ONVIF/VMS integration can be added later without touching detection, ANPR, correlation, or the
           rules engine.</p>
         <p>No Kafka/Kubernetes/vector-DB/edge-Jetson deployment is running — this is the documented "working slice"
           (single FastAPI process + SQLite) the source master document calls for at hackathon scale, with the

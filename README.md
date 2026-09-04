@@ -28,6 +28,18 @@ mocked data.
    real rules engine fire an alert and auto-create an incident, then **Investigate** →
    **Generate Evidence Package**.
 
+## Real Sentinel Camera Grid (live-verified)
+
+Beyond the official Gujarat catalogue, this build also integrates a second real, live camera
+source — 30 real traffic cameras — with genuine end-to-end verification this session:
+discovery, RTSP connection, real frames, real YOLOv8+ByteTrack detections, real alerts,
+incidents, and evidence snapshots (see `HYBRID_ARCHITECTURE.md` and
+`FINAL_PROJECT_STATUS.md` for the full record, and `backend/README.md` → "Real Sentinel
+Camera Grid integration" for setup/troubleshooting).
+
+Credentials go in `backend/.env` only (gitignored — see `backend/.env.example`), **never** in
+source, docs, or committed anywhere. They never reach the frontend.
+
 ## What this is (and isn't)
 
 This is the "working slice" the source document itself recommends for a hackathon build —
@@ -54,9 +66,14 @@ explicitly out of scope.
   making `create_camera`/`restart_camera` and the startup handler `async def`.
 - **Evidence download 401**: browsers can't attach a bearer header to a plain `<a href>` /
   `<img>` / new-tab navigation, so `/api/evidence/{id}/file` and the evidence-package endpoint
-  401'd when opened directly. Fixed by dropping the auth dependency on those two binary/file
-  endpoints only (same accepted trade-off as the MJPEG stream endpoints) — everything else
-  stays authenticated.
+  401'd when opened directly. Originally "fixed" by dropping auth on those endpoints entirely —
+  that made police evidence fetchable by anyone with an ID. Replaced with short-lived signed
+  resource tokens instead (`security.create_resource_token` / `get_user_from_resource_token`):
+  the frontend fetches a token via an authenticated `.../file-token` (or `.../stream-token`,
+  `.../package-token`) request first, then appends it as `?token=` on the actual file/stream
+  URL. Same pattern now covers the MJPEG/snapshot endpoints too — nothing evidence- or
+  camera-feed-related is unauthenticated anymore, and every access is attributed to the real
+  user in the audit log.
 - **Alert flood**: a tracked object sitting in a zone re-fired a new alert every inference
   cycle. Fixed with a per-(camera, zone/watchlist, track) cooldown in `rules_engine.py`.
 - **Map tiles watermarked**: the CARTO dark basemap now requires an API key. Switched to
@@ -81,3 +98,32 @@ explicitly out of scope.
   dot, always claiming "System" was healthy regardless of actual connectivity). Verified live
   by killing the backend mid-session and confirming every page shows the real error state
   instead of fake/empty content, then restoring it and confirming normal operation resumes.
+- **Shared tracker state across cameras**: `detector.py` cached a single YOLO model instance
+  (`lru_cache(maxsize=1)`) reused by every camera's worker; since `model.track(persist=True)`
+  keeps ByteTrack state on that shared object and each camera's inference runs on its own
+  thread (`asyncio.to_thread`), concurrent cameras could race and corrupt each other's track
+  IDs. Fixed with one YOLO/tracker instance per camera (`_MODELS_BY_CAMERA` dict, released on
+  `stop_worker`).
+- **No real reconnect on a dropped stream**: `worker.py`'s camera loop set `status="degraded"`
+  on a bad read and just kept looping forever with a 1s sleep — it never actually reopened the
+  source. Fixed with a real release+reopen retry using exponential backoff
+  (`reconnect_max_attempts`/`reconnect_backoff_base`/`_max`); after the retry budget is
+  exhausted the camera is marked `offline` and the worker stops (an operator's Restart brings
+  it back) instead of spinning "degraded" indefinitely.
+- **RTSP was a defined-but-unimplemented source type**: now routed through the same
+  `cv2.VideoCapture` path as `video_file` via OpenCV's FFmpeg backend, with open/read timeouts
+  so a dead stream fails fast. Best-effort (no ONVIF discovery, no real CCTV/VMS available to
+  test against here) but real, not a stub.
+- **ANPR correlated on any non-empty OCR read**: `looks_like_plate()` (Indian plate-format
+  regex) existed in `anpr.py` but was never called, so a 2-character garbage OCR read became a
+  real `Vehicle`/`Plate` row. Fixed by gating the correlation write on `looks_like_plate()` AND
+  a minimum confidence (`plate_min_confidence`, default 0.35) — noisy reads are simply not
+  persisted as a vehicle sighting, rather than trusted.
+- **Upload endpoint trusted the client filename**: `POST /api/cameras/upload-video` wrote
+  straight to `uploads_dir / file.filename` (path-traversal/overwrite risk, no extension
+  check, no size cap, whole file read into RAM first). Fixed with a server-generated UUID
+  filename, an extension allow-list, a streamed chunked write with a size cap
+  (`max_upload_mb`), and cleanup of any partial file on failure.
+- **Evidence package claimed an audit trail it didn't include**: the docstring said "audit
+  trail" but the returned JSON never actually queried `AuditLog`. Fixed — it now includes the
+  real `AuditLog` rows touching that incident or any of its evidence items.

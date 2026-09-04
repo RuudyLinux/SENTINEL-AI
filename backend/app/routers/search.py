@@ -3,14 +3,13 @@ parser mapping free text to structured filters (doc §58) — not an LLM/NLP
 model; documented non-goal.
 """
 import re
-from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import get_db
 from ..security import get_current_user
-from ..pipeline.anpr import normalize_plate, PLATE_RE
+from ..pipeline.anpr import normalize_plate
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 

@@ -6,7 +6,7 @@ import { api, API_BASE } from "@/lib/api";
 export default function AddCameraPage() {
   const router = useRouter();
   const [form, setForm] = useState({
-    camera_code: "", name: "", department: "Police", location: "", lat: 23.03, lng: 72.58,
+    camera_code: "", name: "", department: "Police", location: "", camera_group: "", lat: 23.03, lng: 72.58,
     source_type: "video_file", source_uri: "",
     ai_person: true, ai_vehicle: true, ai_anpr: true,
   });
@@ -65,7 +65,7 @@ export default function AddCameraPage() {
     <div className="max-w-2xl space-y-4">
       <h1 className="text-lg font-semibold">Add Camera</h1>
       <form onSubmit={save} className="bg-panel border border-border rounded-lg p-5 space-y-4">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="Camera Name">
             <input required value={form.name} onChange={(e) => set("name", e.target.value)} className="input" />
           </Field>
@@ -77,6 +77,9 @@ export default function AddCameraPage() {
           </Field>
           <Field label="Location">
             <input value={form.location} onChange={(e) => set("location", e.target.value)} className="input" />
+          </Field>
+          <Field label="Group (optional)">
+            <input value={form.camera_group} onChange={(e) => set("camera_group", e.target.value)} placeholder="North Zone" className="input" />
           </Field>
           <Field label="Latitude">
             <input type="number" step="0.0001" value={form.lat} onChange={(e) => set("lat", parseFloat(e.target.value))} className="input" />
@@ -90,9 +93,26 @@ export default function AddCameraPage() {
           <select value={form.source_type} onChange={(e) => set("source_type", e.target.value)} className="input">
             <option value="video_file">Uploaded video file (simulated feed)</option>
             <option value="webcam">Webcam (device index)</option>
-            <option value="rtsp">RTSP (not supported in this build)</option>
+            <option value="rtsp">RTSP (best-effort, use Test Connection)</option>
+            <option value="mock_vms">Mock VMS (synthetic demo feed — proves the Generic VMS adapter is pluggable)</option>
+            <option value="onvif">ONVIF (interface stub — not implemented, see note below)</option>
           </select>
         </Field>
+
+        {form.source_type === "mock_vms" && (
+          <div className="text-xs text-slate-400 bg-panel2 border border-border rounded p-3">
+            Generic-VMS adapter demo: produces real synthetic frames through the real AI pipeline
+            (backend/app/pipeline/adapters.py MockVMSAdapter) — proves a "Generic VMS" is pluggable at
+            the adapter boundary without a real vendor backend. No Source URI needed.
+          </div>
+        )}
+        {form.source_type === "onvif" && (
+          <div className="text-xs text-critical bg-panel2 border border-border rounded p-3">
+            ONVIF adapter is an interface stub only — registered to prove the adapter boundary is
+            ready for it, but no ONVIF device was available to implement/test discovery or auth
+            against in this build. Connecting will fail with an honest error, not a fake success.
+          </div>
+        )}
 
         {form.source_type === "video_file" && (
           <Field label="Video File">
@@ -104,11 +124,22 @@ export default function AddCameraPage() {
             <input value={form.source_uri} onChange={(e) => set("source_uri", e.target.value)} placeholder="0" className="input" />
           </Field>
         )}
+        {form.source_type === "onvif" && (
+          <Field label="Device URI (optional — recorded only, not connected)">
+            <input value={form.source_uri} onChange={(e) => set("source_uri", e.target.value)} placeholder="onvif://device-ip:port" className="input" />
+          </Field>
+        )}
         {form.source_type === "rtsp" && (
-          <div className="text-xs text-slate-400 bg-panel2 border border-border rounded p-3">
-            No real CCTV/RTSP source is available in this environment. The adapter interface supports adding one later
-            without changing the detection pipeline — see backend/app/pipeline/source.py.
-          </div>
+          <>
+            <Field label="RTSP URL">
+              <input value={form.source_uri} onChange={(e) => set("source_uri", e.target.value)} placeholder="rtsp://user:pass@host:554/stream" className="input" />
+            </Field>
+            <div className="text-xs text-slate-400 bg-panel2 border border-border rounded p-3">
+              Connects via OpenCV/FFmpeg's RTSP client — best-effort against whatever RTSP source is reachable from this
+              machine (no ONVIF discovery/vendor-specific auth). Use Test Connection before saving; a dead or
+              unreachable stream will report failure quickly instead of hanging.
+            </div>
+          </>
         )}
 
         <div className="flex gap-4 text-sm">

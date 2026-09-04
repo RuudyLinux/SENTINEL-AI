@@ -1,9 +1,21 @@
 "use client";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { API_BASE } from "@/lib/api";
+import { buildTokenedUrl } from "@/lib/api";
 import StatusDot from "./StatusDot";
 
 export default function LiveVideoTile({ camera }: { camera: any }) {
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (camera.status !== "online") return;
+    let cancelled = false;
+    buildTokenedUrl(`/api/streams/${camera.id}/stream-token`, `/api/streams/${camera.id}/mjpeg`)
+      .then((url) => { if (!cancelled) setStreamUrl(url); })
+      .catch(() => { if (!cancelled) setStreamUrl(null); });
+    return () => { cancelled = true; };
+  }, [camera.status, camera.id]);
+
   return (
     <div className="border border-border rounded-lg overflow-hidden bg-panel flex flex-col">
       <div className="flex items-center justify-between px-2 py-1 text-xs bg-panel2">
@@ -11,10 +23,10 @@ export default function LiveVideoTile({ camera }: { camera: any }) {
         <span className="font-mono">{camera.camera_code}</span>
       </div>
       <div className="aspect-video bg-black flex items-center justify-center">
-        {camera.status === "online" ? (
+        {camera.status === "online" && streamUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
-            src={`${API_BASE}/api/streams/${camera.id}/mjpeg`}
+            src={streamUrl}
             alt={camera.name}
             className="w-full h-full object-cover"
           />

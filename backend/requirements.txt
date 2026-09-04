@@ -8,7 +8,11 @@ python-multipart
 aiofiles
 websockets
 opencv-python-headless
+imageio-ffmpeg
 ultralytics
 easyocr
 numpy
 reportlab
+httpx
+pytest
+psutil

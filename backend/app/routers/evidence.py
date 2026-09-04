@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..db import get_db
-from ..security import get_current_user
+from ..security import get_current_user, create_resource_token, get_user_from_resource_token
 from ..config import settings
 from ..audit import log_action
 
@@ -29,15 +29,28 @@ def get_evidence(evidence_id: str, db: Session = Depends(get_db), user: models.U
     return e
 
 
+@router.get("/{evidence_id}/file-token")
+def get_evidence_file_token(evidence_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """RBAC-checked (login required) + audited step that hands out a
+    short-lived token scoped to exactly this evidence file (P0-E)."""
+    e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    log_action(db, user, "request_evidence_file_token", resource=evidence_id)
+    return {"token": create_resource_token("evidence_file", evidence_id, user, settings.evidence_token_ttl_seconds)}
+
+
 @router.get("/{evidence_id}/file")
-def download_evidence_file(evidence_id: str, db: Session = Depends(get_db)):
-    # No auth dependency here: browsers can't attach a bearer header to a plain
-    # <img>/<a href> navigation. Same documented simplification as the MJPEG
-    # stream endpoints (see streams.py) — acceptable for a local demo.
+def download_evidence_file(evidence_id: str, token: str, db: Session = Depends(get_db)):
+    # Browsers can't attach an Authorization: Bearer header to a plain
+    # <img src>/<a href> navigation, so this validates a short-lived signed
+    # resource token instead of dropping auth entirely (P0-E). The token is
+    # only obtainable via the RBAC-checked, audited /file-token endpoint above.
+    user = get_user_from_resource_token("evidence_file", evidence_id, token, db)
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e or not e.file_path:
         raise HTTPException(status_code=404, detail="No file for this evidence record")
-    log_action(db, None, "download_evidence", resource=evidence_id)
+    log_action(db, user, "download_evidence", resource=evidence_id)
     return FileResponse(e.file_path)
 
 
@@ -62,13 +75,24 @@ def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: model
     return {"ok": True, "sha256": e.sha256}
 
 
+@router.get("/incidents/{incident_id}/package-token")
+def get_package_token(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    log_action(db, user, "request_evidence_package_token", resource=incident_id)
+    return {"token": create_resource_token("evidence_package", incident_id, user, settings.evidence_token_ttl_seconds)}
+
+
 @router.get("/incidents/{incident_id}/package")
-def generate_package(incident_id: str, fmt: str = "json", db: Session = Depends(get_db)):
+def generate_package(incident_id: str, token: str, fmt: str = "json", db: Session = Depends(get_db)):
     """Generate an Evidence Package (doc §29): incident summary, camera timeline,
-    vehicle details, evidence list, audit trail — real data pulled from the DB.
-    No auth dependency: triggered via a plain link/new-tab navigation, which
-    can't carry a bearer header (see download_evidence_file above).
+    vehicle details, evidence list, notes, and audit trail — real data pulled
+    from the DB. Triggered via a plain link/new-tab navigation (can't carry a
+    bearer header), so it validates a short-lived signed resource token
+    instead of dropping auth entirely (P0-E) — see /package-token above.
     """
+    user = get_user_from_resource_token("evidence_package", incident_id, token, db)
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -83,20 +107,33 @@ def generate_package(incident_id: str, fmt: str = "json", db: Session = Depends(
         from ..pipeline.correlate import get_route
         sightings = get_route(db, vehicle.id)
 
+    # Chain-of-custody: actual AuditLog rows touching this incident or any
+    # of its evidence items, not just a label claiming one exists.
+    audit_resources = [incident_id] + [e.id for e in evidence_items]
+    audit_trail = (
+        db.query(models.AuditLog)
+        .filter(models.AuditLog.resource.in_(audit_resources))
+        .order_by(models.AuditLog.timestamp.asc())
+        .all()
+    )
+
     package = {
         "incident": {"id": inc.id, "title": inc.title, "priority": inc.priority, "status": inc.status,
                      "description": inc.description, "created_at": inc.created_at.isoformat()},
         "alert": {"id": alert.id, "severity": alert.severity, "reasons": alert.reasons, "timestamp": alert.timestamp.isoformat()} if alert else None,
         "vehicle": {"plate_text": vehicle.plate_text, "vehicle_type": vehicle.vehicle_type, "color": vehicle.color} if vehicle else None,
         "camera_timeline": sightings,
-        "evidence": [{"id": e.id, "type": e.evidence_type, "file_path": e.file_path, "verification_status": e.verification_status} for e in evidence_items],
+        "evidence": [{"id": e.id, "type": e.evidence_type, "file_path": e.file_path, "verification_status": e.verification_status, "sha256": e.sha256} for e in evidence_items],
         "notes": [{"text": n.text, "created_at": n.created_at.isoformat()} for n in notes],
+        "audit_trail": [{"timestamp": a.timestamp.isoformat(), "username": a.username, "action": a.action,
+                          "resource": a.resource, "result": a.result} for a in audit_trail],
+        "generated_by": user.username,
     }
 
     if fmt == "json":
         out_path = settings.evidence_dir / f"package_{incident_id}.json"
         out_path.write_text(json.dumps(package, indent=2, default=str))
-        log_action(db, None, "generate_evidence_package", resource=incident_id)
+        log_action(db, user, "generate_evidence_package", resource=incident_id)
         return FileResponse(out_path, filename=out_path.name, media_type="application/json")
 
     # PDF
@@ -119,5 +156,5 @@ def generate_package(incident_id: str, fmt: str = "json", db: Session = Depends(
         c.drawString(40, y, line[:110])
         y -= 12
     c.save()
-    log_action(db, None, "generate_evidence_package", resource=incident_id)
+    log_action(db, user, "generate_evidence_package", resource=incident_id)
     return FileResponse(out_path, filename=out_path.name, media_type="application/pdf")

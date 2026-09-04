@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useParams } from "next/navigation";
-import { api, API_BASE, ApiError } from "@/lib/api";
+import { api, openTokenedResource, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import SeverityBadge from "@/components/SeverityBadge";
 import ErrorState from "@/components/ErrorState";
@@ -13,8 +13,10 @@ export default function IncidentDetailPage() {
   const { data: incident, error, reload: reloadIncident } = useApiData<any>(`/api/incidents/${incidentId}`);
   const { data: timelineData, error: timelineError, reload: reloadTimeline } = useApiData<any>(`/api/incidents/${incidentId}/timeline`);
   const { data: evidenceData, error: evidenceError, reload: reloadEvidence } = useApiData<any[]>(`/api/evidence?incident_id=${incidentId}`);
+  const { data: camerasData } = useApiData<any[]>("/api/cameras");
   const timeline = timelineData?.events || [];
   const evidence = evidenceData || [];
+  const cameras = camerasData || [];
 
   const [tab, setTab] = useState<(typeof TABS)[number]>("Overview");
   const [note, setNote] = useState("");
@@ -49,12 +51,27 @@ export default function IncidentDetailPage() {
     }
   }
 
-  function downloadPackage(fmt: "json" | "pdf") {
-    window.open(`${API_BASE}/api/evidence/incidents/${incidentId}/package?fmt=${fmt}`, "_blank");
+  async function downloadPackage(fmt: "json" | "pdf") {
+    setActionError(null);
+    try {
+      await openTokenedResource(
+        `/api/evidence/incidents/${incidentId}/package-token`,
+        `/api/evidence/incidents/${incidentId}/package?fmt=${fmt}`
+      );
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Could not generate evidence package");
+    }
   }
 
   if (error) return <ErrorState message={`Incident ${incidentId} could not be loaded: ${error}`} onRetry={reloadIncident} />;
-  if (!incident) return null;
+  if (!incident) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-slate-500 py-8">
+        <span className="inline-block h-3 w-3 rounded-full border-2 border-slate-500 border-t-transparent animate-spin" />
+        Loading incident {incidentId}…
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-4xl space-y-4">
@@ -83,7 +100,7 @@ export default function IncidentDetailPage() {
         <div className="bg-panel border border-border rounded-lg p-4 text-sm space-y-2">
           <div><span className="text-slate-500">Location:</span> {incident.location || "—"}</div>
           <div><span className="text-slate-500">Description:</span> {incident.description || "—"}</div>
-          <div><span className="text-slate-500">Camera:</span> {incident.camera_id || "—"}</div>
+          <div><span className="text-slate-500">Camera:</span> {incident.camera_id ? (cameras.find((c) => c.id === incident.camera_id)?.camera_code || incident.camera_id) : "—"}</div>
           <div><span className="text-slate-500">Created:</span> {new Date(incident.created_at).toLocaleString()}</div>
           <div className="flex gap-2 pt-3">
             <button onClick={() => downloadPackage("json")} className="text-xs bg-accent text-ink font-medium rounded px-3 py-1.5">GENERATE EVIDENCE PACKAGE (JSON)</button>
@@ -119,7 +136,14 @@ export default function IncidentDetailPage() {
             {evidence.map((e) => (
               <div key={e.id} className="px-3 py-2 flex justify-between text-sm">
                 <span>{e.evidence_type} · {e.verification_status}</span>
-                {e.file_path && <a href={`${API_BASE}/api/evidence/${e.id}/file`} target="_blank" className="text-accent text-xs hover:underline">VIEW</a>}
+                {e.file_path && (
+                  <button
+                    onClick={() => openTokenedResource(`/api/evidence/${e.id}/file-token`, `/api/evidence/${e.id}/file`)}
+                    className="text-accent text-xs hover:underline"
+                  >
+                    VIEW
+                  </button>
+                )}
               </div>
             ))}
             {evidence.length === 0 && <div className="px-3 py-4 text-xs text-slate-500">No evidence attached yet.</div>}

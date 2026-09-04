@@ -45,15 +45,20 @@ function NavGroup({ items, pathname }: { items: typeof PRIMARY; pathname: string
   );
 }
 
-export default function Sidebar() {
+export default function Sidebar({ open = false, onNavigate }: { open?: boolean; onNavigate?: () => void }) {
   const pathname = usePathname();
   return (
-    <aside className="w-56 shrink-0 border-r border-border bg-panel h-screen sticky top-0 flex flex-col">
+    <aside
+      className={`w-56 shrink-0 border-r border-border bg-panel h-screen flex flex-col z-40
+        fixed inset-y-0 left-0 transform transition-transform duration-200 ease-out
+        ${open ? "translate-x-0" : "-translate-x-full"}
+        md:translate-x-0 md:sticky md:top-0`}
+    >
       <div className="px-4 py-4 border-b border-border">
         <div className="text-sm font-bold tracking-wide text-slate-100">SENTINEL VISION</div>
         <div className="text-[10px] text-slate-500 mt-0.5">Unified Video Intelligence</div>
       </div>
-      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5" onClick={onNavigate}>
         <NavGroup items={PRIMARY} pathname={pathname} />
         <div className="pt-3 mt-3 border-t border-border text-[10px] uppercase tracking-wide text-slate-500 px-3">
           Administration

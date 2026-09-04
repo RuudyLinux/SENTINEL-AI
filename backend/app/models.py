@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, ForeignKey, Text, JSON
+    Column, String, Float, Integer, Boolean, DateTime, ForeignKey, JSON
 )
 from sqlalchemy.orm import relationship
 
@@ -56,19 +56,51 @@ class Camera(Base):
     error_count = Column(Integer, default=0)
     last_frame_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Official camera-catalogue linkage (Phase 3). Populated only by a
+    # catalogue sync (see pipeline/catalog.py) — null for manually-added
+    # cameras. `catalog_stale=True` means the catalogue no longer lists this
+    # camera as of the last sync; it is kept (not deleted) so history isn't lost.
+    external_catalog_id = Column(String, nullable=True, index=True)
+    catalog_codec = Column(String, default="")
+    catalog_live_status = Column(String, default="")
+    catalog_synced_at = Column(DateTime, nullable=True)
+    catalog_stale = Column(Boolean, default=False)
+    # Phase 6: the catalogue's other two stream URLs, preserved alongside the
+    # RTSP one already used for AI ingestion (source_uri). Genuinely
+    # optional — a record missing either stays NULL, never fabricated.
+    # Unlike source_uri (may carry embedded RTSP credentials, deliberately
+    # never returned by the API), these are meant for direct client
+    # consumption per the official spec (WHEP -> browser preview, HLS ->
+    # dashboard/mobile fallback) so CameraOut does expose them.
+    whep_url = Column(String, nullable=True)
+    hls_url = Column(String, nullable=True)
+    # Model 2/4: free-form grouping/tagging (e.g. "North Zone", "Highway Cams") —
+    # client-side filterable on the Cameras screen. Empty string, never null, so
+    # existing rows migrate cleanly (see ensure_columns backfill in main.py).
+    # Named `camera_group`, not `group` — the latter is a reserved SQL keyword and
+    # broke the raw-SQL ensure_columns/ensure_indexes migration helpers (SQLAlchemy's
+    # own query compiler would have auto-quoted it, but those helpers don't).
+    camera_group = Column(String, default="")
 
 
 class Detection(Base):
     __tablename__ = "detections"
     id = Column(String, primary_key=True, default=lambda: uid("det"))
-    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time: when SENTINEL wrote this row
+    source_timestamp = Column(DateTime, nullable=True)  # SOURCE time: when the frame was captured, if reliably known (see pipeline/timing.py)
     cls = Column(String, nullable=False)  # person | car | truck | bus | motorbike
     confidence = Column(Float, nullable=False)
     bbox = Column(JSON, default=list)  # [x1,y1,x2,y2]
     track_id = Column(String, nullable=True)
     model_version = Column(String, default="")
     snapshot_path = Column(String, nullable=True)
+    # Cross-camera PERSON correlation (Phase 5): a compact HSV color-histogram
+    # signature of the crop, computed only for cls=="person" (pipeline/appearance.py).
+    # Explicitly NOT biometric/facial — a visual-similarity signal only, used to rank
+    # candidate sightings for an investigator, never an identity claim. Null when not
+    # computed (never fabricated) — see worker.py._process_frame.
+    appearance_signature = Column(JSON, nullable=True)
 
 
 class Track(Base):
@@ -103,7 +135,8 @@ class Plate(Base):
     plate_text_raw = Column(String, default="")
     plate_text_normalized = Column(String, default="", index=True)
     confidence = Column(Float, default=0.0)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=datetime.utcnow)  # PROCESSING time
+    source_timestamp = Column(DateTime, nullable=True)  # SOURCE time — see Detection.source_timestamp
     snapshot_path = Column(String, nullable=True)
 
 
@@ -144,6 +177,11 @@ class Zone(Base):
     schedule_start = Column(String, default="00:00")
     schedule_end = Column(String, default="23:59")
     active = Column(Boolean, default=True)
+    # Loitering rule support (Phase 6): dwell-time threshold in seconds. Null means
+    # no loitering check applies to this zone — only zones with this set AND an
+    # active AlertRule(rule_type="loitering") referencing them are checked (see
+    # rules_engine.py) — restricted-zone entry itself is unaffected either way.
+    loitering_seconds = Column(Float, nullable=True)
 
 
 class AlertRule(Base):
@@ -160,15 +198,16 @@ class AlertRule(Base):
 class Alert(Base):
     __tablename__ = "alerts"
     id = Column(String, primary_key=True, default=lambda: uid("alt"))
-    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False)
+    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
     rule_id = Column(String, ForeignKey("alert_rules.id"), nullable=True)
-    severity = Column(String, default="MEDIUM")  # LOW | MEDIUM | HIGH | CRITICAL
-    status = Column(String, default="new")  # new | acknowledged | escalated | dismissed
+    severity = Column(String, default="MEDIUM", index=True)  # LOW | MEDIUM | HIGH | CRITICAL
+    status = Column(String, default="new", index=True)  # new | acknowledged | escalated | dismissed
     vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True)
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     confidence = Column(Float, default=0.0)
     reasons = Column(JSON, default=list)  # explainability list
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=datetime.utcnow)  # PROCESSING time
+    source_timestamp = Column(DateTime, nullable=True)  # SOURCE time of the triggering detection
     acknowledged_by = Column(String, ForeignKey("users.id"), nullable=True)
     snapshot_path = Column(String, nullable=True)
 
@@ -179,7 +218,7 @@ class Incident(Base):
     title = Column(String, nullable=False)
     incident_type = Column(String, default="")
     priority = Column(String, default="MEDIUM")
-    status = Column(String, default="open")  # open | in_progress | closed
+    status = Column(String, default="open", index=True)  # open | in_progress | closed
     location = Column(String, default="")
     description = Column(String, default="")
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=True)
@@ -210,6 +249,11 @@ class Evidence(Base):
     uploaded_by = Column(String, ForeignKey("users.id"), nullable=True)
     verification_status = Column(String, default="unverified")
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Event-clip linkage (Phase 3). Null for pre-existing snapshot/report rows.
+    alert_id = Column(String, ForeignKey("alerts.id"), nullable=True)
+    detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
+    event_type = Column(String, default="")  # e.g. watchlist_match | zone_entry
+    source_timestamp = Column(DateTime, nullable=True)
 
 
 class AuditLog(Base):

@@ -47,8 +47,8 @@ export default function WatchlistsPage() {
         ))}
       </div>
 
-      <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex gap-2 items-end max-w-2xl">
-        <div className="flex-1">
+      <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex flex-wrap gap-2 items-end max-w-2xl">
+        <div className="flex-1 min-w-[140px]">
           <label className="text-xs text-slate-400">{tab === "plate" ? "Plate number" : tab === "vehicle" ? "Vehicle identifier" : "Person identifier / note"}</label>
           <input required value={form.identifier} onChange={(e) => setForm({ ...form, identifier: e.target.value.toUpperCase() })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>

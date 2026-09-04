@@ -3,6 +3,7 @@ const COLORS: Record<string, string> = {
   operational: "bg-ok",
   offline: "bg-slate-500",
   degraded: "bg-high",
+  down: "bg-critical",
   new: "bg-critical",
 };
 

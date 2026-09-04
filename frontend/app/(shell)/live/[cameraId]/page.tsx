@@ -1,7 +1,7 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { api, API_BASE, ApiError } from "@/lib/api";
+import { api, buildTokenedUrl, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import StatusDot from "@/components/StatusDot";
 import ErrorState from "@/components/ErrorState";
@@ -12,6 +12,16 @@ export default function SingleCameraPage() {
   const { data: camera, loading: cameraLoading, error: cameraError, reload: reloadCamera } = useApiData<any>(
     `/api/cameras/${cameraId}`, { pollMs: 4000 }
   );
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (camera?.status !== "online") return;
+    let cancelled = false;
+    buildTokenedUrl(`/api/streams/${cameraId}/stream-token`, `/api/streams/${cameraId}/mjpeg`)
+      .then((url) => { if (!cancelled) setStreamUrl(url); })
+      .catch(() => { if (!cancelled) setStreamUrl(null); });
+    return () => { cancelled = true; };
+  }, [camera?.status, cameraId]);
   const { data: detections, error: detectionsError, reload: reloadDetections } = useApiData<any[]>(
     `/api/detections?camera_id=${cameraId}&limit=50`, { pollMs: 4000 }
   );
@@ -57,9 +67,9 @@ export default function SingleCameraPage() {
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
         <div className="bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
-          {camera.status === "online" ? (
+          {camera.status === "online" && streamUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={`${API_BASE}/api/streams/${cameraId}/mjpeg`} alt={camera.name} className="w-full h-full object-contain" />
+            <img src={streamUrl} alt={camera.name} className="w-full h-full object-contain" />
           ) : (
             <div className="text-slate-500 text-sm">Camera {camera.status}. Last frame: {camera.last_frame_at ? new Date(camera.last_frame_at).toLocaleString() : "never"}</div>
           )}

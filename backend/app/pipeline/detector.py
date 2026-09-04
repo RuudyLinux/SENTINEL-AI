@@ -1,6 +1,16 @@
-"""Real YOLOv8 detection + built-in ByteTrack tracking (ultralytics)."""
-from functools import lru_cache
+"""Real YOLOv8 detection + built-in ByteTrack tracking (ultralytics).
 
+Tracker isolation: ultralytics keeps ByteTrack state (next track id,
+active tracklets) on the `YOLO`/predictor instance itself when calling
+`.track(..., persist=True)`. A single model instance shared across cameras
+would let concurrent camera workers race on that shared state and corrupt
+each other's track IDs. So we keep one YOLO instance PER CAMERA — each
+camera's worker loop calls inference sequentially, so its own instance is
+never touched concurrently.
+"""
+from typing import Any
+
+import numpy as np
 from ultralytics import YOLO
 
 from ..config import settings
@@ -10,17 +20,30 @@ PERSON_CLASSES = {0: "person"}
 VEHICLE_CLASSES = {2: "car", 3: "motorbike", 5: "bus", 7: "truck"}
 ALL_CLASSES = {**PERSON_CLASSES, **VEHICLE_CLASSES}
 
-
-@lru_cache(maxsize=1)
-def get_model() -> YOLO:
-    return YOLO(settings.model_name)
+_MODELS_BY_CAMERA: dict[str, YOLO] = {}
 
 
-def detect_and_track(frame, want_person: bool = True, want_vehicle: bool = True):
-    """Runs one frame through YOLO + ByteTrack. Returns a list of dicts:
+def get_model(camera_id: str) -> YOLO:
+    model = _MODELS_BY_CAMERA.get(camera_id)
+    if model is None:
+        model = YOLO(settings.model_name)
+        _MODELS_BY_CAMERA[camera_id] = model
+    return model
+
+
+def release_model(camera_id: str) -> None:
+    """Drop a camera's model/tracker instance (call on camera stop/delete)."""
+    _MODELS_BY_CAMERA.pop(camera_id, None)
+
+
+def detect_and_track(
+    frame: np.ndarray, camera_id: str, want_person: bool = True, want_vehicle: bool = True
+) -> list[dict[str, Any]]:
+    """Runs one frame through YOLO + ByteTrack for a single camera's own
+    model instance. Returns a list of dicts:
     {cls, confidence, bbox: [x1,y1,x2,y2], track_id}
     """
-    model = get_model()
+    model = get_model(camera_id)
     class_ids = []
     if want_person:
         class_ids += list(PERSON_CLASSES.keys())

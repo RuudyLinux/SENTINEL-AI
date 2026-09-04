@@ -15,7 +15,7 @@ export default function MapIntelligencePage() {
   const { data: camerasData, error: camerasError, reload: reloadCameras } = useApiData<any[]>("/api/cameras");
   const { data: incidentsData, error: incidentsError } = useApiData<any[]>("/api/incidents");
   const { data: zonesData, error: zonesError, reload: reloadZones } = useApiData<any[]>("/api/zones");
-  const [zoneForm, setZoneForm] = useState({ name: "", camera_id: "", severity: "HIGH" });
+  const [zoneForm, setZoneForm] = useState({ name: "", camera_id: "", severity: "HIGH", loitering_seconds: "" });
   const [formError, setFormError] = useState<string | null>(null);
 
   const cameras = camerasData || [];
@@ -30,8 +30,11 @@ export default function MapIntelligencePage() {
     if (!zoneForm.camera_id) return;
     setFormError(null);
     try {
-      await api.post("/api/zones", { ...zoneForm, x1: 0, y1: 0, x2: 1, y2: 1, zone_type: "restricted" });
-      setZoneForm({ name: "", camera_id: "", severity: "HIGH" });
+      await api.post("/api/zones", {
+        ...zoneForm, x1: 0, y1: 0, x2: 1, y2: 1, zone_type: "restricted",
+        loitering_seconds: zoneForm.loitering_seconds ? parseFloat(zoneForm.loitering_seconds) : null,
+      });
+      setZoneForm({ name: "", camera_id: "", severity: "HIGH", loitering_seconds: "" });
       reloadZones();
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : "Could not create zone");
@@ -83,7 +86,17 @@ export default function MapIntelligencePage() {
             <select value={zoneForm.severity} onChange={(e) => setZoneForm({ ...zoneForm, severity: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm">
               <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
             </select>
-            <div className="text-xs text-slate-500">Zone covers the full camera frame in this build (axis-aligned rectangle drawing is a documented non-goal).</div>
+            <input
+              type="number" min="1" placeholder="Loitering threshold, seconds (optional)"
+              value={zoneForm.loitering_seconds}
+              onChange={(e) => setZoneForm({ ...zoneForm, loitering_seconds: e.target.value })}
+              className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm"
+            />
+            <div className="text-xs text-slate-500">
+              Zone covers the full camera frame in this build (axis-aligned rectangle drawing is a documented
+              non-goal). Set a loitering threshold and create a matching "Loitering" rule under AI Rules to alert
+              on dwell time.
+            </div>
             {formError && <div className="text-xs text-critical">{formError}</div>}
             <button className="text-xs bg-accent text-ink font-medium rounded px-4 py-2">SAVE ZONE</button>
           </form>
@@ -93,7 +106,10 @@ export default function MapIntelligencePage() {
             <div className="border border-border rounded-lg divide-y divide-border h-fit">
               {zones.map((z) => (
                 <div key={z.id} className="px-3 py-2 flex justify-between text-sm">
-                  <span>{z.name} <span className="text-xs text-slate-500">({cameras.find((c) => c.id === z.camera_id)?.camera_code})</span></span>
+                  <span>
+                    {z.name} <span className="text-xs text-slate-500">({cameras.find((c) => c.id === z.camera_id)?.camera_code || "camera removed"})</span>
+                    {z.loitering_seconds && <span className="text-xs text-slate-500 ml-1">· loiter &gt;{z.loitering_seconds}s</span>}
+                  </span>
                   <span className={`severity-${z.severity} text-xs`}>{z.severity}</span>
                 </div>
               ))}

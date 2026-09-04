@@ -8,6 +8,8 @@ from functools import lru_cache
 
 import numpy as np
 
+from ..config import settings
+
 PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}$")
 
 
@@ -42,3 +44,11 @@ def read_plate(crop: np.ndarray) -> tuple[str, str, float]:
 
 def looks_like_plate(normalized: str) -> bool:
     return bool(PLATE_RE.match(normalized))
+
+
+def passes_anpr_gate(normalized: str, confidence: float) -> bool:
+    """The single quality gate (P0-C): a normalized OCR read only becomes a
+    Vehicle/Plate correlation record when it looks like a plate AND clears
+    the configured confidence floor. Extracted as its own function so it's
+    directly unit-testable without a real OCR/frame pipeline."""
+    return bool(normalized) and looks_like_plate(normalized) and confidence >= settings.plate_min_confidence
