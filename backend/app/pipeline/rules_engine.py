@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..ws import manager
+from .db_retry import safe_commit
 
 COOLDOWN_SECONDS = 45.0
 _last_alert_at: dict[tuple, float] = {}
@@ -176,6 +177,8 @@ async def evaluate(
     alerts.append(alert)
 
     # Auto-create an incident for CRITICAL alerts (doc §60 flagship flow)
+    incident = None
+    incident_evidence = None
     if severity == "CRITICAL":
         incident = models.Incident(
             title=f"Potential match — {vehicle.plate_text if vehicle else detection.cls} on {camera.camera_code}",
@@ -191,15 +194,26 @@ async def evaluate(
         db.add(incident)
         db.flush()
         if detection.snapshot_path:
-            db.add(models.Evidence(
+            incident_evidence = models.Evidence(
                 incident_id=incident.id,
                 evidence_type="snapshot",
                 camera_id=camera.id,
                 file_path=detection.snapshot_path,
                 verification_status="unverified",
-            ))
+            )
+            db.add(incident_evidence)
 
-    db.commit()
+    # alert/incident/incident_evidence are all freshly db.add()'d in this
+    # same call — never persisted before — so on a transient SQLite lock a
+    # rollback only detaches them; their already-set Python attributes
+    # (including each one's client-side-generated PK from the db.flush()
+    # calls above) survive untouched, so re-add() alone correctly restores
+    # them for a retry (verified empirically — see pipeline/db_retry.py).
+    await safe_commit(db, f"camera {camera.camera_code}", reapply=lambda: (
+        db.add(alert),
+        db.add(incident) if incident is not None else None,
+        db.add(incident_evidence) if incident_evidence is not None else None,
+    ))
     await manager.broadcast("alert", {
         "id": alert.id,
         "camera_id": camera.id,

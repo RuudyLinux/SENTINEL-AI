@@ -33,7 +33,7 @@ export default function DashboardPage() {
       {error ? (
         <ErrorState message={`Command Center KPIs could not be loaded: ${error}`} onRetry={reload} />
       ) : (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 stagger-children">
           <KpiCard
             title="Cameras"
             value={overview ? `${overview.cameras.online}/${overview.cameras.total}` : "—"}

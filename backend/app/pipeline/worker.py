@@ -26,14 +26,11 @@ from .appearance import compute_signature
 from .correlate import upsert_vehicle_for_plate
 from .rules_engine import evaluate
 from .timing import compute_source_timestamp
+from .db_retry import safe_commit
 from . import clips
 
 LATEST_FRAMES: dict[str, bytes] = {}
 RUNNING: dict[str, "asyncio.Task[None]"] = {}
-
-# Consecutive bad reads before we treat the stream as dropped and attempt a
-# real reconnect (release + reopen), rather than reacting to one blip.
-READ_FAILURES_BEFORE_RECONNECT = 3
 
 # Phase 4 diagnostics — per-camera runtime counters for the concurrency
 # investigation (frame/inference latency, drops, reconnects, last error).
@@ -82,22 +79,12 @@ def _ema(prev: float | None, sample: float, alpha: float = 0.2) -> float:
     return sample if prev is None else (alpha * sample + (1 - alpha) * prev)
 
 
-def _safe_commit(db: Session, camera_code: str) -> bool:
-    """A db.commit() that can never itself throw and kill the calling task.
-    Every commit outside the main per-iteration block (which has its own
-    dedicated try/except covering the whole iteration) goes through this
-    instead. Returns False on failure (already rolled back) so the caller
-    can decide whether to retry."""
-    try:
-        db.commit()
-        return True
-    except Exception:
-        logger.exception("camera %s: commit failed", camera_code)
-        try:
-            db.rollback()
-        except Exception:
-            logger.exception("camera %s: rollback after failed commit also failed", camera_code)
-        return False
+async def _safe_commit(db: Session, camera_code: str, reapply=None) -> bool:
+    """Thin camera-labeled wrapper around db_retry.safe_commit — see that
+    module for the full rationale (retry-with-reapply on a transient SQLite
+    lock, verified empirically; no retry without `reapply`, to avoid a
+    retry-with-nothing-pending silently reporting success on a lost write)."""
+    return await safe_commit(db, f"camera {camera_code}", reapply=reapply)
 
 
 async def _open_with_timeout(source: "CameraSource", camera_id: str | None = None) -> bool:
@@ -142,9 +129,18 @@ async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db
         # T assignment shows as a false-positive type error; at runtime an
         # ORM instance attribute is always the plain value, matching every
         # other read/write of `camera.*` throughout this module.
+        # Target values captured into locals BEFORE assignment/commit —
+        # `reapply` below must reassign FROM these, never from re-reading
+        # `camera.*` after a rollback, since rollback expires a persistent
+        # object's mutated attributes back to their last-committed DB value
+        # (verified empirically; see db_retry.py's module docstring).
+        degraded_error_count = camera.error_count + 1  # type: ignore[operator]
         camera.status = "degraded"  # type: ignore[assignment]
-        camera.error_count += 1  # type: ignore[assignment]
-        _safe_commit(db, str(camera.camera_code))
+        camera.error_count = degraded_error_count  # type: ignore[assignment]
+        await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
+            setattr(camera, "status", "degraded"),
+            setattr(camera, "error_count", degraded_error_count),
+        ))
         delay = min(settings.reconnect_backoff_max, settings.reconnect_backoff_base * (2 ** (attempt - 1)))
         await asyncio.sleep(delay)
         await asyncio.to_thread(source.release)
@@ -152,10 +148,16 @@ async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db
         if opened:
             ok, _ = await asyncio.to_thread(source.read)
             if ok:
+                online_fps = source.fps() or camera.fps or 15.0
+                online_resolution = source.resolution() or camera.resolution
                 camera.status = "online"  # type: ignore[assignment]
-                camera.fps = source.fps() or camera.fps or 15.0  # type: ignore[assignment]
-                camera.resolution = source.resolution() or camera.resolution  # type: ignore[assignment]
-                _safe_commit(db, str(camera.camera_code))
+                camera.fps = online_fps  # type: ignore[assignment]
+                camera.resolution = online_resolution  # type: ignore[assignment]
+                await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
+                    setattr(camera, "status", "online"),
+                    setattr(camera, "fps", online_fps),
+                    setattr(camera, "resolution", online_resolution),
+                ))
                 return True
     return False
 
@@ -240,6 +242,7 @@ async def _process_frame(
                     logger.exception("camera %s: appearance signature failed for detection %s", camera_code, det_row.id)
 
             vehicle = None
+            plate_row = None
             if bool(camera.ai_anpr) and d["cls"] in ("car", "truck", "bus", "motorbike"):
                 x1, y1, x2, y2 = [max(0, int(v)) for v in d["bbox"]]
                 crop = frame[y1:y2, x1:x2]
@@ -251,12 +254,13 @@ async def _process_frame(
                     snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
                     det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
                     vehicle = upsert_vehicle_for_plate(db, normalized, conf)
-                    db.add(models.Plate(
+                    plate_row = models.Plate(
                         vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
                         plate_text_raw=raw, plate_text_normalized=normalized,
                         confidence=conf, snapshot_path=snapshot_path,
                         source_timestamp=frame_source_ts,
-                    ))
+                    )
+                    db.add(plate_row)
 
             if not snapshot_path and vehicle is not None and bool(vehicle.watchlist_flag):
                 snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
@@ -274,7 +278,36 @@ async def _process_frame(
             # the latency finding is db.py's wal_autocheckpoint tuning
             # (checkpoint more often, in smaller increments, instead of
             # letting the WAL grow large between checkpoints).
-            db.commit()
+            #
+            # Retry-with-reapply on a transient lock (verified empirically —
+            # see db_retry.py): det_row/plate_row are freshly db.add()'d,
+            # never-committed objects, so a rollback only detaches them —
+            # their already-set Python attributes (including det_row.id,
+            # a client-side-generated PK computed at the db.flush() above,
+            # and plate_row's FK captured from it) survive untouched, so
+            # re-add() alone correctly restores them. `vehicle` may instead
+            # be a PRE-EXISTING, persistent row whose last_seen/
+            # plate_confidence were just mutated in-place (correlate.py) —
+            # rollback expires those back to their last-committed value, so
+            # reapply also explicitly re-sets them from the values captured
+            # right after they were computed (never by re-reading
+            # `vehicle.*`, which could return the stale, reverted value).
+            vehicle_target_last_seen = vehicle.last_seen if vehicle is not None else None
+            vehicle_target_confidence = vehicle.plate_confidence if vehicle is not None else None
+
+            def _reapply_detection_commit(
+                _det_row=det_row, _plate_row=plate_row, _vehicle=vehicle,
+                _last_seen=vehicle_target_last_seen, _confidence=vehicle_target_confidence,
+            ):
+                db.add(_det_row)
+                if _plate_row is not None:
+                    db.add(_plate_row)
+                if _vehicle is not None:
+                    db.add(_vehicle)  # no-op if already persistent/attached
+                    _vehicle.last_seen = _last_seen
+                    _vehicle.plate_confidence = _confidence
+
+            await _safe_commit(db, camera_code, reapply=_reapply_detection_commit)
             alerts = await evaluate(db, camera, det_row, w, h, vehicle)
             for alert in alerts:
                 incident = db.query(models.Incident).filter(models.Incident.alert_id == alert.id).first()
@@ -291,10 +324,16 @@ async def _process_frame(
                 # short-circuits this, so nothing changes for that path).
                 if not alert.snapshot_path:
                     evidence_snapshot_path = await asyncio.to_thread(_save_snapshot, frame, f"{camera_code}_{alert.id}")
+                    # `alert` (committed inside rules_engine.evaluate) and
+                    # `det_row` (committed just above) are both already
+                    # PERSISTENT by this point — a rollback here would expire
+                    # these mutations back to their last-committed value, not
+                    # just detach them, so reapply must reassign from these
+                    # captured locals, not from re-reading alert.*/det_row.*.
+                    det_snapshot_target = det_row.snapshot_path or evidence_snapshot_path
                     alert.snapshot_path = evidence_snapshot_path  # type: ignore[assignment]
-                    if not det_row.snapshot_path:
-                        det_row.snapshot_path = evidence_snapshot_path  # type: ignore[assignment]
-                    db.add(models.Evidence(
+                    det_row.snapshot_path = det_snapshot_target  # type: ignore[assignment]
+                    evidence_row = models.Evidence(
                         incident_id=incident.id if incident else None,
                         evidence_type="snapshot",
                         camera_id=camera_id,
@@ -304,8 +343,20 @@ async def _process_frame(
                         event_type=event_type,
                         source_timestamp=frame_source_ts,
                         verification_status="unverified",
-                    ))
-                    db.commit()
+                    )
+                    db.add(evidence_row)
+
+                    def _reapply_evidence_commit(
+                        _alert=alert, _det_row=det_row, _evidence_row=evidence_row,
+                        _alert_snapshot=evidence_snapshot_path, _det_snapshot=det_snapshot_target,
+                    ):
+                        db.add(_alert)  # no-op if already persistent/attached
+                        db.add(_det_row)
+                        db.add(_evidence_row)
+                        _alert.snapshot_path = _alert_snapshot
+                        _det_row.snapshot_path = _det_snapshot
+
+                    await _safe_commit(db, camera_code, reapply=_reapply_evidence_commit)
 
                 asyncio.create_task(clips.build_event_clip(
                     camera_id, camera_code, str(alert.id), str(det_row.id),
@@ -345,16 +396,26 @@ async def _camera_loop(camera_id: str) -> None:
             # webcam-busy failures), not just an immediate give-up.
             opened = await _reopen_with_backoff(source, camera, db)
         if not opened:
+            offline_error_count = camera.error_count + 1  # type: ignore[operator]
             camera.status = "offline"  # type: ignore[assignment]  # legacy Column() declarative model — plain-value assignment is correct at runtime
-            camera.error_count += 1  # type: ignore[assignment]
-            _safe_commit(db, str(camera.camera_code))
+            camera.error_count = offline_error_count  # type: ignore[assignment]
+            await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
+                setattr(camera, "status", "offline"),
+                setattr(camera, "error_count", offline_error_count),
+            ))
             if _stats(camera_id)["grid_state"] not in ("AUTH_ERROR",):
                 _set_grid_state(camera_id, "DISCONNECTED")
             return
+        initial_fps = source.fps() or 15.0
+        initial_resolution = source.resolution()
         camera.status = "online"  # type: ignore[assignment]
-        camera.fps = source.fps() or 15.0  # type: ignore[assignment]
-        camera.resolution = source.resolution()  # type: ignore[assignment]
-        _safe_commit(db, str(camera.camera_code))
+        camera.fps = initial_fps  # type: ignore[assignment]
+        camera.resolution = initial_resolution  # type: ignore[assignment]
+        await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
+            setattr(camera, "status", "online"),
+            setattr(camera, "fps", initial_fps),
+            setattr(camera, "resolution", initial_resolution),
+        ))
         # Cached rather than re-read from `camera.*` every loop iteration:
         # a rollback (unconditionally, regardless of expire_on_commit)
         # expires every attribute on the object, so a later bare read can
@@ -417,12 +478,16 @@ async def _camera_loop(camera_id: str) -> None:
 
                 if not ok or frame is None:
                     consecutive_failures += 1
-                    camera.error_count += 1  # type: ignore[assignment]
+                    read_fail_error_count = camera.error_count + 1  # type: ignore[operator]
+                    camera.error_count = read_fail_error_count  # type: ignore[assignment]
                     st["read_failures"] += 1
-                    if consecutive_failures < READ_FAILURES_BEFORE_RECONNECT:
+                    if consecutive_failures < settings.read_failures_before_reconnect:
                         camera.status = "degraded"  # type: ignore[assignment]
                         _set_grid_state(camera_id, "DEGRADED")
-                        _safe_commit(db, camera_code_cached)
+                        await _safe_commit(db, camera_code_cached, reapply=lambda: (
+                            setattr(camera, "status", "degraded"),
+                            setattr(camera, "error_count", read_fail_error_count),
+                        ))
                         loop_sleep_s = 1.0
                     else:
                         # Stream is actually dropped: attempt a real
@@ -433,7 +498,7 @@ async def _camera_loop(camera_id: str) -> None:
                             camera.status = "offline"  # type: ignore[assignment]
                             if _stats(camera_id)["grid_state"] not in ("AUTH_ERROR",):
                                 _set_grid_state(camera_id, "DISCONNECTED")
-                            _safe_commit(db, camera_code_cached)
+                            await _safe_commit(db, camera_code_cached, reapply=lambda: setattr(camera, "status", "offline"))
                             return  # stop this worker; operator can Restart the camera
                         consecutive_failures = 0
                         session_opened_at = datetime.now(timezone.utc)
@@ -480,10 +545,26 @@ async def _camera_loop(camera_id: str) -> None:
                         last_pos_msec = pos_msec
 
                     last_detections = await _process_frame(db, camera, frame, frame_idx, w, h, frame_source_ts, last_detections)
-                    camera.last_frame_at = datetime.now(timezone.utc)  # type: ignore[assignment]
+                    # Highest-frequency commit in the whole pipeline (up to
+                    # once/sec per camera, so N concurrent cameras = N/sec
+                    # writers to the same SQLite file) — real production logs
+                    # showed this specific commit as the dominant source of
+                    # "database is locked". Retried in place (reapply just
+                    # re-sets these two fields from the locals captured
+                    # below) so a transient lock here never falls through to
+                    # the outer except below, which would otherwise flip a
+                    # perfectly healthy camera to grid_state=ERROR and bump
+                    # error_count for a heartbeat write that had nothing to
+                    # do with the actual frame processing (which already
+                    # succeeded above).
+                    heartbeat_last_frame_at = datetime.now(timezone.utc)
+                    camera.last_frame_at = heartbeat_last_frame_at  # type: ignore[assignment]
                     camera.status = "online"  # type: ignore[assignment]
                     if now_mono - last_heartbeat_commit_at >= HEARTBEAT_MIN_INTERVAL_S:
-                        db.commit()
+                        await _safe_commit(db, camera_code_cached, reapply=lambda: (
+                            setattr(camera, "last_frame_at", heartbeat_last_frame_at),
+                            setattr(camera, "status", "online"),
+                        ))
                         last_heartbeat_commit_at = now_mono
                     loop_sleep_s = max(0.01, 1.0 / max(camera_fps_cached, 1.0))
             except Exception as exc:
@@ -495,15 +576,20 @@ async def _camera_loop(camera_id: str) -> None:
                     db.rollback()
                 except Exception:
                     logger.exception("camera %s: rollback after error also failed", camera_code_cached)
-                try:
-                    camera.error_count += 1  # type: ignore[assignment]
-                    db.commit()
-                except Exception:
-                    logger.exception("camera %s: error-count commit also failed", camera_code_cached)
+                else:
+                    # Reading `camera.error_count` here is itself a fresh
+                    # SELECT (rollback just expired it) — the exact "implicit
+                    # unguarded SELECT can itself hit a locked database" risk
+                    # this loop's own guard comment above warns about, so
+                    # it's covered by the same broad except as everything
+                    # else in this handler rather than being allowed to
+                    # escape and kill the task.
                     try:
-                        db.rollback()
+                        error_count_target = camera.error_count + 1  # type: ignore[operator]
+                        camera.error_count = error_count_target  # type: ignore[assignment]
+                        await _safe_commit(db, camera_code_cached, reapply=lambda: setattr(camera, "error_count", error_count_target))
                     except Exception:
-                        pass
+                        logger.exception("camera %s: error-count bump also failed, continuing", camera_code_cached)
                 loop_sleep_s = 0.5
 
             await asyncio.sleep(loop_sleep_s)

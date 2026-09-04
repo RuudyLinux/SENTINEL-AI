@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
+import { Play, Eye } from "lucide-react";
 import { buildTokenedUrl } from "@/lib/api";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "./ConnectionBadge";
 
@@ -38,8 +39,12 @@ export default function LiveVideoTile({ camera }: { camera: any }) {
           // eslint-disable-next-line @next/next/no-img-element
           <img src={streamUrl} alt={camera.name} className="w-full h-full object-cover" />
         ) : isLive ? (
-          <button onClick={startPreview} className="text-xs text-accent border border-accent/40 rounded px-3 py-1.5 hover:bg-accent/10">
-            ▶ Preview
+          <button
+            onClick={startPreview}
+            className="flex items-center gap-1.5 text-xs text-accent border border-accent/40 rounded px-3 py-1.5 hover:bg-accent/10 transition-colors duration-150"
+          >
+            <Play size={13} strokeWidth={2.25} />
+            Preview
           </button>
         ) : (
           <div className="text-xs text-slate-500 text-center px-4">
@@ -51,7 +56,11 @@ export default function LiveVideoTile({ camera }: { camera: any }) {
         <span>{camera.location} | {camera.resolution || "—"} | {camera.fps ? camera.fps.toFixed(0) : 0} FPS</span>
       </div>
       <div className="px-2 pb-2 flex gap-2">
-        <Link href={`/live/${camera.id}`} className="flex-1 text-center text-xs bg-panel2 border border-border rounded py-1 hover:border-accent">
+        <Link
+          href={`/live/${camera.id}`}
+          className="flex-1 flex items-center justify-center gap-1.5 text-xs bg-panel2 border border-border rounded py-1 hover:border-accent transition-colors duration-150"
+        >
+          <Eye size={13} strokeWidth={2.25} />
           VIEW
         </Link>
       </div>

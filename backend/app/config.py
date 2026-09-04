@@ -2,15 +2,30 @@
 from pathlib import Path
 
 import cv2
-from pydantic_settings import BaseSettings
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Values that must never be trusted as a real production JWT secret — the
+# bundled dev default plus a couple of common placeholder strings someone
+# might paste in without actually generating a random one.
+_INSECURE_JWT_SECRETS = {
+    "sentinel-vision-dev-secret-change-in-production", "", "changeme", "secret", "password",
+}
+_MIN_PRODUCTION_JWT_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
     jwt_secret: str = "sentinel-vision-dev-secret-change-in-production"
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 480
+
+    # CORS (hardening pass): was hardcoded to localhost:3000 in main.py —
+    # correct for local demo, but not configurable for an actual deploy.
+    # Comma-separated so it stays a plain env var, no JSON parsing needed;
+    # default preserves today's exact behavior unchanged.
+    cors_allowed_origins: str = "http://localhost:3000"
 
     db_path: Path = BASE_DIR / "sentinel.db"
     uploads_dir: Path = BASE_DIR / "uploads"
@@ -32,6 +47,16 @@ class Settings(BaseSettings):
     reconnect_max_attempts: int = 5
     reconnect_backoff_base: float = 1.0
     reconnect_backoff_max: float = 30.0
+    # Consecutive bad reads tolerated before a camera is treated as dropped
+    # and a real reconnect (release + reopen) is attempted, vs. reacting to
+    # one blip. Real observed finding: individual h264 decode errors
+    # ("error while decoding MB ...") on a live RTSP feed are FFmpeg
+    # recovering from a corrupted macroblock, not necessarily a failed
+    # `read()` — but they cluster during real network jitter, so raised
+    # from 3 to 8 to ride out a short bad patch (~250-300ms at 30fps)
+    # without a full reconnect cycle, while still catching a genuinely
+    # dead stream in under a second.
+    read_failures_before_reconnect: int = 8
 
     # Upload hardening (P0-F)
     max_upload_mb: int = 500
@@ -128,8 +153,27 @@ class Settings(BaseSettings):
     clip_post_event_seconds: float = 10.0
     clip_fps: float = 10.0  # nominal playback rate; source frames may be variable-interval
 
-    class Config:
-        env_file = ".env"
+    model_config = SettingsConfigDict(env_file=".env")
+
+    @model_validator(mode="after")
+    def _enforce_production_jwt_secret(self) -> "Settings":
+        # Hardening-pass finding: nothing previously stopped DEMO_MODE=false
+        # (the documented "this is a production deploy" signal — see seed.py,
+        # which already gates demo accounts/watchlist seeding on it) from
+        # running with the bundled dev JWT secret, or a short/placeholder
+        # one. Demo mode is completely unaffected — this only fires once
+        # DEMO_MODE=false is set, which is exactly the signal that a real
+        # deploy is intended. Fails loudly at startup (import time), not
+        # silently, and never once the app is already serving requests.
+        if not self.demo_mode:
+            if self.jwt_secret in _INSECURE_JWT_SECRETS or len(self.jwt_secret) < _MIN_PRODUCTION_JWT_SECRET_LENGTH:
+                raise RuntimeError(
+                    "DEMO_MODE=false (production mode) requires a real JWT_SECRET — at least "
+                    f"{_MIN_PRODUCTION_JWT_SECRET_LENGTH} characters, not the bundled dev default "
+                    "or a placeholder. Set JWT_SECRET in the environment/.env, e.g.:\n"
+                    '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+                )
+        return self
 
 
 settings = Settings()

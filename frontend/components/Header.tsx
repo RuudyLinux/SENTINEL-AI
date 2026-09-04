@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { Menu, Search, Bell, Wifi, WifiOff, CircleUserRound, LogOut } from "lucide-react";
 import { clearToken, getStoredUser } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 
@@ -29,36 +30,53 @@ export default function Header({ onMenuClick }: { onMenuClick?: () => void }) {
       <button
         onClick={onMenuClick}
         aria-label="Open navigation menu"
-        className="md:hidden shrink-0 text-slate-300 hover:text-accent text-lg leading-none px-1.5 py-1 border border-border rounded"
+        className="md:hidden shrink-0 text-slate-300 hover:text-accent px-1.5 py-1.5 border border-border rounded-md transition-colors duration-150"
       >
-        ☰
+        <Menu size={18} strokeWidth={2} />
       </button>
-      <form onSubmit={submitSearch} className="flex-1 min-w-0 sm:max-w-xl">
+      <form onSubmit={submitSearch} className="flex-1 min-w-0 sm:max-w-xl relative">
+        <Search size={15} strokeWidth={2} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" aria-hidden="true" />
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Search camera, person, vehicle, plate..."
-          className="w-full min-w-0 bg-panel2 border border-border rounded-md px-3 py-1.5 text-sm outline-none focus:border-accent"
+          className="w-full min-w-0 bg-panel2 border border-border rounded-md pl-9 pr-3 py-1.5 text-sm outline-none focus:border-accent transition-colors duration-150"
         />
       </form>
       <div className="flex items-center gap-2 sm:gap-4 ml-auto text-sm shrink-0">
-        <button onClick={() => router.push("/alerts")} className="relative text-slate-300 hover:text-accent" title={error ? "Alert count unavailable — backend unreachable" : undefined}>
-          🔔 {error ? "—" : overview?.alerts.active ?? 0}
+        <button
+          onClick={() => router.push("/alerts")}
+          className="relative flex items-center gap-1.5 text-slate-300 hover:text-accent transition-colors duration-150"
+          title={error ? "Alert count unavailable — backend unreachable" : undefined}
+        >
+          <Bell size={17} strokeWidth={2} />
+          <span className="text-xs">{error ? "—" : overview?.alerts.active ?? 0}</span>
         </button>
+        {/* System status — the one continuously-animated element in the navbar
+            (a subtle breathing pulse on the dot only), per the "don't animate
+            the whole navbar" rule. */}
         <span
           className={`hidden sm:flex items-center gap-1.5 text-xs ${error ? "text-critical" : "text-slate-400"}`}
           title={error ? `Backend unreachable: ${error}` : "Backend reachable"}
         >
-          <span className={`h-2 w-2 rounded-full ${error ? "bg-critical" : "bg-ok"}`} />
-          {error ? "System unreachable" : "System"}
+          <span className="relative flex h-2 w-2">
+            <span className={`absolute inline-flex h-full w-full rounded-full ${error ? "bg-critical" : "bg-ok"} ${error ? "" : "animate-pulse-subtle"}`} />
+          </span>
+          {error ? <WifiOff size={14} strokeWidth={2} /> : <Wifi size={14} strokeWidth={2} />}
+          {error ? "System unreachable" : "System online"}
         </span>
         {user && (
           <div className="flex items-center gap-2">
+            <CircleUserRound size={20} strokeWidth={1.75} className="hidden md:block text-slate-400" aria-hidden="true" />
             <div className="hidden md:block text-right leading-tight">
               <div className="text-xs font-medium">{user.full_name}</div>
               <div className="text-[10px] text-slate-500">{user.role}</div>
             </div>
-            <button onClick={logout} className="text-xs text-slate-400 hover:text-red-400 border border-border rounded px-2 py-1 shrink-0">
+            <button
+              onClick={logout}
+              className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-red-400 border border-border rounded px-2 py-1 shrink-0 transition-colors duration-150"
+            >
+              <LogOut size={13} strokeWidth={2} />
               Logout
             </button>
           </div>

@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { WS_BASE } from "./api";
+import { WS_BASE, getToken } from "./api";
 
 export type LiveEvent = { type: string; data: any };
 
@@ -18,7 +18,14 @@ export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
 
     function connect() {
       if (cancelled) return;
-      const ws = new WebSocket(`${WS_BASE}/ws`);
+      // Browsers can't attach an Authorization header to a WebSocket
+      // handshake, so the token travels as a query param instead (backend
+      // validates it before accepting — see main.py's /ws). Read fresh on
+      // every (re)connect attempt, not just once, so a login that happens
+      // after this hook first mounted is picked up on the next retry.
+      const token = getToken();
+      const url = token ? `${WS_BASE}/ws?token=${encodeURIComponent(token)}` : `${WS_BASE}/ws`;
+      const ws = new WebSocket(url);
       wsRef.current = ws;
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {

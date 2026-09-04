@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -11,6 +12,23 @@ from ..config import settings
 from ..audit import log_action
 
 router = APIRouter(prefix="/api/evidence", tags=["evidence"])
+
+
+def _safe_evidence_path(raw_path: str) -> Path:
+    """Every current write path for Evidence.file_path is server-generated
+    (worker.py._save_snapshot, pipeline/clips.py — timestamped filenames
+    under settings.evidence_dir, never client input), so this is defense in
+    depth rather than a fix for a reachable exploit today: resolves the
+    stored path and refuses to serve anything outside the evidence
+    directory, so a future bug (or a bad row from some other path) can
+    never turn this endpoint into an arbitrary-file-read."""
+    resolved = Path(raw_path).resolve()
+    evidence_root = settings.evidence_dir.resolve()
+    if evidence_root not in resolved.parents and resolved != evidence_root:
+        raise HTTPException(status_code=404, detail="Evidence file not found")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Evidence file not found")
+    return resolved
 
 
 @router.get("", response_model=list[schemas.EvidenceOut])
@@ -50,8 +68,9 @@ def download_evidence_file(evidence_id: str, token: str, db: Session = Depends(g
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e or not e.file_path:
         raise HTTPException(status_code=404, detail="No file for this evidence record")
+    safe_path = _safe_evidence_path(e.file_path)
     log_action(db, user, "download_evidence", resource=evidence_id)
-    return FileResponse(e.file_path)
+    return FileResponse(safe_path)
 
 
 def _hash_file(path: str) -> str:

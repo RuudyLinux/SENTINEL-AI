@@ -34,6 +34,27 @@ def create_access_token(user: models.User) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
+def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.User]:
+    """Same JWT validation as get_current_user, usable outside the HTTP
+    Authorization-header/OAuth2PasswordBearer machinery — for the WebSocket
+    handshake (browsers can't attach a header there; the token travels as a
+    query parameter instead, see main.py's /ws). Returns None rather than
+    raising; the caller decides what "no valid user" means for its transport."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+    except JWTError:
+        return None
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None or not user.active:
+        return None
+    return user
+
+
 def get_current_user(
     token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> models.User:
@@ -42,17 +63,8 @@ def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    if not token:
-        raise credentials_exc
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise credentials_exc
-    except JWTError:
-        raise credentials_exc
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user is None or not user.active:
+    user = get_user_from_token(token, db)
+    if user is None:
         raise credentials_exc
     return user
 

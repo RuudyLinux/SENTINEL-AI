@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class LoginRequest(BaseModel):
@@ -24,8 +24,7 @@ class UserOut(BaseModel):
     role: Optional[str] = None
     active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UserCreate(BaseModel):
@@ -41,8 +40,7 @@ class RoleOut(BaseModel):
     name: str
     description: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CameraCreate(BaseModel):
@@ -119,8 +117,7 @@ class CameraOut(BaseModel):
     whep_url: Optional[str] = None
     hls_url: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DetectionOut(BaseModel):
@@ -134,8 +131,7 @@ class DetectionOut(BaseModel):
     track_id: Optional[str] = None
     snapshot_path: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PlateOut(BaseModel):
@@ -148,8 +144,7 @@ class PlateOut(BaseModel):
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class VehicleOut(BaseModel):
@@ -162,8 +157,7 @@ class VehicleOut(BaseModel):
     last_seen: datetime
     watchlist_flag: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SightingOut(BaseModel):
@@ -198,8 +192,7 @@ class WatchlistOut(BaseModel):
     valid_from: datetime
     valid_until: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ZoneCreate(BaseModel):
@@ -220,8 +213,7 @@ class ZoneOut(ZoneCreate):
     id: str
     active: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AlertRuleCreate(BaseModel):
@@ -236,8 +228,7 @@ class AlertRuleOut(AlertRuleCreate):
     active: bool
     version: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AlertOut(BaseModel):
@@ -252,8 +243,7 @@ class AlertOut(BaseModel):
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IncidentCreate(BaseModel):
@@ -282,8 +272,7 @@ class IncidentOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class IncidentNoteCreate(BaseModel):
@@ -304,8 +293,7 @@ class EvidenceOut(BaseModel):
     event_type: str = ""
     source_timestamp: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AuditOut(BaseModel):
@@ -316,5 +304,4 @@ class AuditOut(BaseModel):
     result: str
     timestamp: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

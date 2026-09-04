@@ -115,7 +115,17 @@ def test_filenames_do_not_collide_across_concurrent_cameras(monkeypatch, db_sess
     asyncio.run(worker._process_frame(db_session, cam_a, frame, 0, 640, 480, None, []))
     asyncio.run(worker._process_frame(db_session, cam_b_camera, frame, 0, 640, 480, None, []))
 
-    paths = [e.file_path for e in db_session.query(models.Evidence).all()]
+    # Scoped to exactly these two cameras' own evidence — an unscoped query
+    # over the whole table picks up rows from every other test file sharing
+    # this DB (same class of cross-test pollution fixed elsewhere this
+    # session), which is a test-isolation bug, not evidence of a real
+    # filename collision.
+    paths = [
+        e.file_path for e in db_session.query(models.Evidence)
+        .filter(models.Evidence.camera_id.in_([cam_a.id, cam_b_camera.id]))
+        .all()
+    ]
+    assert len(paths) == 2
     assert len(paths) == len(set(paths))  # no collisions
     for p in paths:
         assert Path(p).exists()

@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,6 +9,8 @@ from .seed import run_seed
 from .ws import manager
 from .pipeline.worker import start_worker
 from .pipeline import supervisor
+from .security import get_user_from_token
+from .config import settings
 
 from .routers import (
     auth, cameras, streams, detections, vehicles, persons, search,
@@ -14,11 +18,25 @@ from .routers import (
     analytics, system,
 )
 
-app = FastAPI(title="SENTINEL VISION API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup and shutdown in one place (FastAPI's on_event startup/shutdown
+    # hooks are deprecated in favor of this) — same two phases as before,
+    # just expressed as the code before/after the single `yield` rather than
+    # two separate decorated functions.
+    await _on_startup()
+    yield
+    await _on_shutdown()
+
+
+app = FastAPI(title="SENTINEL VISION API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Configurable (CORS_ALLOWED_ORIGINS, comma-separated) rather than
+    # hardcoded — default preserves the exact local-demo origin unchanged.
+    allow_origins=[o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,8 +48,7 @@ for r in (auth, cameras, streams, detections, vehicles, persons, search,
     app.include_router(r.router)
 
 
-@app.on_event("startup")
-async def on_startup():
+async def _on_startup():
     Base.metadata.create_all(bind=engine)
     # Additive-only migration for columns added after a DB already existed
     # (create_all never alters existing tables) — see db.ensure_columns.
@@ -86,8 +103,7 @@ async def on_startup():
     supervisor.start_supervisor()
 
 
-@app.on_event("shutdown")
-async def on_shutdown():
+async def _on_shutdown():
     # Stops the supervisor's sweep loop and every camera worker it manages
     # cleanly — no orphaned asyncio task or RTSP/cv2 resource left behind at
     # process exit.
@@ -100,7 +116,23 @@ def health():
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket, token: str | None = None):
+    # Real gap found in a hardening pass: this endpoint broadcasts live
+    # detection/alert events (worker.py, rules_engine.py) and previously had
+    # NO authentication at all — anyone who could reach the backend got the
+    # live surveillance feed without logging in. Browsers can't attach an
+    # Authorization header to a WebSocket handshake, so the token travels as
+    # a query parameter instead (same reasoning as the existing resource-
+    # token endpoints for evidence/streams) and is validated with the same
+    # JWT before the connection is ever accepted.
+    db = SessionLocal()
+    try:
+        user = get_user_from_token(token, db)
+    finally:
+        db.close()
+    if user is None:
+        await ws.close(code=4401)
+        return
     await manager.connect(ws)
     try:
         while True:

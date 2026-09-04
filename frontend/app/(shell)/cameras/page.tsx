@@ -332,7 +332,7 @@ export default function CamerasPage() {
               {lastCatalogSync && <> · Last catalogue sync: {new Date(lastCatalogSync).toLocaleString()}</>}
             </div>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 stagger-children">
             <KpiCard title="Registered" value={gridRegistered} />
             <KpiCard title="Connected" value={gridConnected} sub="live stream, AI on or off" />
             <KpiCard title="Processing" value={gridProcessing} sub="AI actively running" />
