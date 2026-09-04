@@ -333,7 +333,7 @@ async def _process_frame(
                 if passes_anpr_gate(normalized, conf):
                     snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
                     det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
-                    vehicle = upsert_vehicle_for_plate(db, normalized, conf)
+                    vehicle = await upsert_vehicle_for_plate(db, normalized, conf)
                     plate_row = models.Plate(
                         vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
                         plate_text_raw=raw, plate_text_normalized=normalized,

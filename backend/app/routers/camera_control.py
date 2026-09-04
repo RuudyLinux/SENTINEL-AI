@@ -118,8 +118,12 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "AI-disable write did not persist (database busy) — retry"}
             detail = "AI stopped"
         elif action == "restart":
-            stop_worker(camera_id)
-            start_worker(camera_id)
+            # Audit finding: raw stop_worker+start_worker bypassed
+            # supervisor.py's AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping
+            # for a sentinel_grid camera. supervisor.restart is the single
+            # shared implementation also used by the single-camera restart
+            # endpoint (routers/cameras.py) — reused, not duplicated.
+            supervisor.restart(camera_id, str(camera.source_type))
             detail = "Restarted"
         elif action == "disconnect":
             if camera.source_type == "sentinel_grid":

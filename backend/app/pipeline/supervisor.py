@@ -249,3 +249,33 @@ def disconnect(camera_id: str) -> None:
     AUTO_MANAGED.discard(camera_id)
     OPERATOR_DISCONNECTED.add(camera_id)
     worker.stop_worker(camera_id)
+
+
+def restart(camera_id: str, source_type: str) -> None:
+    """Explicit operator Restart — single source of truth for BOTH the
+    single-camera restart endpoint (routers/cameras.py) and the bulk
+    Camera Control Center restart action (routers/camera_control.py), so
+    the two never drift.
+
+    Audit finding (PR #1 review): both call sites used to do a raw
+    `worker.stop_worker(camera_id); worker.start_worker(camera_id)` even
+    for a real Sentinel Grid camera — that bypasses this module's
+    AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping entirely, so a restarted
+    grid camera that drops again later was silently NOT picked back up by
+    the 24/7 auto-reconnect sweep (never added to AUTO_MANAGED by a raw
+    start_worker call), regardless of whether the operator had ever
+    explicitly disconnected it. Fixed by reusing connect() (exactly as an
+    explicit Connect does) after the stop, for a sentinel_grid camera —
+    real state transition, not just cosmetic: OPERATOR_DISCONNECTED is
+    cleared and AUTO_MANAGED gains the camera, same as a fresh Connect.
+
+    `worker.stop_worker` must run first and be awaited-by-being-synchronous
+    here (it's a plain function, not a coroutine) so `connect()`'s
+    `start_worker` call sees no still-running task for this camera_id and
+    actually starts a fresh one — start_worker's own dedup guard
+    (`existing and not existing.done()`) would otherwise silently no-op."""
+    worker.stop_worker(camera_id)
+    if source_type == "sentinel_grid":
+        connect(camera_id)
+    else:
+        worker.start_worker(camera_id)

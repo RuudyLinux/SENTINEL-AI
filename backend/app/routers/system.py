@@ -9,9 +9,9 @@ from ..config import settings
 from ..db import get_db
 from ..security import get_current_user, require_roles
 from ..audit import log_action
-from ..pipeline.worker import RUNNING, stop_worker
+from ..pipeline.worker import RUNNING, start_worker, stop_worker
 from ..pipeline.demo_scenario import trigger_scenario, DemoScenarioError
-from ..seed import reset_demo_data
+from ..seed import reset_demo_data, DEMO_CAMERAS
 from ..ws import manager
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -53,15 +53,34 @@ def system_status(db: Session = Depends(get_db), user: models.User = Depends(get
 
 
 @router.post("/demo/reset")
-def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
     """Returns the app to a clean, repeatable judge-demo state. DEMO_MODE
     only. Stops any running camera workers first (their DB rows are about
     to be reset), wipes transactional data, and re-ensures the two demo
-    cameras + the demo watchlist entry — see seed.reset_demo_data."""
+    cameras + the demo watchlist entry — see seed.reset_demo_data.
+
+    Real-evidence-workflow fix: reset_demo_data only ever wrote DB rows —
+    it never started the two demo cameras' workers, so `worker.LATEST_FRAMES`
+    was always empty by the time an operator called
+    POST /demo/trigger-scenario next, and demo_scenario.py's
+    _save_demo_snapshot (correctly) refuses to fabricate a frame, silently
+    producing NO evidence for the flagship demo path. Starting them here —
+    same as _on_startup does for every video_file camera — means a real
+    frame is actually decoding from the real bundled video
+    (uploads/car-detection.mp4) by the time the demo continues, so the demo
+    scenario's snapshot/clip are genuine, not empty by omission. `async def`
+    (not the previous `def`) because start_worker() calls
+    asyncio.create_task(), which needs a running event loop in this thread —
+    FastAPI runs sync `def` handlers in a worker thread with no such loop
+    (the exact bug class README.md's "Camera creation crash" entry already
+    documents fixing once for POST /api/cameras)."""
     _require_demo_mode()
     for camera in db.query(models.Camera).all():
         stop_worker(camera.id)
     summary = reset_demo_data(db)
+    demo_codes = [c["camera_code"] for c in DEMO_CAMERAS]
+    for camera in db.query(models.Camera).filter(models.Camera.camera_code.in_(demo_codes)).all():
+        start_worker(camera.id)
     log_action(db, user, "demo_reset", resource=",".join(summary["cameras"]))
     return summary
 

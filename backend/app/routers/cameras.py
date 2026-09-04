@@ -306,11 +306,17 @@ def system_diagnostics(user: models.User = Depends(require_roles("Administrator"
 
 @router.post("/{camera_id}/restart")
 async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
+    """Audit finding (PR #1 review): a real Sentinel Grid camera restarted
+    via raw stop_worker/start_worker bypassed supervisor.py's AUTO_MANAGED/
+    OPERATOR_DISCONNECTED bookkeeping entirely, so it silently dropped out
+    of the 24/7 auto-reconnect sweep. Fixed by routing through
+    supervisor.restart — the single shared implementation also used by the
+    bulk Camera Control Center restart (routers/camera_control.py), so the
+    two can never drift again."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
-    stop_worker(camera_id)
-    start_worker(camera_id)
+    supervisor.restart(camera_id, str(camera.source_type))
     log_action(db, user, "restart_camera", resource=camera.camera_code)
     return {"ok": True}
 
