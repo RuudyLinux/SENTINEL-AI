@@ -94,12 +94,47 @@ redundant load on the grid.)
 
 Transitions `CONNECTED → RECONNECTING → CONNECTED` and
 `CONNECTED → RECONNECTING → DISCONNECTED` both observed for real during
-staging, consistent with the existing 2/4/8/16/30s backoff. No duplicate
+staging, consistent with the existing 1/2/4/8/16s backoff (see §8b — this
+figure was corrected after this section was first written). No duplicate
 workers at any point (dict-keyed by camera_id, and the existing
 `test_connect_eligible_never_starts_a_second_worker_for_an_already_running_camera`
 / `test_sweep_does_not_undo_a_manual_disconnect` tests cover this
 structurally). Not intentionally attacked/overloaded — each stage was one
 clean staggered rollout, observed, then cleanly stopped before the next.
+
+## 8b. Addendum — re-verification with a longer observation window
+
+Follow-up request: push past 5 with careful tuning rather than a blanket
+cap change. Two corrections to the record above:
+
+- **Backoff schedule correction**: `reconnect_backoff_base=1.0`,
+  doubling, capped at 30s, over `reconnect_max_attempts=5` is actually
+  **1/2/4/8/16s** (not 2/4/8/16/30 as stated earlier in this doc) — the
+  earlier figure was never numerically checked. Total internal retry
+  budget per connection attempt is ~31s, not ~60s.
+- **Level 8 re-tested with a 5-minute window** (previous runs were judged
+  after only ~60-80s, before every staggered camera's own retry budget
+  could have played out — camera #8 with 6s stagger doesn't even start
+  trying until t≈42s). Result: it does **not** converge given time — it
+  settles into an oscillating equilibrium, mostly 4/8, briefly touching 3
+  or transient RECONNECTING flurries, never durably higher. This is a
+  stronger, more honest result than the earlier "not yet stable" — it's
+  genuinely not stable at any observed duration, not just "needs more
+  patience."
+- **Level 5 re-verified over 3 minutes the same session**: took longer to
+  fully settle than the original test (~140s vs ~40s — the grid was
+  measurably noisier this run), but **did reach and hold 5/5** for the
+  remainder of the window. 5 remains the one number that has now been
+  independently reproduced stable on two separate days/sessions.
+- Local RAM/CPU stayed uninvolved in the level-8 failure (884 MB RSS,
+  4.17 GB system RAM still free at the end of that 5-minute run, most
+  workers dead) — confirms again this is the external grid's own
+  tolerance, not this machine.
+
+No config change made as a result: the default cap was already 5, which
+is the only number with two independent stable confirmations. Default
+`sentinel_grid_stagger_seconds` stays 3.0s — 6s helped a single run at
+level 8 but didn't produce a durable result either.
 
 ## 9. Tests added (108 total, up from 105)
 
