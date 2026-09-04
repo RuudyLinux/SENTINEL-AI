@@ -37,7 +37,8 @@ value captured before the first attempt*, never from re-reading the object.
 """
 import asyncio
 import logging
-from typing import Callable
+import time
+from typing import Awaitable, Callable
 
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -56,11 +57,87 @@ def _is_lock_error(exc: OperationalError) -> bool:
     return any(marker in msg for marker in _LOCK_MARKERS)
 
 
+async def _safe_write(
+    db: Session,
+    op_name: str,
+    op: Callable[[], None],
+    label: str,
+    reapply: Callable[[], None] | None,
+    max_attempts: int,
+    on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None" = None,
+) -> bool:
+    """Shared retry body for both safe_commit and safe_flush below — a lock
+    on `db.flush()` (which itself issues real INSERT/UPDATE statements
+    against SQLite, same as commit) is the identical failure mode with the
+    identical fix, just at a different point in the transaction. See this
+    module's docstring for why a bare retry loop is wrong and what
+    `reapply` must do.
+
+    The actual flush()/commit()/rollback() calls are offloaded via
+    asyncio.to_thread: they block synchronously on SQLite's busy_timeout
+    wait, and running that on the event loop thread would stall every other
+    camera's asyncio task sharing it for the whole wait.
+
+    `on_result`, if given, is awaited exactly once right before returning,
+    as `(final_attempt, max_attempts, success, was_lock_error, duration_s)`
+    — purely observational (e.g. self_heal.engine.record_event); this
+    function's own retry/rollback/return behavior never depends on it, and
+    a failure inside it is caught by the caller (self_heal's own record_event
+    is itself best-effort/never-raises), never here.
+    """
+    started = time.monotonic()
+    attempts = max_attempts if reapply is not None else 1
+    ever_lock = False
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.to_thread(op)
+            if on_result is not None:
+                await on_result(attempt, attempts, True, ever_lock, time.monotonic() - started)
+            return True
+        except OperationalError as exc:
+            is_lock = _is_lock_error(exc)
+            ever_lock = ever_lock or is_lock
+            if is_lock:
+                logger.warning(
+                    "%s: %s hit a locked database (attempt %d/%d)%s",
+                    label, op_name, attempt, attempts, "" if attempt < attempts else " — giving up",
+                )
+            else:
+                logger.exception("%s: %s failed (not a lock — not retrying)", label, op_name)
+        except Exception:
+            logger.exception("%s: %s failed", label, op_name)
+            is_lock = False
+
+        try:
+            await asyncio.to_thread(db.rollback)
+        except Exception:
+            logger.exception("%s: rollback after failed %s also failed", label, op_name)
+            if on_result is not None:
+                await on_result(attempt, attempts, False, ever_lock, time.monotonic() - started)
+            return False
+
+        if is_lock and reapply is not None and attempt < attempts:
+            try:
+                reapply()
+            except Exception:
+                logger.exception("%s: reapply before %s retry failed", label, op_name)
+                if on_result is not None:
+                    await on_result(attempt, attempts, False, ever_lock, time.monotonic() - started)
+                return False
+            await asyncio.sleep(min(0.5, 0.05 * (2 ** (attempt - 1))))
+            continue
+        if on_result is not None:
+            await on_result(attempt, attempts, False, ever_lock, time.monotonic() - started)
+        return False
+    return False
+
+
 async def safe_commit(
     db: Session,
     label: str,
     reapply: Callable[[], None] | None = None,
     max_attempts: int = 4,
+    on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None" = None,
 ) -> bool:
     """A db.commit() that can never itself throw and kill the calling task.
 
@@ -78,42 +155,30 @@ async def safe_commit(
     a no-op that reports success while having silently lost the write, which
     is worse than today's visible, logged failure.
 
-    The actual commit()/rollback() calls are offloaded via asyncio.to_thread:
-    they block synchronously on SQLite's busy_timeout wait, and running that
-    on the event loop thread would stall every other camera's asyncio task
-    sharing it for the whole wait.
+    `on_result`: see _safe_write above — optional observational hook.
     """
-    attempts = max_attempts if reapply is not None else 1
-    for attempt in range(1, attempts + 1):
-        try:
-            await asyncio.to_thread(db.commit)
-            return True
-        except OperationalError as exc:
-            is_lock = _is_lock_error(exc)
-            if is_lock:
-                logger.warning(
-                    "%s: commit hit a locked database (attempt %d/%d)%s",
-                    label, attempt, attempts, "" if attempt < attempts else " — giving up",
-                )
-            else:
-                logger.exception("%s: commit failed (not a lock — not retrying)", label)
-        except Exception:
-            logger.exception("%s: commit failed", label)
-            is_lock = False
+    return await _safe_write(db, "commit", db.commit, label, reapply, max_attempts, on_result)
 
-        try:
-            await asyncio.to_thread(db.rollback)
-        except Exception:
-            logger.exception("%s: rollback after failed commit also failed", label)
-            return False
 
-        if is_lock and reapply is not None and attempt < attempts:
-            try:
-                reapply()
-            except Exception:
-                logger.exception("%s: reapply before commit retry failed", label)
-                return False
-            await asyncio.sleep(min(0.5, 0.05 * (2 ** (attempt - 1))))
-            continue
-        return False
-    return False
+async def safe_flush(
+    db: Session,
+    label: str,
+    reapply: Callable[[], None] | None = None,
+    max_attempts: int = 4,
+    on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None" = None,
+) -> bool:
+    """Same contract as safe_commit, for db.flush(). Root-cause fix for a real
+    gap found in production logs: worker.py's `db.add(det_row); db.flush()`
+    (assigns the detection's client-generated id and makes it visible for the
+    rest of the frame's processing, well before the eventual safe_commit)
+    issued a real write against SQLite completely unguarded — a lock there
+    surfaced as an uncaught OperationalError that killed the whole per-frame
+    detection loop iteration (rolled back further up in worker.py's outer
+    except, silently dropping that detection) instead of being retried in
+    place like every other write in this pipeline.
+
+    `reapply` for a flush is almost always just re-`db.add()`-ing the still-
+    transient object(s) pending in this flush — rollback only detaches them,
+    their already-set Python attributes (including a client-side-generated
+    PK) survive untouched, same as safe_commit's docstring above."""
+    return await _safe_write(db, "flush", db.flush, label, reapply, max_attempts, on_result)

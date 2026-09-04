@@ -1,13 +1,16 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+logger = logging.getLogger("sentinel.main")
+
 from .db import Base, engine, SessionLocal, ensure_columns, ensure_indexes
 from . import models
 from .seed import run_seed
 from .ws import manager
-from .pipeline.worker import start_worker
+from .pipeline.worker import start_worker, stop_worker, RUNNING
 from .pipeline import supervisor
 from .security import get_user_from_token
 from .config import settings
@@ -15,8 +18,9 @@ from .config import settings
 from .routers import (
     auth, cameras, streams, detections, vehicles, persons, search,
     alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-    analytics, system,
+    analytics, system, self_heal, camera_control,
 )
+from .self_heal import engine as self_heal_engine
 
 
 @asynccontextmanager
@@ -44,7 +48,7 @@ app.add_middleware(
 
 for r in (auth, cameras, streams, detections, vehicles, persons, search,
           alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-          analytics, system):
+          analytics, system, self_heal, camera_control):
     app.include_router(r.router)
 
 
@@ -72,7 +76,7 @@ async def _on_startup():
         backfill_defaults={"event_type": "''"},
     )
     # Camera groups (Model 2/4), person appearance-similarity signatures (Phase 5),
-    # loitering rule support (Phase 6) — see HYBRID_ARCHITECTURE.md.
+    # loitering rule support (Phase 6) — see README.md → "Capability breakdown".
     ensure_columns("cameras", {"camera_group": "VARCHAR"}, backfill_defaults={"camera_group": "''"})
     ensure_columns("detections", {"appearance_signature": "JSON"})
     ensure_columns("zones", {"loitering_seconds": "FLOAT"})
@@ -102,12 +106,37 @@ async def _on_startup():
     await supervisor.discover_and_register()
     supervisor.start_supervisor()
 
+    # Self-Heal: reload the open-problem index from real recorded events so
+    # GET /api/self-heal/problems reflects true state across a restart, not
+    # just this process's in-memory history since boot.
+    self_heal_engine.rebuild_open_problems()
+
 
 async def _on_shutdown():
-    # Stops the supervisor's sweep loop and every camera worker it manages
-    # cleanly — no orphaned asyncio task or RTSP/cv2 resource left behind at
-    # process exit.
+    # Stops the supervisor's sweep loop and every camera worker IT manages
+    # (supervisor.AUTO_MANAGED — sentinel_grid cameras only).
     await supervisor.stop_supervisor()
+    # Bug fix: _on_startup also starts workers directly for every webcam/
+    # video_file/mock_vms camera (start_worker() above), completely
+    # bypassing the supervisor — those tasks are never added to
+    # AUTO_MANAGED, so stop_supervisor() alone never touches them. Without
+    # this, they were abandoned at process exit instead of going through
+    # _camera_loop's `finally: source.release()`, leaking the asyncio task
+    # and cv2.VideoCapture handle. Stopping every remaining key in RUNNING
+    # (a dict, so this snapshot avoids mutating it while iterating — stop_worker
+    # pops from RUNNING) covers ALL camera workers, supervisor-managed or not.
+    #
+    # Each stop is independently guarded: RUNNING is process-global, so one
+    # camera's cleanup raising (e.g. a task tied to an event loop that's
+    # already been closed by something else) must never abort cleanup of
+    # the rest, nor propagate out of shutdown and fail whatever caller is
+    # waiting on it — same defensive stance worker.py already takes
+    # everywhere else around per-camera cleanup.
+    for camera_id in list(RUNNING.keys()):
+        try:
+            stop_worker(camera_id)
+        except Exception:
+            logger.exception("shutdown: stop_worker failed for camera %s, continuing", camera_id)
 
 
 @app.get("/api/health")

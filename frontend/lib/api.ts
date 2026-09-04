@@ -32,6 +32,36 @@ class ApiError extends Error {
   }
 }
 
+// Self-Heal "API transient errors" recovery (spec recovery type 6): a
+// bounded retry, only for the standard transient set, only for GET — a
+// POST/PATCH/DELETE that reached the server may have already taken effect,
+// so auto-retrying those here could double-fire a non-idempotent action
+// (e.g. creating a duplicate incident); callers that need a retry for those
+// offer it explicitly (a Retry button), never silently. A network-level
+// fetch failure (no response at all) is retried for any method that never
+// left the browser — nothing on the server could have run yet.
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const MAX_FETCH_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = [300, 900]; // between attempts 1->2 and 2->3
+
+async function _fetchWithRetry(url: string, init: RequestInit, method: string): Promise<Response> {
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, init);
+      const canRetryStatus = method === "GET" && RETRYABLE_STATUS.has(res.status);
+      if (!canRetryStatus || attempt === MAX_FETCH_ATTEMPTS) return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === MAX_FETCH_ATTEMPTS) throw err;
+    }
+    await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)]));
+  }
+  // Unreachable in practice (the loop above always returns or throws on the
+  // final attempt) — satisfies the type checker without changing behavior.
+  throw lastErr ?? new Error("request failed");
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = { ...(options.headers as any) };
@@ -40,7 +70,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const method = (options.method || "GET").toUpperCase();
+  const res = await _fetchWithRetry(`${API_BASE}${path}`, { ...options, headers }, method);
   if (res.status === 401) {
     // The login endpoint itself returning 401 means "wrong credentials" —
     // a normal, expected business response, not a "your session expired"

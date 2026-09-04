@@ -15,6 +15,7 @@ from ..pipeline.source import CameraSource
 from ..pipeline.catalog import fetch_catalog, upsert_from_catalog, CatalogError
 from ..pipeline.sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGridError
 from ..pipeline import supervisor
+from ..self_heal import engine as self_heal
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -55,6 +56,18 @@ async def sync_camera_catalog(
         summary = upsert_from_catalog(db, raw_records)
     except CatalogError as exc:
         log_action(db, user, "sync_camera_catalog", result="FAILURE")
+        # "not configured" is a distinct condition from a real network/host
+        # failure (Self-Heal Part B): never retried automatically either
+        # way, but surfaced with the right status so Problems/Health don't
+        # conflate "nobody has set CAMERA_CATALOG_BASE_URL yet" with "the
+        # configured host is actually down".
+        not_configured = "not configured" in str(exc)
+        await self_heal.record_event(
+            component="camera_catalog", error_type="MISSING_CONFIG" if not_configured else "CONNECTION_ERROR",
+            severity="warning" if not_configured else "critical", message=str(exc),
+            recovery_action="NONE" if not_configured else "NONE", attempt=1, max_attempts=1,
+            status="CONFIG_REQUIRED" if not_configured else "FAILED", endpoint="/api/cameras/catalog/sync",
+        )
         raise HTTPException(status_code=502, detail=str(exc))
     log_action(db, user, "sync_camera_catalog", resource=str(summary["total_in_catalogue"]))
     return summary

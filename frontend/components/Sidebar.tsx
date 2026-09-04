@@ -19,11 +19,20 @@ const PRIMARY = [
 
 const ADMIN = [
   { href: "/cameras", label: "Cameras" },
+  { href: "/cameras/control", label: "Camera Control" },
   { href: "/watchlists", label: "Watchlists" },
   { href: "/admin/rules", label: "AI Rules" },
   { href: "/admin/users", label: "Users" },
   { href: "/admin/audit", label: "Audit" },
   { href: "/admin/system", label: "System" },
+];
+
+const SELF_HEAL = [
+  { href: "/self-heal/health", label: "Health Dashboard" },
+  { href: "/self-heal/problems", label: "Problems" },
+  { href: "/self-heal/activity", label: "Recovery Activity" },
+  { href: "/self-heal/camera-health", label: "Camera Health" },
+  { href: "/self-heal/errors", label: "Error Logs" },
 ];
 
 function NavGroup({ items, pathname }: { items: typeof PRIMARY; pathname: string }) {
@@ -80,6 +89,10 @@ export default function Sidebar({ open = false, onNavigate }: { open?: boolean; 
           Administration
         </div>
         <NavGroup items={ADMIN} pathname={pathname} />
+        <div className="pt-3 mt-3 border-t border-border text-[10px] uppercase tracking-wide text-slate-500 px-3">
+          Self-Heal
+        </div>
+        <NavGroup items={SELF_HEAL} pathname={pathname} />
       </nav>
     </aside>
   );

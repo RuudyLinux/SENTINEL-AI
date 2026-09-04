@@ -8,11 +8,23 @@ for the actual per-source-type logic (webcam/video_file/rtsp/mock_vms/onvif) and
 how a future vendor-specific VMS adapter plugs in without touching this file, the
 detector, ANPR, correlation, or rules-engine code.
 """
-import cv2  # noqa: F401 — re-exported so tests can monkeypatch `source.cv2.VideoCapture`
+import cv2
 import numpy as np
 
-from ..config import settings  # noqa: F401 — re-exported so tests can monkeypatch `source.settings.*`
+from ..config import settings
 from .adapters import CameraAdapter, get_adapter
+
+# `cv2`/`settings` are never referenced below by name — they're kept as
+# module attributes here (not truly "unused") because test_source_rtsp.py
+# monkeypatches them via `source_mod.cv2.VideoCapture` / `source_mod.settings.*`.
+# Since `cv2` is a single shared module object, patching it through this
+# name also affects adapters.py's own `import cv2` (same object in
+# sys.modules) — that's the actual mechanism the test relies on. A bare
+# `# noqa: F401` doesn't silence this for plain `pyflakes` (only flake8
+# honors noqa), so this explicit reference is what actually keeps the
+# import from being flagged as dead code without deleting something a real
+# test depends on.
+_ = (cv2, settings)
 
 
 class CameraSource:

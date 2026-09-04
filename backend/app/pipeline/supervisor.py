@@ -18,9 +18,9 @@ Local CPU/RAM were NOT the limiting factor at 10 concurrent; the external
 grid's tolerance for a simultaneous connection burst was. `_connect_eligible`
 below therefore staggers successive worker starts within one sweep by
 `settings.sentinel_grid_stagger_seconds`, real backend restarts included
-(there is no separate "burst" code path to disable) — see
-CONCURRENCY_OPTIMIZATION.md for the staged 5/8/10/... test results this is
-based on.
+(there is no separate "burst" code path to disable) — see README.md →
+"Real Sentinel Camera Grid — verified concurrency limits" for the staged
+5/8/... test results this is based on.
 
 Deliberately reuses the existing worker lifecycle (`worker.start_worker`/
 `stop_worker`/`RUNNING`/`CAMERA_STATS`) rather than a second parallel worker

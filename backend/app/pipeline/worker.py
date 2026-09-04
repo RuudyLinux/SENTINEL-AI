@@ -26,7 +26,8 @@ from .appearance import compute_signature
 from .correlate import upsert_vehicle_for_plate
 from .rules_engine import evaluate
 from .timing import compute_source_timestamp
-from .db_retry import safe_commit
+from .db_retry import safe_commit, safe_flush
+from ..self_heal import engine as self_heal
 from . import clips
 
 LATEST_FRAMES: dict[str, bytes] = {}
@@ -79,12 +80,48 @@ def _ema(prev: float | None, sample: float, alpha: float = 0.2) -> float:
     return sample if prev is None else (alpha * sample + (1 - alpha) * prev)
 
 
+def _self_heal_camera_id(camera_code: str) -> str | None:
+    # CAMERA_STATS is keyed by camera.id (not camera_code) — cheap reverse
+    # lookup only used for the self-heal event's camera_id field, purely
+    # informational (never on any hot path: only called when a lock was
+    # actually hit, i.e. already the rare/slow path).
+    for cid, stats in CAMERA_STATS.items():
+        if stats.get("camera_code") == camera_code:
+            return cid
+    return None
+
+
+async def _db_self_heal_on_result(camera_code: str, op_name: str):
+    """Builds the `on_result` hook passed to safe_commit/safe_flush —
+    records a Self-Heal event ONLY when a lock actually happened (the
+    overwhelming common case is a clean first-try write, which would be
+    pure noise to log every time). See self_heal/engine.py's module
+    docstring for why this observes rather than re-implements db_retry.py's
+    real retry logic."""
+    async def _on_result(attempt: int, max_attempts: int, success: bool, was_lock: bool, duration_s: float):
+        if not was_lock:
+            return
+        await self_heal.record_event(
+            component="database", camera_id=_self_heal_camera_id(camera_code),
+            error_type="SQLITE_LOCK", severity="warning" if success else "critical",
+            message=f"{op_name} hit a locked database for camera {camera_code}",
+            recovery_action="ROLLBACK_RETRY", attempt=attempt, max_attempts=max_attempts,
+            status="RECOVERED" if success else "FAILED", duration_seconds=duration_s,
+        )
+    return _on_result
+
+
 async def _safe_commit(db: Session, camera_code: str, reapply=None) -> bool:
     """Thin camera-labeled wrapper around db_retry.safe_commit — see that
     module for the full rationale (retry-with-reapply on a transient SQLite
     lock, verified empirically; no retry without `reapply`, to avoid a
     retry-with-nothing-pending silently reporting success on a lost write)."""
-    return await safe_commit(db, f"camera {camera_code}", reapply=reapply)
+    return await safe_commit(db, f"camera {camera_code}", reapply=reapply, on_result=await _db_self_heal_on_result(camera_code, "commit"))
+
+
+async def _safe_flush(db: Session, camera_code: str, reapply=None) -> bool:
+    """Same as _safe_commit above, for db.flush() — see db_retry.safe_flush."""
+    return await safe_flush(db, f"camera {camera_code}", reapply=reapply, on_result=await _db_self_heal_on_result(camera_code, "flush"))
 
 
 async def _open_with_timeout(source: "CameraSource", camera_id: str | None = None) -> bool:
@@ -118,12 +155,24 @@ async def _open_with_timeout(source: "CameraSource", camera_id: str | None = Non
         return False
 
 
-async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db: Session) -> bool:
+async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db: Session, reason: str = "stream_read_failure") -> bool:
     """Attempts to release+reopen a dropped source with exponential backoff.
     Returns True once reopened, False after exhausting the retry budget
-    (caller marks the camera offline and stops the worker)."""
-    _set_grid_state(str(camera.id), "RECONNECTING")
-    for attempt in range(1, settings.reconnect_max_attempts + 1):
+    (caller marks the camera offline and stops the worker).
+
+    `reason` is honesty-only labeling for the Self-Heal event this records —
+    "initial_connect" (never opened this session) vs "stream_read_failure"
+    (was flowing, then N consecutive bad reads — which folds in whatever a
+    real dead RTSP/H264 stream looks like to cv2/FFmpeg: cv2 exposes no
+    structured decode-error signal, only read() returning False, so this is
+    never labeled as a fake "H264 decoder" diagnosis)."""
+    camera_id = str(camera.id)
+    camera_code = str(camera.camera_code)
+    error_type = "CAMERA_CONNECT_FAILURE" if reason == "initial_connect" else "STREAM_READ_FAILURE"
+    _set_grid_state(camera_id, "RECONNECTING")
+    reconnect_started = time.monotonic()
+    max_attempts = settings.reconnect_max_attempts
+    for attempt in range(1, max_attempts + 1):
         # These are legacy Column()-style declarative model attributes
         # (models.py) — Pylance sees them as Column[T], not T, so a plain
         # T assignment shows as a false-positive type error; at runtime an
@@ -158,7 +207,19 @@ async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db
                     setattr(camera, "fps", online_fps),
                     setattr(camera, "resolution", online_resolution),
                 ))
+                await self_heal.record_event(
+                    component="camera", camera_id=camera_id, error_type=error_type,
+                    severity="info", message=f"Camera {camera_code} stream reopened",
+                    recovery_action="RECONNECT", attempt=attempt, max_attempts=max_attempts,
+                    status="RECOVERED", duration_seconds=time.monotonic() - reconnect_started,
+                )
                 return True
+    await self_heal.record_event(
+        component="camera", camera_id=camera_id, error_type=error_type,
+        severity="critical", message=f"Camera {camera_code} stream unavailable after {max_attempts} reconnect attempts",
+        recovery_action="RECONNECT", attempt=max_attempts, max_attempts=max_attempts,
+        status="FAILED", duration_seconds=time.monotonic() - reconnect_started,
+    )
     return False
 
 
@@ -228,7 +289,18 @@ async def _process_frame(
                 source_timestamp=frame_source_ts,
             )
             db.add(det_row)
-            db.flush()
+            # Root-cause fix: this is a real write against SQLite (assigns
+            # det_row's identity for the rest of this function) and was
+            # previously unguarded — a lock here escaped to _camera_loop's
+            # outer except, silently dropping this detection instead of
+            # being retried like every other write in this pipeline (see
+            # db_retry.safe_flush). Bounded (max_attempts default 4,
+            # matching safe_commit); permanent failure here means this one
+            # detection could not be persisted — skip it and continue with
+            # the rest of the frame's detections rather than losing them too.
+            flushed = await _safe_flush(db, camera_code, reapply=lambda _det_row=det_row: db.add(_det_row))
+            if not flushed:
+                continue
 
             # Cross-camera person appearance signature (Phase 5) — visual-similarity
             # only, never biometric/identity. A failure here must never break
@@ -388,13 +460,17 @@ async def _camera_loop(camera_id: str) -> None:
         camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
         if not camera:
             return
+        # Reverse lookup for self-heal event logging (_self_heal_camera_id
+        # below) — _safe_commit/_safe_flush only ever see camera_code, not
+        # camera_id, at their existing call sites.
+        _stats(camera_id)["camera_code"] = str(camera.camera_code)
         source = CameraSource(str(camera.source_type), str(camera.source_uri))
         _set_grid_state(camera_id, "CONNECTING")
         opened = await _open_with_timeout(source, camera_id)
         if not opened:
             # Real reconnect attempt on initial failure too (transient RTSP/
             # webcam-busy failures), not just an immediate give-up.
-            opened = await _reopen_with_backoff(source, camera, db)
+            opened = await _reopen_with_backoff(source, camera, db, reason="initial_connect")
         if not opened:
             offline_error_count = camera.error_count + 1  # type: ignore[operator]
             camera.status = "offline"  # type: ignore[assignment]  # legacy Column() declarative model — plain-value assignment is correct at runtime
@@ -438,10 +514,12 @@ async def _camera_loop(camera_id: str) -> None:
         # single frame (up to ~camera.fps times/sec) was the dominant source
         # of SQLite write pressure once a second camera ran concurrently —
         # far more frequent than actually needed for a liveness heartbeat.
-        # Throttled to at most once/second; real detection/alert data still
-        # commits immediately wherever it's written (unaffected, see
-        # _process_frame).
-        HEARTBEAT_MIN_INTERVAL_S = 1.0
+        # Throttled to at most once every 2s (raised from Phase 4's 1s per
+        # the concurrency-hardening finding that 1/sec/camera was still the
+        # dominant write-pressure source with 5+ concurrent cameras); real
+        # detection/alert data still commits immediately wherever it's
+        # written (unaffected, see _process_frame).
+        HEARTBEAT_MIN_INTERVAL_S = 2.0
         last_heartbeat_commit_at = 0.0
         # `camera` is loaded once per connection (below) and, with
         # expire_on_commit=False (db.py), never picks up another session's
@@ -572,6 +650,12 @@ async def _camera_loop(camera_id: str) -> None:
                 st["last_error"] = f"{type(exc).__name__}: {exc}"
                 st["recovered_errors"] += 1
                 st["grid_state"] = "ERROR"  # next successful iteration flips this back to CONNECTED/PROCESSING
+                _error_type, _severity = self_heal.classify_exception(exc)
+                asyncio.create_task(self_heal.record_event(
+                    component="worker", camera_id=camera_id, error_type=_error_type, severity=_severity,
+                    message=f"camera {camera_code_cached}: {exc}", recovery_action="CONTINUE_LOOP",
+                    attempt=1, max_attempts=1, status="RECOVERED",
+                ))  # fire-and-forget: this is diagnostic logging, must never delay/block the loop's own recovery below
                 try:
                     db.rollback()
                 except Exception:
@@ -611,10 +695,16 @@ async def _camera_loop_supervised(camera_id: str) -> None:
     the camera is marked offline and observable instead of silently dead."""
     try:
         await _camera_loop(camera_id)
-    except Exception:
+    except Exception as exc:
         logger.exception("camera %s: _camera_loop exited via an unguarded exception", camera_id)
         st = _stats(camera_id)
         st["last_error"] = "top-level crash — see server log for traceback"
+        _error_type, _ = self_heal.classify_exception(exc)
+        await self_heal.record_event(
+            component="worker", camera_id=camera_id, error_type=_error_type, severity="critical",
+            message=f"camera {camera_id}: worker crashed at the top level: {exc}",
+            recovery_action="MARK_OFFLINE", attempt=1, max_attempts=1, status="FAILED",
+        )
         try:
             db: Session = SessionLocal()
             try:
