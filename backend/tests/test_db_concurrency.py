@@ -25,7 +25,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import models
-from app.pipeline.db_retry import safe_commit
+from app.pipeline.db_retry import safe_commit, safe_flush
 
 
 def _make_short_timeout_engine(db_path: str):
@@ -154,3 +154,120 @@ def test_safe_commit_without_reapply_fails_fast_under_a_real_lock_rather_than_re
 
     assert ok is False
     assert elapsed < 1.0  # single attempt, not stuck waiting through the holder's full 1s hold
+
+
+def test_safe_flush_retries_through_a_real_sqlite_lock_and_succeeds():
+    """Root-cause regression test: worker.py's `db.add(det_row); db.flush()`
+    (assigns the detection's identity before the rest of the frame's
+    processing) was completely unguarded — a real lock there escaped to
+    _camera_loop's outer except and silently dropped the detection instead
+    of retrying, exactly as seen in a real production log (`INSERT INTO
+    detections ... sqlite3.OperationalError: database is locked`). Same real-
+    lock harness as the safe_commit test above, proving safe_flush recovers
+    and the flushed row is durably visible."""
+    tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
+    db_path = os.path.join(tmp_dir, "flush_lock_test.db").replace("\\", "/")
+
+    engine = _make_short_timeout_engine(db_path)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+    db = Session()
+    camera = models.Camera(
+        camera_code="C-FLUSH-LOCK", name="flush lock test", source_type="video_file",
+        source_uri="unused.mp4", status="offline",
+    )
+    db.add(camera)
+    db.commit()
+    camera_id = camera.id
+
+    lock_hold_seconds = 0.6
+
+    def _hold_lock():
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE cameras SET name = name WHERE id = ?", (camera_id,))
+        time.sleep(lock_hold_seconds)
+        conn.commit()
+        conn.close()
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    time.sleep(0.15)
+
+    try:
+        det = models.Detection(
+            camera_id=camera_id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4],
+        )
+        db.add(det)
+
+        def reapply():
+            # Same reasoning as db_retry.safe_flush's docstring: rollback
+            # only detaches the still-transient `det` — its client-generated
+            # id and other already-set attributes survive untouched, so
+            # re-add() alone correctly restores it for the retried flush.
+            db.add(det)
+
+        ok = asyncio.run(safe_flush(db, "test-camera", reapply=reapply, max_attempts=20))
+        assert ok is True
+        det_id = det.id
+        db.commit()  # persist what the flush staged, so a fresh connection can see it
+    finally:
+        holder.join()
+        db.close()
+
+    verify_db = Session()
+    try:
+        reloaded = verify_db.query(models.Detection).filter(models.Detection.id == det_id).first()
+        assert reloaded is not None  # durably persisted, verified via a fresh connection
+        assert reloaded.camera_id == camera_id
+    finally:
+        verify_db.close()
+    engine.dispose()
+
+
+def test_safe_flush_without_reapply_fails_fast_rather_than_retrying():
+    """No `reapply` given -> a single attempt, same bounded-retry contract as
+    safe_commit — proves this never turns into an unbounded/blind retry
+    loop against a real lock."""
+    tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
+    db_path = os.path.join(tmp_dir, "flush_lock_test2.db").replace("\\", "/")
+
+    engine = _make_short_timeout_engine(db_path)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+    db = Session()
+    camera = models.Camera(
+        camera_code="C-FLUSH-LOCK-2", name="flush lock test 2", source_type="video_file",
+        source_uri="unused.mp4", status="offline",
+    )
+    db.add(camera)
+    db.commit()
+    camera_id = camera.id
+
+    def _hold_lock():
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE cameras SET name = name WHERE id = ?", (camera_id,))
+        time.sleep(1.0)
+        conn.commit()
+        conn.close()
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    time.sleep(0.15)
+
+    try:
+        det = models.Detection(camera_id=camera_id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4])
+        db.add(det)
+        t0 = time.monotonic()
+        ok = asyncio.run(safe_flush(db, "test-camera"))
+        elapsed = time.monotonic() - t0
+    finally:
+        holder.join()
+        db.close()
+        engine.dispose()
+
+    assert ok is False
+    assert elapsed < 1.0

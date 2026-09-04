@@ -9,8 +9,8 @@ that exact plate off that footage is not deterministic or repeatable for a
 live judge demo.
 
 This module stands in for ONLY the OCR-image-decode step, exactly as
-documented in backend/README.md ("Cross-camera demonstration") and the
-Phase 5 report — every other step is the real code: `upsert_vehicle_for_plate`
+documented in README.md ("Judge demo runbook") — every other step is the
+real code: `upsert_vehicle_for_plate`
 (real correlation), `rules_engine.evaluate` (real watchlist match, real
 explainable alert, real cooldown, real auto-incident), `get_route` (real
 cross-camera route). The ANPR quality gate itself is never touched, weakened,

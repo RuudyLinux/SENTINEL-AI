@@ -266,3 +266,29 @@ class AuditLog(Base):
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class SelfHealEvent(Base):
+    """Sentinel Self-Heal audit trail — one row per real recovery attempt
+    (see app/self_heal/engine.py). Deliberately NOT written for every routine
+    successful commit/read (that would be thousands of rows/minute with zero
+    diagnostic value) — only when something actually went wrong and a
+    recovery path (retry, reconnect, restart, rollback...) ran. Never the
+    system of record for correctness — a best-effort diagnostic/audit log;
+    losing an occasional row under extreme contention is acceptable and
+    never blocks the real operation it's describing."""
+    __tablename__ = "self_heal_events"
+    id = Column(String, primary_key=True, default=lambda: uid("sh"))
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    component = Column(String, nullable=False, index=True)  # database | camera | worker | websocket | api | camera_catalog | sentinel_grid
+    camera_id = Column(String, ForeignKey("cameras.id"), nullable=True, index=True)
+    error_type = Column(String, nullable=False)  # SQLITE_LOCK | STREAM_DECODE_ERROR | CAMERA_TIMEOUT | WORKER_EXCEPTION | MISSING_CONFIG | ...
+    severity = Column(String, default="warning")  # info | warning | critical
+    message = Column(String, default="")
+    recovery_action = Column(String, default="")  # ROLLBACK_RETRY | RECONNECT | RESTART_WORKER | NONE ...
+    attempt = Column(Integer, default=1)
+    max_attempts = Column(Integer, default=1)
+    status = Column(String, default="RECOVERED")  # RECOVERING | RECOVERED | FAILED | CONFIG_REQUIRED
+    duration_seconds = Column(Float, default=0.0)
+    endpoint = Column(String, default="")
+    event_metadata = Column(JSON, default=dict)

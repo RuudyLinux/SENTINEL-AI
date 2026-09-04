@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import settings
+from ..self_heal.http_retry import request_with_retry
 
 
 class CatalogError(Exception):
@@ -121,7 +122,11 @@ async def fetch_catalog() -> list[dict]:
     url = f"{settings.camera_catalog_base_url.rstrip('/')}/api/ingest"
     try:
         async with httpx.AsyncClient(timeout=settings.camera_catalog_timeout_seconds) as client:
-            resp = await client.get(url)
+            # Bounded retry (self_heal/http_retry.py) on a transient
+            # network blip or a 5xx/408/429 from the catalogue host — never
+            # on a genuine "host unreachable"/timeout that persists across
+            # every attempt, which still raises below exactly as before.
+            resp = await request_with_retry(lambda: client.get(url), "camera_catalog fetch")
     except httpx.TimeoutException:
         raise CatalogError(f"Camera catalogue at {settings.camera_catalog_base_url} timed out")
     except httpx.RequestError as exc:

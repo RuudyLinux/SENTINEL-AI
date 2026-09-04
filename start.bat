@@ -4,7 +4,7 @@ set ROOT=%~dp0
 
 if not exist "%ROOT%backend\.venv\Scripts\python.exe" (
     echo [ERROR] Backend venv not found at backend\.venv
-    echo Run: cd backend ^&^& uv venv --python 3.11 .venv ^&^& uv pip install --python .venv -r requirements.txt
+    echo Run: cd backend ^&^& uv venv --python 3.11 .venv ^&^& uv pip install --python .venv -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
     pause
     exit /b 1
 )

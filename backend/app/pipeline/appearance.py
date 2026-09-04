@@ -5,8 +5,8 @@ color-histogram "visual signature" of a person's bounding-box crop — a lightwe
 non-biometric feature used only to *rank* candidate sightings across cameras by how
 visually similar they look (clothing/color, roughly), for an investigator to review
 and confirm manually. It cannot and does not identify who someone is. See
-routers/persons.py and HYBRID_ARCHITECTURE.md for the exact honest framing used
-throughout the app.
+routers/persons.py and README.md → "Cross-camera intelligence" for the exact
+honest framing used throughout the app.
 
 No new dependency — built entirely on cv2/numpy, already in requirements.txt.
 """

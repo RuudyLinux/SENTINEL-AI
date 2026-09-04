@@ -7,7 +7,8 @@
 import {
   LayoutDashboard, Camera, ScanLine, Search, Bell, ShieldAlert, FileSearch,
   Map, FolderLock, BarChart3, ListChecks, SlidersHorizontal, Users,
-  ScrollText, Settings, type LucideIcon,
+  ScrollText, Settings, Sliders, HeartPulse, TriangleAlert, Activity,
+  Stethoscope, ClipboardList, type LucideIcon,
 } from "lucide-react";
 
 export const NAV_ICONS: Record<string, LucideIcon> = {
@@ -22,9 +23,15 @@ export const NAV_ICONS: Record<string, LucideIcon> = {
   "/evidence": FolderLock,
   "/analytics": BarChart3,
   "/cameras": Camera,
+  "/cameras/control": Sliders,         // Camera Control Center
   "/watchlists": ListChecks,
   "/admin/rules": SlidersHorizontal,   // AI Rules (thresholds/filters)
   "/admin/users": Users,
   "/admin/audit": ScrollText,
   "/admin/system": Settings,
+  "/self-heal/health": HeartPulse,
+  "/self-heal/problems": TriangleAlert,
+  "/self-heal/activity": Activity,
+  "/self-heal/camera-health": Stethoscope,
+  "/self-heal/errors": ClipboardList,
 };

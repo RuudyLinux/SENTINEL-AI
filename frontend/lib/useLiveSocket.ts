@@ -14,7 +14,14 @@ export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
 
   useEffect(() => {
     let cancelled = false;
-    let retryDelay = 1000;
+    // Self-Heal Part 2 recovery type 5 (WebSocket disconnect): bounded
+    // exponential backoff instead of a flat 1s retry — real network/server
+    // outages shouldn't be hammered once per second forever. Resets to the
+    // base delay on every successful open (see ws.onopen below), so a
+    // single blip never leaves the socket permanently on a long delay.
+    const BASE_DELAY_MS = 1000;
+    const MAX_DELAY_MS = 30000;
+    let retryDelay = BASE_DELAY_MS;
 
     function connect() {
       if (cancelled) return;
@@ -22,18 +29,33 @@ export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
       // handshake, so the token travels as a query param instead (backend
       // validates it before accepting — see main.py's /ws). Read fresh on
       // every (re)connect attempt, not just once, so a login that happens
-      // after this hook first mounted is picked up on the next retry.
+      // after this hook first mounted is picked up on the next retry
+      // (preserves JWT auth across every reconnect, not just the first).
       const token = getToken();
       const url = token ? `${WS_BASE}/ws?token=${encodeURIComponent(token)}` : `${WS_BASE}/ws`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        // Stress-test/audit finding: a socket can still be mid-handshake
+        // when the component unmounts (cleanup already ran, cancelled=true,
+        // wsRef.current?.close() called) — onopen can fire microtasks later
+        // on that now-closing socket. Guarded so a stale socket can never
+        // flip `connected` back to true after unmount.
+        if (cancelled) return;
+        setConnected(true);
+        retryDelay = BASE_DELAY_MS; // real recovery — un-backoff for the next disconnect
+      };
       ws.onclose = () => {
+        if (cancelled) return;
         setConnected(false);
-        if (!cancelled) setTimeout(connect, retryDelay);
+        setTimeout(connect, retryDelay);
+        retryDelay = Math.min(MAX_DELAY_MS, retryDelay * 2);
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (msg) => {
+        // Same stale-socket guard as onopen — a message racing the cleanup
+        // close() must never update state after this hook has unmounted.
+        if (cancelled) return;
         try {
           const parsed: LiveEvent = JSON.parse(msg.data);
           setLastEvent(parsed);

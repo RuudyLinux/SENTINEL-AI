@@ -95,11 +95,21 @@ def ensure_columns(table: str, columns: dict[str, str], backfill_defaults: dict[
     with engine.begin() as conn:
         for name, ddl_type in columns.items():
             if name not in existing:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}"))
+                # bandit B608 (possible SQL injection via string-built query):
+                # `table`/`name`/`ddl_type` here are never request/user input —
+                # every call site (main.py startup) passes hardcoded string
+                # literals, and SQLAlchemy's `text()`/DBAPI params can't
+                # parameterize identifiers (table/column names) anyway, only
+                # values. Safe as written; flagged for visibility, not fixed
+                # with bind params, because there's nothing to bind.
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}"))  # nosec B608
                 added.append(name)
         for name, default_sql in (backfill_defaults or {}).items():
             if name in columns:  # only touch columns this call actually manages
-                conn.execute(text(f"UPDATE {table} SET {name} = {default_sql} WHERE {name} IS NULL"))
+                # Same reasoning as above — `default_sql` is also always a
+                # hardcoded literal from a call site (e.g. "''", "0"), never
+                # external input.
+                conn.execute(text(f"UPDATE {table} SET {name} = {default_sql} WHERE {name} IS NULL"))  # nosec B608
     return added
 
 
@@ -117,6 +127,9 @@ def ensure_indexes(table: str, index_columns: list[str]) -> list[str]:
     with engine.begin() as conn:
         for column in index_columns:
             name = f"ix_{table}_{column}"
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+            # bandit B608: same as ensure_columns above — `table`/`column`
+            # are always hardcoded literals from main.py startup, never
+            # external input, and there are no values here to bind.
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))  # nosec B608
             created.append(name)
     return created

@@ -4,7 +4,7 @@ Unified CCTV Intelligence & Real-Time Smart Policing Platform — built from
 `SENTINEL_VISION_Master_Project_Documentation_Gujarat_Police_Innovation_Challenge_2026.docx`
 for the Gujarat Police Innovation Challenge 2026.
 
-Real, running system: a FastAPI backend runs actual YOLOv8 detection + ByteTrack tracking +
+Real, running system: a FastAPI backend runs actual YOLOv8 detection + ByteTrack tracking + 
 EasyOCR ANPR against a webcam or an uploaded video file, persists everything to SQLite, and
 evaluates a real rules engine that produces explainable alerts and auto-created incidents.
 A Next.js dashboard covers the full site map from the doc against that live backend — no
@@ -12,7 +12,7 @@ mocked data.
 
 ## Run order
 
-1. **Backend** (see `backend/README.md`):
+1. **Backend**:
    ```
    cd backend
    .venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8000
@@ -31,11 +31,13 @@ mocked data.
 ## Real Sentinel Camera Grid (live-verified)
 
 Beyond the official Gujarat catalogue, this build also integrates a second real, live camera
-source — 30 real traffic cameras — with genuine end-to-end verification this session:
-discovery, RTSP connection, real frames, real YOLOv8+ByteTrack detections, real alerts,
-incidents, and evidence snapshots (see `HYBRID_ARCHITECTURE.md` and
-`FINAL_PROJECT_STATUS.md` for the full record, and `backend/README.md` → "Real Sentinel
-Camera Grid integration" for setup/troubleshooting).
+source — 30 real traffic cameras — with genuine end-to-end verification: discovery, RTSP
+connection, real frames, real YOLOv8+ByteTrack detections, real alerts, incidents, and evidence
+snapshots. Setup/troubleshooting: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in
+`backend/.env` (see `backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register
+(never auto-starts AI), then **Start**/**Connect** per camera or from the **Camera Control
+Center** (see below) — the 24/7 auto-connect supervisor (`app/pipeline/supervisor.py`) keeps
+eligible ones reconnected afterward, up to `SENTINEL_GRID_MAX_AUTOCONNECT`.
 
 Credentials go in `backend/.env` only (gitignored — see `backend/.env.example`), **never** in
 source, docs, or committed anywhere. They never reach the frontend.
@@ -46,15 +48,67 @@ This is the "working slice" the source document itself recommends for a hackatho
 real AI on real frames, running end-to-end from ingestion through alerting, investigation and
 evidence export — documented against, but not attempting to stand up, the statewide-scale
 architecture (80,000+ cameras, Kafka, Kubernetes, vector search, edge Jetson boxes) the same
-document describes as the long-term target. See `backend/README.md` → "Scope & honesty notes"
-and the in-app **System → Scope & Honesty** panel for the full list of what's real vs.
-explicitly out of scope.
+document describes as the long-term target. See the in-app **System → Scope & Honesty** panel
+for the full list of what's real vs. explicitly out of scope.
 
 ## Layout
 
-- `backend/` — FastAPI app, detection pipeline (`app/pipeline/`), SQLite datastore.
+- `backend/` — FastAPI app, detection pipeline (`app/pipeline/`), Self-Heal recovery engine
+  (`app/self_heal/`), SQLite datastore.
 - `frontend/` — Next.js 16 (App Router) + TypeScript + Tailwind dashboard, all ~26 screens
-  from the doc's site map, wired to the live backend API + WebSocket.
+  from the doc's site map plus the Camera Control Center and Self-Heal section, wired to the
+  live backend API + WebSocket.
+
+## Database architecture & scaling decision
+
+SQLite (`backend/sentinel.db`), WAL journal mode, `busy_timeout=30000` (`app/db.py`) — every
+write-heavy call site (camera workers, API routes) goes through the same connection pool, so a
+transient lock is absorbed by SQLite's own busy-wait before ever reaching Python, and any lock
+that does surface is retried with bounded backoff (see Self-Heal below) rather than crashing.
+
+**Verified acceptable for this deployment shape** — a single backend process, a bounded number
+of concurrent camera workers (real-camera testing: staged up to the documented safe concurrency
+figure; synthetic stress test: 12 concurrent workers, real detection/heartbeat/alert writes,
+zero crashed workers — see `backend/tests/test_stress_concurrency.py`). **Not** appropriate
+once the deployment needs multiple backend *processes/instances* sharing one datastore (SQLite
+has no real concept of a remote/networked writer) or the statewide-scale (80,000+ camera)
+architecture the source document describes as the long-term target. That path is
+**PostgreSQL** — a separate, dedicated migration task (schema is already a plain SQLAlchemy
+ORM, so the model layer ports without a rewrite; what changes is the connection string, the
+SQLite-specific PRAGMAs in `app/db.py`, and the additive-migration helpers in `db.py` which
+assume SQLite's `ALTER TABLE`/`inspect()` behavior) — never mixed into a stability/hardening
+pass, and not attempted here.
+
+## Self-Heal (`backend/app/self_heal/`)
+
+Observes and logs the platform's real recovery paths — it does not re-implement or override
+them: SQLite lock retry (`pipeline/db_retry.py`), camera reconnect/backoff
+(`pipeline/worker.py`), outbound HTTP retry for this app's own camera-catalogue fetch
+(`self_heal/http_retry.py` — deliberately NOT applied to the Sentinel Grid client, whose
+timeouts are already real-measured/tuned). Every recovery attempt is a `SelfHealEvent` row
+(`GET /api/self-heal/health|problems|events|events/{id}`), broadcast live over the existing
+WebSocket. A repeat "recovered" event for the identical ongoing condition within a short window
+is deduplicated so the Error Log doesn't drown in identical rows; a genuine failure is never
+deduplicated. UI: sidebar **Self-Heal** section (Health Dashboard, Problems, Recovery Activity,
+Camera Health, Error Logs, Problem Details).
+
+**Known, honest limitation**: OpenCV/FFmpeg exposes no structured H264/decode-error signal to
+this codebase — a corrupted frame just makes `cv2.VideoCapture.read()` return `False`. Self-Heal
+therefore labels a stream disruption `STREAM_READ_FAILURE` (or `CAMERA_CONNECT_FAILURE` for an
+initial-connect failure), never a fabricated "H264 decoder" diagnosis — real ffmpeg stderr lines
+(`error while decoding MB...`, `mmco: unref short failure`, etc.) still appear in the server log
+as FFmpeg's own diagnostic output, just not parsed/re-classified by Self-Heal.
+
+## Camera Control Center (`/cameras/control`, `POST /api/cameras/bulk`)
+
+Bulk connect/start/start AI/stop/restart/disconnect — reuses the existing per-camera
+start_worker/stop_worker/supervisor connect/disconnect, bounded concurrency (max 5 at once),
+per-camera failure isolation (one bad camera never aborts the batch), a duplicate-in-progress
+guard, one audit-log entry per bulk call, and live per-camera progress over the WebSocket.
+`stop` disables AI while keeping the stream connected; `disconnect` fully stops the worker;
+`connect`/`start` are honest aliases — this codebase has no real distinction between them.
+RBAC is enforced server-side (`require_roles("Administrator", "Control Room Operator")`) —
+a disabled frontend button is a convenience, not the security boundary.
 
 ## Known-fixed issues (kept here so they don't get re-introduced)
 
@@ -127,3 +181,18 @@ explicitly out of scope.
 - **Evidence package claimed an audit trail it didn't include**: the docstring said "audit
   trail" but the returned JSON never actually queried `AuditLog`. Fixed — it now includes the
   real `AuditLog` rows touching that incident or any of its evidence items.
+- **SQLite lock during `db.flush()`, not just `commit()`**: `worker.py`'s `db.add(det_row);
+  db.flush()` (assigns a detection's identity before the rest of the frame's processing) was
+  completely unguarded — a lock there escaped to the outer per-iteration `except`, silently
+  dropping that detection instead of retrying like every other write. Fixed with
+  `db_retry.safe_flush` (same rollback→reapply→bounded-backoff→retry as `safe_commit`) — see
+  `backend/tests/test_db_concurrency.py`.
+- **WebSocket reconnect had no backoff**: `useLiveSocket.ts` retried a dropped connection every
+  1s forever. Fixed with bounded exponential backoff (1s→30s cap, resets on a real reconnect);
+  also guarded `onopen`/`onmessage` against updating state from a socket that's already closing
+  during unmount (a real, if rare, stale-update race).
+- **Frontend API calls had no retry for transient failures**: `lib/api.ts` now retries GET
+  requests (never POST/PATCH/DELETE — those may have already taken effect server-side) on
+  408/429/500/502/503/504 or a network failure, bounded to 3 attempts.
+- **Camera Control's per-row action menu stayed open until another item was clicked**: fixed
+  with a real click-outside listener (`RowActionsMenu` in `cameras/control/page.tsx`).
