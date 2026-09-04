@@ -7,6 +7,7 @@ import {
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket } from "@/lib/useLiveSocket";
 import { api, ApiError, getStoredUser } from "@/lib/api";
+import { aiState } from "@/lib/cameraState";
 import ErrorState from "@/components/ErrorState";
 import StatusDot from "@/components/StatusDot";
 
@@ -26,21 +27,16 @@ const BULK_BUTTONS: { action: BulkAction; label: string; icon: typeof Wifi }[] =
   { action: "disconnect", label: "Disconnect", icon: WifiOff },
 ];
 
-const DISRUPTIVE = new Set<BulkAction>(["restart", "disconnect", "stop"]);
+// Fallback only — the real source of truth is GET /api/cameras/bulk/disruptive-actions
+// (see below), fetched once so this page can never silently diverge from the
+// backend's own classification of which actions need a confirmation dialog.
+const DEFAULT_DISRUPTIVE = new Set<BulkAction>(["restart", "disconnect", "stop"]);
 
 const DISRUPTIVE_COPY: Record<string, string> = {
   restart: "This will temporarily interrupt active streams.",
   disconnect: "This will fully stop the camera worker and end the stream.",
   stop: "This will stop AI processing on the selected camera(s); the stream stays connected.",
 };
-
-function aiState(c: Camera): string {
-  if (c.grid_state === "PROCESSING") return "AI RUNNING";
-  if (c.grid_state === "CONNECTED") return "AI STOPPED";
-  if (c.grid_state === "ERROR") return "AI ERROR";
-  if (c.grid_state === "RECONNECTING" || c.grid_state === "CONNECTING") return "AI STARTING";
-  return "—";
-}
 
 type ProgressState = {
   opId: string; action: BulkAction; total: number; completed: number;
@@ -59,6 +55,12 @@ export default function CameraControlCenterPage() {
 
   const user = useMemo(() => getStoredUser(), []);
   const canControl = user?.role === "Administrator" || user?.role === "Control Room Operator";
+
+  const { data: disruptiveList } = useApiData<string[]>("/api/cameras/bulk/disruptive-actions");
+  const disruptive = useMemo(
+    () => (disruptiveList ? new Set(disruptiveList as BulkAction[]) : DEFAULT_DISRUPTIVE),
+    [disruptiveList]
+  );
 
   useLiveSocket((e) => {
     if (e.type === "bulk_progress") {
@@ -107,7 +109,7 @@ export default function CameraControlCenterPage() {
   function requestBulk(action: BulkAction, scope: "selected" | "all") {
     const ids = scope === "selected" ? Array.from(selected) : null;
     if (scope === "selected" && ids && ids.length === 0) return;
-    if (DISRUPTIVE.has(action)) {
+    if (disruptive.has(action)) {
       setConfirmAction({ action, ids });
     } else {
       runBulk(action, ids);
@@ -225,7 +227,7 @@ export default function CameraControlCenterPage() {
                       camera={c}
                       canControl={canControl}
                       onAction={async (action) => {
-                        if (DISRUPTIVE.has(action)) {
+                        if (disruptive.has(action)) {
                           setConfirmAction({ action, ids: [c.id] });
                         } else {
                           await runSingle(action, c);

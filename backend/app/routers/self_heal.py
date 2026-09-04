@@ -82,9 +82,23 @@ def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(
         "subsystems": {
             "api": "HEALTHY",
             "database": "DEGRADED" if (not db_ok or recent_db_failure) else "HEALTHY",
-            "websocket": "CONNECTED" if len(manager.active) >= 0 else "DISCONNECTED",  # accepting connections proves this
+            # Final-review audit finding: this used to be a tautological
+            # `len(...) >= 0` (always true) — there is no real "the WS
+            # manager is broken" signal to check (it's an in-process list,
+            # not a connection this process could lose), so honestly this
+            # line is a live check the SAME way "api": "HEALTHY" above is —
+            # this response returning at all proves the process (and
+            # therefore the WS manager module) is up. Not a fake hardcode
+            # dressed as a conditional.
+            "websocket": "CONNECTED",
             "websocket_clients": len(manager.active),
-            "ai_engine": "RUNNING" if ai_running else ("IDLE" if total_cameras else "IDLE"),
+            # Final-review audit finding: this used to be a dead ternary
+            # (`"IDLE" if total_cameras else "IDLE"` — both branches
+            # identical, total_cameras never actually consulted). There is
+            # no genuine third state to distinguish here yet (a camera-less
+            # deployment and one with cameras but AI off both really are
+            # just "not running"), so simplified to say only what's true.
+            "ai_engine": "RUNNING" if ai_running else "IDLE",
             "self_heal": "ACTIVE",
         },
         "cameras": {"online": online_cameras, "degraded": degraded_cameras, "offline": offline_cameras, "total": total_cameras},

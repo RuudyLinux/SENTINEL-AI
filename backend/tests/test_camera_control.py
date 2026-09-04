@@ -1,9 +1,19 @@
 """Camera Control Center bulk endpoint: RBAC enforcement, partial-failure
 handling (one bad camera never aborts the batch), duplicate-in-progress
 skip, and the one audit-log entry per bulk call."""
+import asyncio
+import os
+import sqlite3
+import tempfile
+import threading
+import time
+
 import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
 
 from app import models
+from app.db import Base
 from app.routers import camera_control
 from app.security import hash_password, create_access_token
 
@@ -140,3 +150,73 @@ def test_disruptive_actions_list_matches_documented_set(client, admin_token):
     resp = client.get("/api/cameras/bulk/disruptive-actions", headers=_auth(admin_token))
     assert resp.status_code == 200
     assert set(resp.json()) == {"restart", "disconnect", "stop"}
+
+
+def _make_short_timeout_engine(db_path: str):
+    """Same PRAGMAs as db.py's real engine, short busy_timeout so a real
+    lock surfaces in milliseconds — same harness as test_db_concurrency.py."""
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 0.2})
+
+    @event.listens_for(engine, "connect")
+    def _pragmas(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=200")
+        cursor.close()
+
+    return engine
+
+
+def test_set_ai_retries_through_a_real_sqlite_lock_and_durably_persists():
+    """Final-review audit finding regression test: camera_control._set_ai
+    used to be a bare `db.commit()`, bypassing this PR's own SQLite-lock
+    retry — inconsistent with worker.py under the exact sustained
+    contention this PR exists to survive, and riskier here since a bulk
+    call runs up to MAX_CONCURRENT of these concurrently. Proves _set_ai now
+    retries through a REAL second-connection write lock (not mocked) and the
+    reapplied value is durably committed, verified via a fresh connection."""
+    tmp_dir = tempfile.mkdtemp(prefix="sentinel_bulk_lock_test_")
+    db_path = os.path.join(tmp_dir, "bulk_lock_test.db").replace("\\", "/")
+
+    engine = _make_short_timeout_engine(db_path)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+    db = Session()
+    camera = models.Camera(
+        camera_code="C-BULK-REAL-LOCK", name="bulk lock test", source_type="video_file",
+        source_uri="unused.mp4", status="offline", ai_person=False, ai_vehicle=False, ai_anpr=False,
+    )
+    db.add(camera)
+    db.commit()
+    camera_id = camera.id
+
+    lock_hold_seconds = 0.6
+
+    def _hold_lock():
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE cameras SET name = name WHERE id = ?", (camera_id,))
+        time.sleep(lock_hold_seconds)
+        conn.commit()
+        conn.close()
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    time.sleep(0.15)
+
+    try:
+        ok = asyncio.run(camera_control._set_ai(db, camera, True, "C-BULK-REAL-LOCK"))
+        assert ok is True
+    finally:
+        holder.join()
+        db.close()
+
+    verify_db = Session()
+    try:
+        reloaded = verify_db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+        assert reloaded is not None
+        assert reloaded.ai_person is True and reloaded.ai_vehicle is True and reloaded.ai_anpr is True
+    finally:
+        verify_db.close()
+    engine.dispose()

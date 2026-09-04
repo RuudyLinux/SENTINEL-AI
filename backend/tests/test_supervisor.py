@@ -24,6 +24,15 @@ class _FakeTask:
     def cancel(self) -> None:
         self._done = True
 
+    def __await__(self):
+        # Final-review audit finding: stop_worker() now returns the task it
+        # cancelled so callers (stop_supervisor/_on_shutdown) can genuinely
+        # await its cleanup via asyncio.gather — this fake must therefore be
+        # awaitable too, or gather() itself raises TypeError. A real
+        # asyncio.Task's cancellation eventually completes; this immediately
+        # resolves, standing in for "already finished" for this test's purposes.
+        return iter(())
+
 
 @pytest.fixture(autouse=True)
 def _clean_supervisor_state(monkeypatch):
@@ -168,7 +177,16 @@ def test_stop_supervisor_cleans_up_while_a_sweep_is_mid_stagger(monkeypatch):
 
     started, stopped = [], []
     monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: (started.append(cid), worker.RUNNING.__setitem__(cid, _FakeTask(done=False))))
-    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: (stopped.append(cid), worker.RUNNING.pop(cid, None)))
+
+    def _fake_stop_worker(cid):
+        # Real stop_worker() returns the cancelled task (or None) so a
+        # caller can await its cleanup — mirror that contract here rather
+        # than the old side-effect-tuple stand-in, which broke
+        # stop_supervisor's new asyncio.gather(*tasks) with a plain tuple.
+        stopped.append(cid)
+        return worker.RUNNING.pop(cid, None)
+
+    monkeypatch.setattr(supervisor.worker, "stop_worker", _fake_stop_worker)
 
     async def _run():
         supervisor.start_supervisor()

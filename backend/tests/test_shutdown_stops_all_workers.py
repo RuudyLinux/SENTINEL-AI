@@ -1,12 +1,25 @@
-"""Regression test for a real shutdown-leak bug: _on_startup starts workers
-directly for every webcam/video_file/mock_vms camera via start_worker(),
-completely bypassing the supervisor — those tasks are never registered in
-supervisor.AUTO_MANAGED. The old _on_shutdown() only called
-supervisor.stop_supervisor(), which only stops AUTO_MANAGED workers, so a
-directly-started camera's asyncio task and cv2.VideoCapture handle were
-just abandoned at process exit instead of going through _camera_loop's
-`finally: source.release()`. Fixed by having _on_shutdown also stop
-whatever is still left in worker.RUNNING after the supervisor is stopped.
+"""Regression tests for two real shutdown-leak bugs:
+
+1. _on_startup starts workers directly for every webcam/video_file/mock_vms
+   camera via start_worker(), completely bypassing the supervisor — those
+   tasks are never registered in supervisor.AUTO_MANAGED. The old
+   _on_shutdown() only called supervisor.stop_supervisor(), which only
+   stops AUTO_MANAGED workers, so a directly-started camera's asyncio task
+   and cv2.VideoCapture handle were just abandoned at process exit instead
+   of going through _camera_loop's `finally: source.release()`. Fixed by
+   having _on_shutdown also stop whatever is still left in worker.RUNNING
+   after the supervisor is stopped.
+
+2. (Final-review audit finding) stop_worker() only REQUESTS cancellation
+   via task.cancel() — the task's own `finally: source.release()` only
+   actually runs once the task is next scheduled, which is not guaranteed
+   before uvicorn tears down the event loop unless something explicitly
+   awaits it. _on_shutdown now collects stop_worker's returned tasks and
+   `await`s them via asyncio.gather before returning, so cleanup is
+   deterministic — proven below by asserting immediately after
+   `await main._on_shutdown()` with NO manual poll loop (an earlier version
+   of this test polled for up to 2s afterward specifically because the
+   cleanup wasn't actually guaranteed to have finished yet).
 """
 import asyncio
 
@@ -73,20 +86,16 @@ def test_shutdown_stops_a_directly_started_webcam_worker_not_just_supervisor_man
         assert camera.id in worker.RUNNING  # actually running before we shut down
 
         await main._on_shutdown()
-
-        # task.cancel() is asynchronous — give the event loop a moment to
-        # actually unwind _camera_loop's while-loop and run its `finally`.
-        for _ in range(100):
-            if camera.id not in worker.RUNNING and source.released:
-                break
-            await asyncio.sleep(0.02)
+        # No manual poll loop here (deliberately) — _on_shutdown now awaits
+        # every stopped camera's task via asyncio.gather internally, so
+        # cleanup is guaranteed complete the instant this await returns.
 
     try:
         asyncio.run(_drive())
         # The actual bug: this camera was never in AUTO_MANAGED, so the old
         # _on_shutdown() (supervisor.stop_supervisor() only) left it running.
         assert camera.id not in worker.RUNNING
-        assert source.released is True  # source.release() in _camera_loop's finally actually ran
+        assert source.released is True  # source.release() in _camera_loop's finally actually ran, deterministically
     finally:
         worker.stop_worker(camera.id)
         worker.CAMERA_STATS.pop(camera.id, None)
