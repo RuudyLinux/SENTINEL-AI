@@ -220,8 +220,15 @@ async def stop_supervisor() -> None:
         except Exception:
             logger.exception("Sentinel Grid supervisor sweep task raised on shutdown")
         _supervisor_task = None
-    for camera_id in list(AUTO_MANAGED):
-        worker.stop_worker(camera_id)
+    # Audit finding: stop_worker() only REQUESTS cancellation — the task's
+    # own cleanup (source.release() in _camera_loop's `finally`) only runs
+    # once it's next scheduled, which is not guaranteed before the ASGI
+    # server tears down the event loop unless something here actually
+    # awaits it. Collect + gather so this function returns only once every
+    # camera's real cleanup has actually run, not merely been requested.
+    tasks = [t for t in (worker.stop_worker(camera_id) for camera_id in list(AUTO_MANAGED)) if t is not None]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     AUTO_MANAGED.clear()
     OPERATOR_DISCONNECTED.clear()
 
