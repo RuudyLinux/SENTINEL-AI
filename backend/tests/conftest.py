@@ -15,6 +15,18 @@ os.environ.setdefault("UPLOADS_DIR", str(_tmp_root / "uploads"))
 os.environ.setdefault("EVIDENCE_DIR", str(_tmp_root / "evidence_store"))
 os.environ.setdefault("CAMERA_CATALOG_BASE_URL", "")  # must stay empty unless a test opts in
 os.environ.setdefault("DEMO_MODE", "true")
+# Real credentials for the Sentinel Camera Grid may exist in a developer's
+# real backend/.env (pydantic-settings reads it too, not just os.environ) —
+# without this override, every test that boots the real FastAPI app (the
+# `client` fixture) would trigger a REAL network call to the real external
+# grid via supervisor.discover_and_register() at startup: real login latency
+# per test, and real repeated hits against the live grid. Force both empty
+# so credentials are "not configured" for the whole suite regardless of what
+# a developer's .env holds; AUTOCONNECT is also forced off as a second,
+# independent guard against any accidental real connection during a test.
+os.environ.setdefault("SENTINEL_GRID_EMAIL", "")
+os.environ.setdefault("SENTINEL_GRID_PASSWORD", "")
+os.environ.setdefault("SENTINEL_GRID_AUTOCONNECT", "false")
 
 import pytest
 from fastapi.testclient import TestClient

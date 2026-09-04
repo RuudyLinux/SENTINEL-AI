@@ -73,6 +73,34 @@ class Settings(BaseSettings):
     # on immediate retry (real network jitter to the grid, not a code bug).
     sentinel_grid_timeout_seconds: float = 20.0
 
+    # 24/7 auto-connect supervisor (real camera connectivity task). Separate
+    # from AI: this only keeps eligible real Sentinel Grid cameras' RTSP
+    # connection alive — it never enables ai_person/ai_vehicle/ai_anpr on a
+    # camera. Cap is a conservative starting point, NOT yet validated against
+    # this machine's actual CPU/RAM/network cost of N concurrent real RTSP
+    # decodes — do not raise it, or claim any concurrency figure, before
+    # running the staged 1/3/5/10/30 connection test and recording the
+    # measured safe number here.
+    sentinel_grid_autoconnect: bool = True
+    sentinel_grid_max_autoconnect: int = 5
+    sentinel_grid_supervisor_sweep_seconds: float = 30.0
+    # After a real AUTH_ERROR (credentials rejected by the grid, not just
+    # "unconfigured"), the supervisor stops retrying for this long — a
+    # rejected credential fails identically for every camera since the grid
+    # login is one shared account, so retrying per-camera would just hammer
+    # the same login endpoint repeatedly for no new information.
+    sentinel_grid_auth_cooldown_seconds: float = 300.0
+    # Staggered startup (concurrency optimization task). Real finding: firing
+    # every eligible camera's start_worker() back-to-back in one sweep opens
+    # that many simultaneous new RTSP TCP handshakes against the external
+    # grid at once — measured (staged 10-camera test) as meaningfully less
+    # reliable than bringing cameras up one at a time. This delay is inserted
+    # BETWEEN successive worker starts within one sweep (never before the
+    # first, never blocking anything else) — turns a burst into a rollout.
+    # 3.0s is a conservative starting point within the requested 2-5s range;
+    # re-measure before lowering it for a higher concurrency target.
+    sentinel_grid_stagger_seconds: float = 3.0
+
     # RTSP transport (Phase 3 P0). The official sandbox requires TCP
     # ("UDP fails across NAT/firewalls") — centralized here as a safe,
     # overridable switch rather than hardcoded in the adapter.

@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api, buildTokenedUrl, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
-import StatusDot from "@/components/StatusDot";
+import ConnectionBadge, { AiBadge } from "@/components/ConnectionBadge";
 import ErrorState from "@/components/ErrorState";
 
 export default function SingleCameraPage() {
@@ -62,7 +62,10 @@ export default function SingleCameraPage() {
           <h1 className="text-lg font-semibold">{camera.name} <span className="text-slate-500 font-normal">({camera.camera_code})</span></h1>
           <div className="text-xs text-slate-400">{camera.location} · {camera.department}</div>
         </div>
-        <StatusDot status={camera.status} />
+        <div className="flex items-center gap-1.5">
+          <ConnectionBadge camera={camera} />
+          <AiBadge camera={camera} />
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
@@ -89,6 +92,8 @@ export default function SingleCameraPage() {
             <div>FPS: {camera.fps?.toFixed(1) ?? "—"}</div>
             <div>Resolution: {camera.resolution || "—"}</div>
             <div>Errors: {camera.error_count}</div>
+            {typeof camera.reconnect_count === "number" && <div>Reconnects: {camera.reconnect_count}</div>}
+            {camera.last_error && <div className="text-critical truncate" title={camera.last_error}>Last error: {camera.last_error}</div>}
           </div>
           {actionError && <div className="text-xs text-critical">{actionError}</div>}
           <div className="flex flex-col gap-2">

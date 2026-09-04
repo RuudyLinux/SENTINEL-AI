@@ -94,6 +94,16 @@ class CameraOut(BaseModel):
     ai_anpr: bool
     camera_group: str = ""
     last_frame_at: Optional[datetime] = None
+    # Richer connection-lifecycle state (24/7 auto-connect task) — in-memory
+    # only (CAMERA_STATS), attached by routers/cameras.py.list_cameras; null
+    # for a camera whose worker has never run in this process. Distinct from
+    # `status` (DB column, only ever online/offline/degraded).
+    grid_state: Optional[str] = None
+    # Same in-memory source (CAMERA_STATS), same reasoning as grid_state above —
+    # already computed by worker.py per iteration, just not previously exposed.
+    # Null for a camera whose worker has never run in this process.
+    reconnect_count: Optional[int] = None
+    last_error: Optional[str] = None
     # Catalogue linkage — informational only. Deliberately no `source_uri`
     # here: the RTSP URL may carry embedded credentials and must never reach
     # the frontend/logs (see P0-E from Phase 1 and pipeline/catalog.py).

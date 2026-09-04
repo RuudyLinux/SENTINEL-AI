@@ -195,8 +195,17 @@ async def _process_frame(
     camera_code = str(camera.camera_code)
     want_person = bool(camera.ai_person)
     want_vehicle = bool(camera.ai_vehicle)
+    ai_enabled = want_person or want_vehicle
 
-    if frame_idx % settings.detect_every_n_frames == 0:
+    # A camera can be connected (real frames flowing, e.g. via the 24/7
+    # auto-connect supervisor) with AI fully off — that must cost nothing
+    # beyond decode/MJPEG. `detect_and_track` itself no-ops on empty
+    # class_ids, but reaching it still calls `detector.get_model()`, which
+    # loads/caches a real per-camera YOLO instance — real memory/init cost
+    # even when it would detect nothing. Skipping the call entirely when
+    # neither class is wanted is what makes "connected, AI off" genuinely
+    # lightweight rather than just "inference skipped."
+    if ai_enabled and frame_idx % settings.detect_every_n_frames == 0:
         t0 = time.monotonic()
         detections = await asyncio.to_thread(
             detect_and_track, frame, camera_id, want_person, want_vehicle
@@ -307,6 +316,11 @@ async def _process_frame(
                 "cls": d["cls"], "confidence": d["confidence"],
                 "timestamp": det_row.timestamp.isoformat(),
             })
+    elif not ai_enabled:
+        # AI was toggled off (possibly mid-session, via PATCH) — drop any
+        # boxes from when it was last on rather than overlaying stale ones
+        # on an otherwise-live connect-only feed indefinitely.
+        last_detections = []
 
     annotated = _draw_boxes(frame.copy(), last_detections)
     ok2, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
@@ -368,6 +382,14 @@ async def _camera_loop(camera_id: str) -> None:
         # _process_frame).
         HEARTBEAT_MIN_INTERVAL_S = 1.0
         last_heartbeat_commit_at = 0.0
+        # `camera` is loaded once per connection (below) and, with
+        # expire_on_commit=False (db.py), never picks up another session's
+        # commit on its own — a PATCH to ai_person/ai_vehicle from the API
+        # would otherwise sit invisible to this already-running loop until a
+        # full reconnect. Refreshed at the same throttle cadence as the
+        # heartbeat commit (see below) so Start AI/Stop AI take effect within
+        # about a second, not never.
+        last_ai_refresh_at = 0.0
 
         frame_idx = 0
         consecutive_failures = 0
@@ -421,8 +443,22 @@ async def _camera_loop(camera_id: str) -> None:
                         st["started_at"] = session_opened_at.isoformat()
                 else:
                     consecutive_failures = 0
-                    if st["grid_state"] != "PROCESSING":
-                        _set_grid_state(camera_id, "PROCESSING")
+                    # CONNECTED = real frames flowing, AI off (e.g. the 24/7
+                    # auto-connect supervisor's default state). PROCESSING =
+                    # frames flowing AND AI actually enabled for this camera.
+                    # Throttled refresh (not every frame) so ai_person/
+                    # ai_vehicle reflect a PATCH from another request instead
+                    # of this session's stale in-memory copy — _process_frame
+                    # reads the same `camera` object right below, so this
+                    # covers both call sites.
+                    now_mono_ai = time.monotonic()
+                    if now_mono_ai - last_ai_refresh_at >= HEARTBEAT_MIN_INTERVAL_S:
+                        db.refresh(camera, attribute_names=["ai_person", "ai_vehicle", "ai_anpr"])
+                        last_ai_refresh_at = now_mono_ai
+                    ai_currently_enabled = bool(camera.ai_person) or bool(camera.ai_vehicle)
+                    desired_state = "PROCESSING" if ai_currently_enabled else "CONNECTED"
+                    if st["grid_state"] != desired_state:
+                        _set_grid_state(camera_id, desired_state)
                     h, w = frame.shape[:2]
                     frame_idx += 1
                     st["frames_read"] += 1
@@ -454,7 +490,7 @@ async def _camera_loop(camera_id: str) -> None:
                 logger.exception("camera %s: loop iteration failed, continuing", camera_code_cached)
                 st["last_error"] = f"{type(exc).__name__}: {exc}"
                 st["recovered_errors"] += 1
-                st["grid_state"] = "ERROR"  # next successful iteration flips this back to PROCESSING
+                st["grid_state"] = "ERROR"  # next successful iteration flips this back to CONNECTED/PROCESSING
                 try:
                     db.rollback()
                 except Exception:
@@ -521,3 +557,13 @@ def stop_worker(camera_id: str) -> None:
     LATEST_FRAMES.pop(camera_id, None)
     release_model(camera_id)  # drop this camera's YOLO/ByteTrack instance
     clips.release_camera(camera_id)  # drop this camera's event-clip ring buffer
+    # Real bug found via the live browser test of the Disconnect button:
+    # _camera_loop's own cancellation path (`except asyncio.CancelledError:
+    # pass`) never updates grid_state, so a deliberately stopped camera kept
+    # showing its last live value (e.g. CONNECTED/PROCESSING) forever in the
+    # Camera Grid — indistinguishable from still being connected. Task
+    # cancellation is asynchronous either way (the loop notices and unwinds
+    # on its own schedule), so this is set here, at the one place that
+    # actually knows the operator asked to stop.
+    if camera_id in CAMERA_STATS:
+        _set_grid_state(camera_id, "DISCONNECTED")

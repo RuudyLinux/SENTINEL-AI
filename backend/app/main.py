@@ -6,6 +6,7 @@ from . import models
 from .seed import run_seed
 from .ws import manager
 from .pipeline.worker import start_worker
+from .pipeline import supervisor
 
 from .routers import (
     auth, cameras, streams, detections, vehicles, persons, search,
@@ -75,6 +76,22 @@ async def on_startup():
                 start_worker(camera.id)
     finally:
         db.close()
+
+    # Real Sentinel Camera Grid 24/7 auto-connect: discover the real catalogue
+    # (register-only, safe if the grid is unreachable/unconfigured — logged,
+    # never fatal to startup) and start the connection supervisor, which
+    # connects eligible real cameras up to a resource-safety cap and
+    # reconnects any that drop. Never enables AI (see supervisor.py header).
+    await supervisor.discover_and_register()
+    supervisor.start_supervisor()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Stops the supervisor's sweep loop and every camera worker it manages
+    # cleanly — no orphaned asyncio task or RTSP/cv2 resource left behind at
+    # process exit.
+    await supervisor.stop_supervisor()
 
 
 @app.get("/api/health")

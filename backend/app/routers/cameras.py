@@ -14,13 +14,28 @@ from ..pipeline.worker import start_worker, stop_worker, RUNNING, CAMERA_STATS
 from ..pipeline.source import CameraSource
 from ..pipeline.catalog import fetch_catalog, upsert_from_catalog, CatalogError
 from ..pipeline.sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGridError
+from ..pipeline import supervisor
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
 
 @router.get("", response_model=list[schemas.CameraOut])
 def list_cameras(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    return db.query(models.Camera).order_by(models.Camera.created_at.desc()).all()
+    cameras = db.query(models.Camera).order_by(models.Camera.created_at.desc()).all()
+    # Richer connection-lifecycle state (LIVE/CONNECTING/PROCESSING/DEGRADED/
+    # RECONNECTING/DISCONNECTED/AUTH_ERROR/ERROR) lives in-memory in
+    # CAMERA_STATS, not the DB — attached here (transient attribute, not
+    # persisted) so the Camera Grid can show it without a per-camera
+    # diagnostics round-trip for every row on every poll. None for a camera
+    # whose worker has never run this process, never fabricated.
+    for camera in cameras:
+        stats = CAMERA_STATS.get(camera.id, {})
+        camera.grid_state = stats.get("grid_state")  # type: ignore[attr-defined]
+        # Same stats dict, same reasoning — surfaces real reconnect/error
+        # diagnostics (Camera Grid UI) without a per-camera round-trip.
+        camera.reconnect_count = stats.get("reconnects")  # type: ignore[attr-defined]
+        camera.last_error = stats.get("last_error")  # type: ignore[attr-defined]
+    return cameras
 
 
 @router.post("/catalog/sync")
@@ -172,8 +187,10 @@ def update_camera(
 ):
     """In-place edit of name/location/camera_group/lat/lng/analytics toggles. Does not
     touch source_type/source_uri (a reconnect operation, not an edit) or restart
-    the camera worker — analytics toggles take effect on the next processed frame
-    (worker.py._process_frame reads camera.ai_* live)."""
+    the camera worker — analytics toggles take effect within about a second on an
+    already-running camera (worker.py._camera_loop refreshes ai_person/ai_vehicle/
+    ai_anpr from the DB on a throttle, since expire_on_commit=False means the
+    loop's long-lived `camera` object otherwise never sees this PATCH's commit)."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -191,6 +208,16 @@ def get_camera(camera_id: str, db: Session = Depends(get_db), user: models.User 
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
+    # Real bug found via the final freeze browser smoke test: the single-
+    # camera detail page (GET /{id}) never got this attachment — only the
+    # list endpoint did — so it always read grid_state as missing and
+    # synthesized DISCONNECTED (deriveConnectionState's fallback for "no
+    # grid_state") even while genuinely PROCESSING with real video/detections
+    # flowing. Same attachment as list_cameras, single row.
+    stats = CAMERA_STATS.get(camera.id, {})
+    camera.grid_state = stats.get("grid_state")  # type: ignore[attr-defined]
+    camera.reconnect_count = stats.get("reconnects")  # type: ignore[attr-defined]
+    camera.last_error = stats.get("last_error")  # type: ignore[attr-defined]
     return camera
 
 
@@ -277,22 +304,36 @@ async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: mo
 
 @router.post("/{camera_id}/start")
 async def start_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """CONNECT to a registered camera and begin AI processing — the
-    deliberate second step after catalogue sync (which only REGISTERS)."""
+    """CONNECT to a registered camera — the deliberate second step after
+    catalogue sync (which only REGISTERS). This does NOT enable AI
+    processing; that stays whatever `ai_person`/`ai_vehicle`/`ai_anpr` the
+    camera already has (see `PATCH /{camera_id}` to change those) — connected
+    and AI-processing are independent, by design. For a real Sentinel Grid
+    camera this also marks it auto-managed, so the 24/7 supervisor
+    (pipeline/supervisor.py) reconnects it automatically if it later drops."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
-    start_worker(camera_id)
+    if camera.source_type == "sentinel_grid":
+        supervisor.connect(camera_id)
+    else:
+        start_worker(camera_id)
     log_action(db, user, "start_camera", resource=camera.camera_code)
     return {"ok": True}
 
 
 @router.post("/{camera_id}/stop")
 def stop_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
+    """DISCONNECT — stops the worker (and, for a real Sentinel Grid camera,
+    removes it from the 24/7 supervisor's auto-managed set first, so it is
+    not immediately reconnected on the next sweep)."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
-    stop_worker(camera_id)
+    if camera.source_type == "sentinel_grid":
+        supervisor.disconnect(camera_id)
+    else:
+        stop_worker(camera_id)
     camera.status = "offline"
     db.commit()
     log_action(db, user, "stop_camera", resource=camera.camera_code)

@@ -5,8 +5,9 @@ import Link from "next/link";
 import { api, getStoredUser, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import DataTable, { Column } from "@/components/DataTable";
-import StatusDot from "@/components/StatusDot";
 import ErrorState from "@/components/ErrorState";
+import ConnectionBadge, { AiBadge, deriveConnectionState } from "@/components/ConnectionBadge";
+import KpiCard from "@/components/KpiCard";
 
 // Mirrors the backend's require_roles("Administrator", "Control Room Operator")
 // on catalog sync / create / start / stop / restart (see routers/cameras.py) —
@@ -29,6 +30,7 @@ export default function CamerasPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
   const [editBusy, setEditBusy] = useState(false);
+  const [rowBusyId, setRowBusyId] = useState<string | null>(null);
 
   useEffect(() => {
     const user = getStoredUser();
@@ -114,8 +116,12 @@ export default function CamerasPage() {
     }
   }
 
-  // Catalogue sync only REGISTERS cameras — CONNECTING (starting AI
-  // processing) is a separate, explicit step the operator takes here.
+  // Catalogue sync only REGISTERS cameras — CONNECTING (establishing the
+  // backend stream) is a separate, explicit step the operator takes here.
+  // /start and /stop already mean Connect/Disconnect (routers/cameras.py
+  // routes sentinel_grid cameras through the supervisor's connect/disconnect,
+  // everything else through start_worker/stop_worker) — same endpoints,
+  // clearer labels below.
   async function bulkAction(action: "start" | "stop") {
     setBulkBusy(true);
     setActionError(null);
@@ -129,6 +135,57 @@ export default function CamerasPage() {
       setActionError(err instanceof ApiError ? err.message : `Bulk ${action} failed`);
     } finally {
       setBulkBusy(false);
+    }
+  }
+
+  // Start AI / Stop AI is deliberately NOT /start or /stop — those connect
+  // or disconnect the stream. AI on/off is the ai_person/ai_vehicle flags
+  // (PATCH, already existed for the Edit form) — toggling them never stops
+  // the worker, so a camera stays CONNECTED with AI OFF when AI is stopped.
+  // ai_anpr is left untouched: it can never fire without person/vehicle
+  // detections feeding it, so it's inert either way and this shouldn't
+  // silently override an operator's separate ANPR preference.
+  async function bulkAiAction(on: boolean) {
+    setBulkBusy(true);
+    setActionError(null);
+    try {
+      for (const id of selected) {
+        await api.patch(`/api/cameras/${id}`, { ai_person: on, ai_vehicle: on });
+      }
+      setSelected(new Set());
+      reload();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : `Bulk AI ${on ? "start" : "stop"} failed`);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function connectionAction(id: string, action: "start" | "stop", e: React.MouseEvent) {
+    e.stopPropagation();
+    setRowBusyId(id);
+    setActionError(null);
+    try {
+      await api.post(`/api/cameras/${id}/${action}`);
+      reload();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : `${action === "start" ? "Connect" : "Disconnect"} failed`);
+    } finally {
+      setRowBusyId(null);
+    }
+  }
+
+  async function aiAction(id: string, on: boolean, e: React.MouseEvent) {
+    e.stopPropagation();
+    setRowBusyId(id);
+    setActionError(null);
+    try {
+      await api.patch(`/api/cameras/${id}`, { ai_person: on, ai_vehicle: on });
+      reload();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : `${on ? "Start AI" : "Stop AI"} failed`);
+    } finally {
+      setRowBusyId(null);
     }
   }
 
@@ -149,22 +206,24 @@ export default function CamerasPage() {
     { key: "location", label: "Location" },
     { key: "camera_group", label: "Group", render: (c) => c.camera_group ? <span className="text-xs text-slate-400">{c.camera_group}</span> : <span className="text-xs text-slate-600">—</span> },
     {
-      key: "status", label: "Status",
-      render: (c) => (
-        <div className="flex items-center gap-1.5">
-          <StatusDot status={c.status} />
-          {/* Catalogue availability (row exists) is a different fact from live stream
-              connectivity — a registered-but-never-started camera must not read as
-              "online" via status alone, so it's called out explicitly here rather
-              than relying on "offline" (also shown for a camera that was connected
-              and then dropped) to imply "never connected." */}
-          {c.external_catalog_id && !c.last_frame_at && c.status === "offline" && (
-            <span className="text-[10px] text-slate-500 border border-border rounded px-1" title="Discovered from a camera catalogue; never connected/started">
-              REGISTERED
-            </span>
-          )}
-        </div>
-      ),
+      // Connection lifecycle (24/7 auto-connect supervisor) — REGISTERED/
+      // CONNECTING/CONNECTED/PROCESSING/DEGRADED/RECONNECTING/DISCONNECTED/
+      // AUTH_ERROR/ERROR. Replaces the old plain online/offline StatusDot:
+      // that DB column can't distinguish "never connected" from "was
+      // connected, then dropped" the way grid_state can.
+      key: "connection", label: "Connection",
+      render: (c) => <ConnectionBadge camera={c} />,
+    },
+    {
+      // AI processing is independent of connection state — shown as its own
+      // fact so "CONNECTED, AI OFF" (the 24/7 auto-connect default) reads
+      // clearly rather than looking like AI is silently running.
+      key: "ai", label: "AI",
+      render: (c) => <AiBadge camera={c} />,
+    },
+    {
+      key: "last_frame_at", label: "Last Frame",
+      render: (c) => c.last_frame_at ? <span className="text-xs text-slate-400">{new Date(c.last_frame_at).toLocaleTimeString()}</span> : <span className="text-xs text-slate-600">—</span>,
     },
     { key: "fps", label: "FPS", render: (c) => c.fps?.toFixed(1) ?? "—" },
     { key: "resolution", label: "Resolution" },
@@ -184,12 +243,30 @@ export default function CamerasPage() {
     { key: "error_count", label: "Errors" },
     ...(canManage ? [{
       key: "actions", label: "Actions",
-      render: (c: any) => (
-        <div className="flex gap-2">
-          <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="text-xs text-accent hover:underline">Edit</button>
-          <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="text-xs text-accent hover:underline">Restart</button>
-        </div>
-      ),
+      render: (c: any) => {
+        const busy = rowBusyId === c.id;
+        const connected = deriveConnectionState(c) !== "REGISTERED" && deriveConnectionState(c) !== "DISCONNECTED";
+        const aiOn = !!(c.ai_person || c.ai_vehicle);
+        return (
+          <div className="flex flex-wrap gap-2">
+            {connected ? (
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "stop", e)} className="text-xs text-critical hover:underline disabled:opacity-50">Disconnect</button>
+            ) : (
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "start", e)} className="text-xs text-accent hover:underline disabled:opacity-50">Connect</button>
+            )}
+            {/* Start/Stop AI only makes sense once a stream exists to process. */}
+            {connected && (
+              aiOn ? (
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, false, e)} className="text-xs text-high hover:underline disabled:opacity-50">Stop AI</button>
+              ) : (
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, true, e)} className="text-xs text-accent hover:underline disabled:opacity-50">Start AI</button>
+              )
+            )}
+            <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="text-xs text-accent hover:underline">Edit</button>
+            <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="text-xs text-accent hover:underline">Restart</button>
+          </div>
+        );
+      },
     }] : []),
   ];
 
@@ -197,6 +274,29 @@ export default function CamerasPage() {
   const groups = Array.from(new Set(allCameras.map((c: any) => c.camera_group).filter(Boolean))) as string[];
   const visibleCameras = groupFilter ? allCameras.filter((c: any) => c.camera_group === groupFilter) : allCameras;
   const editingCamera = editingId ? allCameras.find((c: any) => c.id === editingId) : null;
+
+  // Auto-connect visibility (24/7 supervisor) — real cameras only, i.e.
+  // discovered from the Sentinel Grid catalogue (external_catalog_id set),
+  // not a manually-added test row of the same source_type. All numbers
+  // derived from this poll's actual API data, never hardcoded. "Connected"
+  // includes PROCESSING (a live stream with AI also on is still connected);
+  // "Processing" is called out separately since it's a strict subset.
+  // "Disconnected" is the residual so the five numbers stay internally
+  // consistent: Registered = Connected + Reconnecting + Disconnected.
+  const gridCameras = allCameras.filter((c: any) => c.source_type === "sentinel_grid" && c.external_catalog_id);
+  const gridRegistered = gridCameras.length;
+  const gridConnected = gridCameras.filter((c: any) => ["CONNECTED", "PROCESSING"].includes(deriveConnectionState(c))).length;
+  const gridProcessing = gridCameras.filter((c: any) => deriveConnectionState(c) === "PROCESSING").length;
+  const gridReconnecting = gridCameras.filter((c: any) => deriveConnectionState(c) === "RECONNECTING").length;
+  const gridDisconnected = Math.max(0, gridRegistered - gridConnected - gridReconnecting);
+  // Real evidence the auto-connect machinery has actually run in this backend
+  // process, not an assumed/hardcoded flag — a camera only carries grid_state
+  // once its worker has started.
+  const supervisorActive = gridCameras.some((c: any) => !!c.grid_state);
+  const lastCatalogSync = gridCameras.reduce((latest: string | null, c: any) => {
+    if (!c.catalog_synced_at) return latest;
+    return !latest || c.catalog_synced_at > latest ? c.catalog_synced_at : latest;
+  }, null as string | null);
 
   return (
     <div className="space-y-4">
@@ -222,6 +322,25 @@ export default function CamerasPage() {
           </div>
         )}
       </div>
+
+      {gridRegistered > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between flex-wrap gap-1">
+            <div className="text-xs uppercase tracking-wide text-slate-400">Real Sentinel Cameras: {gridRegistered}</div>
+            <div className="text-[11px] text-slate-500">
+              {supervisorActive ? <span className="text-ok">Supervisor: ACTIVE</span> : <span>Supervisor: not yet swept</span>}
+              {lastCatalogSync && <> · Last catalogue sync: {new Date(lastCatalogSync).toLocaleString()}</>}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            <KpiCard title="Registered" value={gridRegistered} />
+            <KpiCard title="Connected" value={gridConnected} sub="live stream, AI on or off" />
+            <KpiCard title="Processing" value={gridProcessing} sub="AI actively running" />
+            <KpiCard title="Reconnecting" value={gridReconnecting} />
+            <KpiCard title="Disconnected" value={gridDisconnected} sub="registered, not live" />
+          </div>
+        </div>
+      )}
 
       {groups.length > 0 && (
         <div className="flex items-center gap-2 text-xs">
@@ -265,10 +384,12 @@ export default function CamerasPage() {
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
 
       {canManage && selected.size > 0 && (
-        <div className="flex items-center gap-3 text-xs bg-panel2 border border-border rounded px-3 py-2">
+        <div className="flex items-center gap-3 text-xs bg-panel2 border border-border rounded px-3 py-2 flex-wrap">
           <span>{selected.size} selected</span>
-          <button disabled={bulkBusy} onClick={() => bulkAction("start")} className="text-accent hover:underline disabled:opacity-50">Start selected</button>
-          <button disabled={bulkBusy} onClick={() => bulkAction("stop")} className="text-critical hover:underline disabled:opacity-50">Stop selected</button>
+          <button disabled={bulkBusy} onClick={() => bulkAction("start")} className="text-accent hover:underline disabled:opacity-50">Connect selected</button>
+          <button disabled={bulkBusy} onClick={() => bulkAction("stop")} className="text-critical hover:underline disabled:opacity-50">Disconnect selected</button>
+          <button disabled={bulkBusy} onClick={() => bulkAiAction(true)} className="text-accent hover:underline disabled:opacity-50">Start AI selected</button>
+          <button disabled={bulkBusy} onClick={() => bulkAiAction(false)} className="text-high hover:underline disabled:opacity-50">Stop AI selected</button>
           <button onClick={() => setSelected(new Set())} className="text-slate-400 hover:underline ml-auto">Clear</button>
         </div>
       )}

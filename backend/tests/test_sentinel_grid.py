@@ -83,6 +83,24 @@ def test_upsert_creates_then_updates_without_duplicating(db_session):
     assert cams2[0].location == "North Gate (renamed)"
 
 
+def test_upsert_new_camera_defaults_ai_off(db_session):
+    """24/7 auto-connect task: a freshly-discovered real grid camera must
+    default ai_person/ai_vehicle/ai_anpr to False. Camera.model's own column
+    default is True — without this explicit override, the 24/7 supervisor
+    connecting a newly-registered camera would also silently start real
+    YOLO/ByteTrack/OCR on it, since 'registered' and 'AI processing' must
+    stay independent by design."""
+    records = [{"id": "cam-ai-default-test", "name": "AI Default Test", "location": "X"}]
+    upsert_grid_cameras(db_session, records)
+    cam = db_session.query(models.Camera).filter(
+        models.Camera.external_catalog_id == "grid:cam-ai-default-test"
+    ).first()
+    assert cam is not None
+    assert cam.ai_person is False
+    assert cam.ai_vehicle is False
+    assert cam.ai_anpr is False
+
+
 def test_upsert_skips_invalid_records_without_crashing(db_session):
     summary = upsert_grid_cameras(db_session, [{"name": "no id"}, {"id": "cam05"}])
     assert summary["skipped_invalid"] == 1
