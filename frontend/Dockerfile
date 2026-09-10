@@ -35,4 +35,13 @@ COPY --from=builder /app/next.config.js ./next.config.js
 # `node` already exists in this base image as a non-root user.
 USER node
 EXPOSE 3000
+
+# `wget` is busybox's built-in applet on Alpine — already present, no `apk add`
+# needed. `/login` is a public, unauthenticated route so this needs no
+# credentials. Without this, `docker compose up --wait` can only confirm the
+# container is RUNNING, never that Next.js is actually SERVING — a broken
+# `next start` (bad env, missing build output) would still read as healthy.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/login || exit 1
+
 CMD ["npm", "run", "start"]
