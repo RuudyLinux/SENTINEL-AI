@@ -3,7 +3,7 @@
 The primary demo scenario needs a vehicle carrying the exact seeded
 watchlist plate (GJ05AB1234) to appear on camera, a few minutes apart, on
 two different cameras. The only real test footage available
-(uploads/car-detection.mp4) doesn't contain that plate — no real OCR read
+(app/demo_assets/car-detection.mp4) doesn't contain that plate — no real OCR read
 of it can be produced from it — so a literal wait for real ANPR to read
 that exact plate off that footage is not deterministic or repeatable for a
 live judge demo.
@@ -52,7 +52,7 @@ DEMO_FRAME_WAIT_TIMEOUT_S = 3.0  # bounded — see _wait_for_live_frame
 async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -> bytes | None:
     """A camera worker started moments ago (POST /demo/reset now starts the
     two demo cameras — see routers/system.py) needs a brief real interval to
-    open uploads/car-detection.mp4 and decode its first frame before
+    open app/demo_assets/car-detection.mp4 and decode its first frame before
     worker.LATEST_FRAMES has anything in it. Polls briefly rather than
     either fabricating a frame or giving up instantly — bounded, so a
     genuinely non-running camera still returns None (honest "no frame")

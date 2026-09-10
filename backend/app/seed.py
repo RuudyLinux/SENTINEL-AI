@@ -65,16 +65,26 @@ def run_seed(db: Session) -> None:
 
 
 # --- Demo camera fixtures (Phase 6) --------------------------------------
-# The two cameras the primary judge-demo scenario runs against. Both point
-# at the same real uploaded test clip (the only real footage available) —
-# genuine YOLO/ByteTrack/EasyOCR processing runs on both; only the specific
-# ANPR "read" of the demo watchlist plate is injected deterministically (see
+# The two cameras the primary judge-demo scenario runs against. Both point at
+# a small tracked-in-git demo clip (app/demo_assets/car-detection.mp4) — real
+# YOLO/ByteTrack/EasyOCR processing runs on both; only the specific ANPR
+# "read" of the demo watchlist plate is injected deterministically (see
 # pipeline/demo_scenario.py), never the detection/tracking itself.
+#
+# Real bug this fixes: this used to point at "uploads/car-detection.mp4" — a
+# file that only ever existed on one developer's machine. `backend/uploads/`
+# is gitignored (real operator-uploaded evidence never belongs in version
+# control), so a fresh checkout, a Docker build, or any CI runner had NO such
+# file: the documented judge-demo flow (README's "Cameras -> Add Camera...
+# or Investigate -> Generate Evidence Package") silently could not produce a
+# real decoded frame anywhere except that one machine. Caught by this
+# project's own CI actually running for the first time. The demo clip now
+# lives under app/, which IS tracked, specifically so it ships with the code.
 DEMO_CAMERAS = [
     {"camera_code": "C-014", "name": "Ahmedabad Ring Road", "location": "Ahmedabad",
-     "lat": 23.03, "lng": 72.58, "source_type": "video_file", "source_uri": "uploads/car-detection.mp4"},
+     "lat": 23.03, "lng": 72.58, "source_type": "video_file", "source_uri": "app/demo_assets/car-detection.mp4"},
     {"camera_code": "C-019", "name": "Naroda Junction", "location": "Naroda",
-     "lat": 23.07, "lng": 72.65, "source_type": "video_file", "source_uri": "uploads/car-detection.mp4"},
+     "lat": 23.07, "lng": 72.65, "source_type": "video_file", "source_uri": "app/demo_assets/car-detection.mp4"},
 ]
 DEMO_PLATE = "GJ05AB1234"
 

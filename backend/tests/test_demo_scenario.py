@@ -150,7 +150,7 @@ def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_toke
     chain never had a snapshot to work with. Drives the REAL
     POST /api/system/demo/reset endpoint (real event loop, real
     asyncio.create_task) against the REAL bundled
-    uploads/car-detection.mp4 and waits briefly for a real decoded frame —
+    app/demo_assets/car-detection.mp4 and waits briefly for a real decoded frame —
     this is the concrete, observable proof that a judge calling reset then
     trigger-scenario moments later gets real evidence, not an empty demo."""
     monkeypatch.setattr(settings, "evidence_dir", tmp_path)

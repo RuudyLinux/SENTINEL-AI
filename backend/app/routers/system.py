@@ -67,7 +67,7 @@ async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(
     producing NO evidence for the flagship demo path. Starting them here —
     same as _on_startup does for every video_file camera — means a real
     frame is actually decoding from the real bundled video
-    (uploads/car-detection.mp4) by the time the demo continues, so the demo
+    (app/demo_assets/car-detection.mp4) by the time the demo continues, so the demo
     scenario's snapshot/clip are genuine, not empty by omission. `async def`
     (not the previous `def`) because start_worker() calls
     asyncio.create_task(), which needs a running event loop in this thread —
