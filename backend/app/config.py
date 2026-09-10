@@ -33,14 +33,25 @@ class Settings(BaseSettings):
     # postgresql+psycopg://user:pass@host:5432/sentinel
     # Development on SQLite / production on PostgreSQL is the supported split.
     database_url: str = ""
-    # PostgreSQL pool sizing. Must comfortably exceed the camera concurrency
-    # cap: each camera worker holds a session for the life of its stream, so a
+    # Connection pool sizing — applies to BOTH backends (see db.py's
+    # _engine_kwargs). Must comfortably exceed the camera concurrency cap:
+    # each running camera worker holds a Session — one pooled connection —
+    # for the ENTIRE lifetime of its stream, not just for one query, so a
     # pool smaller than the worker count means a worker blocks waiting for a
-    # connection. Ignored on SQLite.
+    # connection. Real bug this fixes: the SQLite branch previously set no
+    # pool size at all, silently taking SQLAlchemy's default (size=5,
+    # max_overflow=10 = 15 total) — confirmed live, bulk-starting cameras via
+    # POST /api/cameras/bulk crashed multiple workers with
+    # `QueuePool limit of size 5 overflow 10 reached`. 30 total is a
+    # comfortable default for a single-machine deployment either way; a held
+    # SQLite connection costs nothing beyond a local file handle, so there is
+    # no real reason to size it any smaller than PostgreSQL's default.
     db_pool_size: int = 20
     db_max_overflow: int = 10
     # Recycle before typical server/proxy idle timeouts so a long-lived camera
     # worker's connection is replaced proactively rather than failing in use.
+    # PostgreSQL only (see db.py) — meaningless for a local SQLite file, which
+    # has no server-side idle-connection concept to recycle against.
     db_pool_recycle_seconds: int = 1800
 
     db_path: Path = BASE_DIR / "sentinel.db"

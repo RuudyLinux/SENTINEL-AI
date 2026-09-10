@@ -42,6 +42,28 @@ def _engine_kwargs() -> dict:
             # retry logic, because SQLite gave up waiting for the lock before
             # the retry ever ran).
             "connect_args": {"check_same_thread": False, "timeout": SQLITE_BUSY_TIMEOUT_SECONDS},
+            # Real bug this fixes: every running camera worker holds ONE
+            # SQLAlchemy Session — one pooled connection — for the ENTIRE
+            # lifetime of its stream (see pipeline/worker.py's
+            # `db = SessionLocal()` at the top of `_camera_loop`), not just for
+            # the length of one query. Left unset here, SQLAlchemy silently
+            # applied its QueuePool DEFAULT (size=5, max_overflow=10 -> 15
+            # total) — this codebase's own architecture guarantees that limit
+            # gets exhausted the moment more than ~15 cameras are running
+            # concurrently (confirmed live: bulk-starting cameras via
+            # POST /api/cameras/bulk crashed multiple camera workers with
+            # `sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow
+            # 10 reached`). The PostgreSQL branch below already reasoned about
+            # this exact requirement ("must comfortably exceed the camera
+            # concurrency cap") and sized its pool accordingly; SQLite — the
+            # DEFAULT backend for local/dev/demo use — had nothing. Reuses the
+            # same db_pool_size/db_max_overflow settings so one pair of knobs
+            # covers both backends, rather than inventing SQLite-specific ones.
+            # A held SQLite connection is cheap (a local file handle, not a
+            # server-side resource), so there is no real cost to sizing this
+            # generously.
+            "pool_size": settings.db_pool_size,
+            "max_overflow": settings.db_max_overflow,
         }
     # PostgreSQL. The workload is N long-lived camera-worker sessions plus
     # request-scoped ones, so the pool must comfortably exceed the camera
@@ -52,7 +74,9 @@ def _engine_kwargs() -> dict:
         # A camera worker's session is held open for the life of the stream, so
         # it WILL outlive an idle-connection timeout on the server or a NAT
         # rebalance. pre_ping turns that into one transparent reconnect instead
-        # of a dead connection surfacing as a worker crash.
+        # of a dead connection surfacing as a worker crash. Not applied to
+        # SQLite above: there is no server-side idle timeout or network to drop
+        # for a local file connection, so the check would be pure overhead.
         "pool_pre_ping": True,
         "pool_recycle": settings.db_pool_recycle_seconds,
     }
