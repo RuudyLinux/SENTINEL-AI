@@ -15,6 +15,12 @@ backend/install.log
 backend/uploads/
 backend/evidence_store/
 backend/*.pt
+
+# Real license-plate photos for tools/anpr_bench.py — never version-controlled
+# (privacy/copyright, same reasoning as uploads/ and evidence_store/ above).
+# The README explaining what goes here IS tracked.
+backend/tools/anpr_corpus/*
+!backend/tools/anpr_corpus/README.md
 *.pyc
 
 # Frontend
