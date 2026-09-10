@@ -143,6 +143,16 @@ class PlateOut(BaseModel):
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
+    # V2 sighting fields. All optional: rows written before V2 genuinely never
+    # captured them, and they stay null rather than being backfilled with a
+    # guess (see main.py's ensure_columns backfill choices).
+    track_id: Optional[str] = None
+    last_seen: Optional[datetime] = None
+    reads_count: int = 1
+    vehicle_class: str = ""
+    detection_confidence: float = 0.0
+    vehicle_bbox: Optional[List[float]] = None
+    plate_bbox: Optional[List[float]] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -161,17 +171,64 @@ class VehicleOut(BaseModel):
 
 
 class SightingOut(BaseModel):
+    """One hop in a vehicle's reconstructed cross-camera journey.
+
+    Every field below is an OBSERVATION at a camera. There is deliberately no
+    interpolated position, heading or speed: the system knows where cameras saw
+    this vehicle and when, and nothing between those points. The route drawn
+    from these hops is a reconstructed camera-to-camera path, never a GPS track.
+    """
     camera_id: str
     camera_code: str
     camera_name: str
-    timestamp: datetime
+    timestamp: datetime  # first confident recognition at this camera
     confidence: float
     snapshot_path: Optional[str] = None
+    # V2 additions — defaulted so a caller written against the pre-V2 shape
+    # keeps working unchanged.
+    location: str = ""
+    lat: float = 0.0
+    lng: float = 0.0
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    dwell_seconds: float = 0.0
+    reads_count: int = 1
+    track_id: Optional[str] = None
+    vehicle_class: str = ""
+    plate_id: Optional[str] = None
+    detection_id: Optional[str] = None
 
 
 class VehicleRouteOut(BaseModel):
     vehicle: VehicleOut
     sightings: List[SightingOut]
+
+
+class VehicleSummaryOut(BaseModel):
+    """The investigation header for one vehicle — everything the operator needs
+    before drilling into the journey, evidence or alerts."""
+    vehicle: VehicleOut
+    total_sightings: int
+    cameras_visited: int
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    current_camera_id: Optional[str] = None
+    current_camera_code: Optional[str] = None
+    current_camera_name: Optional[str] = None
+    current_seen_at: Optional[datetime] = None
+    # True only when the most recent sighting is inside the live window — the
+    # honest distinction between "this vehicle is on camera right now" and
+    # "this is where it was last seen". Never asserted from a stale row.
+    is_live: bool = False
+    alert_count: int = 0
+    incident_count: int = 0
+    evidence_count: int = 0
+    watchlist_flag: bool = False
+    best_plate_confidence: float = 0.0
+    # Populated by the risk engine (pipeline/risk.py).
+    risk_score: int = 0
+    risk_severity: str = "LOW"
+    risk_factors: List[dict] = []
 
 
 class WatchlistCreate(BaseModel):
@@ -242,6 +299,11 @@ class AlertOut(BaseModel):
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
+    # Explainable risk assessment (pipeline/risk.py). Alerts raised before V2
+    # carry 0 / [] — no assessment was made for them, and back-computing one now
+    # would assert a decision that was never taken.
+    risk_score: int = 0
+    risk_factors: List[dict] = []
 
     model_config = ConfigDict(from_attributes=True)
 

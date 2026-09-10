@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, API_BASE } from "@/lib/api";
+import { api } from "@/lib/api";
 
 export default function AddCameraPage() {
   const router = useRouter();
@@ -35,9 +35,10 @@ export default function AddCameraPage() {
       const fd = new FormData();
       fd.append("source_type", form.source_type);
       fd.append("source_uri", uri);
-      const res = await fetch(`${API_BASE}/api/cameras/test-connection`, { method: "POST", body: fd });
-      if (!res.ok) throw new Error(`Test request failed (HTTP ${res.status})`);
-      const data = await res.json();
+      // api.post, not a raw fetch: the helper attaches the bearer token. This
+      // endpoint used to be the one camera route with no authorization at all,
+      // precisely because the caller here never sent one.
+      const data = await api.post<any>("/api/cameras/test-connection", fd);
       setTestResult(data.detail);
       if (uri !== form.source_uri) set("source_uri", uri);
     } catch (err: any) {

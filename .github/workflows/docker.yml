@@ -1,0 +1,126 @@
+# Docker build verification.
+#
+# The images cannot be built on the Windows development machine (Docker is not
+# installed there), so this is the only place the Dockerfiles are actually
+# exercised rather than merely reviewed. It builds both images, brings the full
+# stack up against a real PostgreSQL, and checks that the backend reached a
+# serving state with its schema migrated.
+name: Docker
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-context:
+    # Guards the specific regression that motivated the .dockerignore files: a
+    # developer's Windows .venv (1.4 GB) and node_modules (603 MB) were inside
+    # the build contexts. Beyond the size, those are Linux-incompatible binaries,
+    # and in the frontend the host node_modules would have overwritten the
+    # correctly-installed Linux ones after COPY --from=deps.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build contexts must stay small and free of host artifacts
+        run: |
+          set -euo pipefail
+          for ctx in backend frontend; do
+            # Approximates what Docker would send: tar the context with the
+            # ignore rules applied. A CI checkout has no .venv/node_modules, so
+            # this cannot catch a leak by size alone — the explicit path check
+            # below is what actually guards the regression.
+            bytes=$(tar --exclude-from="$ctx/.dockerignore" -cf - "$ctx" 2>/dev/null | wc -c)
+            mb=$(( bytes / 1000000 ))
+            echo "$ctx build context: ${mb} MB"
+            if [ "$mb" -gt 50 ]; then
+              echo "::error::$ctx build context is ${mb} MB - check $ctx/.dockerignore"
+              exit 1
+            fi
+          done
+          # The real guard: these paths must be ignored regardless of whether
+          # they happen to exist on this runner.
+          grep -qx '.venv/' backend/.dockerignore || { echo '::error::backend/.dockerignore no longer excludes .venv/'; exit 1; }
+          grep -qx 'node_modules/' frontend/.dockerignore || { echo '::error::frontend/.dockerignore no longer excludes node_modules/'; exit 1; }
+          grep -qx '.next/' frontend/.dockerignore || { echo '::error::frontend/.dockerignore no longer excludes .next/'; exit 1; }
+          echo "host-artifact exclusions present in both contexts"
+
+  build-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: sentinel-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: sentinel-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate compose configuration
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          JWT_SECRET: ci-jwt-secret-at-least-32-characters-long
+        run: docker compose config >/dev/null
+
+      - name: Compose refuses to start without its required secrets
+        run: |
+          # A police datastore must never come up on a defaulted credential.
+          if docker compose config >/dev/null 2>&1; then
+            echo "::error::compose accepted an empty POSTGRES_PASSWORD/JWT_SECRET"
+            exit 1
+          fi
+          echo "compose correctly refused to start without POSTGRES_PASSWORD/JWT_SECRET"
+
+      - name: Bring the stack up
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          JWT_SECRET: ci-jwt-secret-at-least-32-characters-long
+        run: |
+          docker compose up -d --wait --wait-timeout 300 db backend || {
+            echo "::group::backend logs"; docker compose logs backend; echo "::endgroup::"
+            echo "::group::db logs"; docker compose logs db; echo "::endgroup::"
+            exit 1
+          }
+
+      - name: Backend is serving, on PostgreSQL, with the schema migrated
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          JWT_SECRET: ci-jwt-secret-at-least-32-characters-long
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:8000/api/health | tee /dev/stderr | grep -q '"ok":true'
+          # Alembic must have run: the V2 tables exist in PostgreSQL, which also
+          # proves the SQLite-only ensure_columns helpers were correctly skipped.
+          docker compose exec -T db psql -U sentinel -d sentinel -c '\dt' | tee /dev/stderr | grep -q incident_alerts
+          docker compose exec -T db psql -U sentinel -d sentinel \
+            -c "select count(*) from alembic_version" | grep -q 1
+          # DEMO_MODE defaults to false in compose, so the production JWT-secret
+          # validator ran and accepted the supplied secret.
+          echo "backend healthy on PostgreSQL with migrations applied"
+
+      - name: Container runs as a non-root user
+        run: |
+          uid=$(docker compose exec -T backend id -u)
+          echo "backend uid: $uid"
+          [ "$uid" != "0" ] || { echo "::error::backend is running as root"; exit 1; }
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

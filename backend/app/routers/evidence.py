@@ -1,4 +1,3 @@
-import hashlib
 import json
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,6 +9,7 @@ from ..db import get_db
 from ..security import get_current_user, create_resource_token, get_user_from_resource_token
 from ..config import settings
 from ..audit import log_action
+from ..evidence_hash import sha256_file
 
 router = APIRouter(prefix="/api/evidence", tags=["evidence"])
 
@@ -73,25 +73,69 @@ def download_evidence_file(evidence_id: str, token: str, db: Session = Depends(g
     return FileResponse(safe_path)
 
 
-def _hash_file(path: str) -> str:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except Exception:
-        return ""
-
-
 @router.post("/{evidence_id}/verify")
 def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Re-hash an evidence file and COMPARE it against the digest recorded when
+    it was captured.
+
+    This previously computed a hash at verification time, stored it, and stamped
+    the record "verified" — which verified nothing. With no baseline to compare
+    against, a file altered between capture and inspection hashed cleanly and
+    was reported as verified. For police evidence that is the wrong answer in
+    the one case the feature exists for.
+
+    Evidence is now hashed at capture (see app/evidence_hash.py), so this can do
+    a real comparison and report an honest outcome:
+
+    - `verified`  — the file still matches its capture-time digest.
+    - `tampered`  — it does not. The stored baseline is NEVER overwritten, so
+      the original digest remains available as the record of what was captured.
+    - `unverifiable` — the file is missing or unreadable now.
+    - `no_baseline` — captured before capture-time hashing existed, or hashing
+      failed at capture. A digest is recorded now so future checks have
+      something to compare against, but this call cannot claim the file is
+      unaltered, and does not.
+    """
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e:
         raise HTTPException(status_code=404, detail="Evidence not found")
-    if e.file_path:
-        e.sha256 = _hash_file(e.file_path)
-    e.verification_status = "verified"
+
+    current = sha256_file(e.file_path)
+    baseline = (e.sha256 or "").strip()
+
+    if not e.file_path or not current:
+        outcome, matches = "unverifiable", False
+        detail = "The evidence file is missing or could not be read."
+    elif not baseline:
+        e.sha256 = current
+        outcome, matches = "no_baseline", False
+        detail = (
+            "No capture-time digest existed for this record, so integrity could not be "
+            "confirmed. The current digest has been stored as the baseline for future checks."
+        )
+    elif current == baseline:
+        outcome, matches = "verified", True
+        detail = "The file matches the digest recorded when it was captured."
+    else:
+        outcome, matches = "tampered", False
+        detail = "The file does NOT match its capture-time digest. The original digest is preserved."
+
+    e.verification_status = outcome
     db.commit()
-    log_action(db, user, "verify_evidence", resource=evidence_id)
-    return {"ok": True, "sha256": e.sha256}
+    # Audited with the real outcome — a tamper finding is exactly the event an
+    # audit trail must carry, and recording every check as a plain success
+    # would bury it.
+    log_action(
+        db, user, "verify_evidence", resource=evidence_id,
+        result="SUCCESS" if matches else "FAILURE",
+    )
+    return {
+        "ok": matches,
+        "status": outcome,
+        "detail": detail,
+        "sha256": e.sha256,
+        "computed_sha256": current,
+    }
 
 
 @router.get("/incidents/{incident_id}/package-token")

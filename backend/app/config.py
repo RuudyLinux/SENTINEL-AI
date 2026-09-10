@@ -27,6 +27,22 @@ class Settings(BaseSettings):
     # default preserves today's exact behavior unchanged.
     cors_allowed_origins: str = "http://localhost:3000"
 
+    # Datastore. Empty means "derive a SQLite URL from db_path" — the exact
+    # pre-V2 behavior, so an existing checkout and the test suite need no
+    # config change. Production sets this to a PostgreSQL URL, e.g.
+    # postgresql+psycopg://user:pass@host:5432/sentinel
+    # Development on SQLite / production on PostgreSQL is the supported split.
+    database_url: str = ""
+    # PostgreSQL pool sizing. Must comfortably exceed the camera concurrency
+    # cap: each camera worker holds a session for the life of its stream, so a
+    # pool smaller than the worker count means a worker blocks waiting for a
+    # connection. Ignored on SQLite.
+    db_pool_size: int = 20
+    db_max_overflow: int = 10
+    # Recycle before typical server/proxy idle timeouts so a long-lived camera
+    # worker's connection is replaced proactively rather than failing in use.
+    db_pool_recycle_seconds: int = 1800
+
     db_path: Path = BASE_DIR / "sentinel.db"
     uploads_dir: Path = BASE_DIR / "uploads"
     evidence_dir: Path = BASE_DIR / "evidence_store"
@@ -41,6 +57,77 @@ class Settings(BaseSettings):
     # ANPR quality gate: a normalized OCR read only becomes a Vehicle/Plate
     # correlation record if it looks like a plate AND clears this confidence.
     plate_min_confidence: float = 0.35
+
+    # --- V2 plate pipeline (plate localization + per-track confidence voting) ---
+    # Master switch. False restores the exact pre-V2 behavior: whole vehicle
+    # crop -> OCR -> one Plate row per passing frame. Kept as a real escape
+    # hatch, not decoration — the V2 path changes both OCR cost and Plate row
+    # cardinality, and an operator must be able to revert that in one env var
+    # without a code change.
+    plate_pipeline_v2: bool = True
+    # Optional dedicated license-plate detection weights. Deliberately empty by
+    # default: this repo bundles only yolov8n.pt (COCO), which has no plate
+    # class, and a plate model is a real asset a deployment supplies. Empty (or
+    # a path that does not exist) falls back to classical CV localization —
+    # see pipeline/plate_detect.py. Never fabricated, never auto-downloaded.
+    plate_model_name: str = ""
+    plate_detect_confidence: float = 0.25
+    # Plate crops are upscaled to this glyph height before OCR. Effective glyph
+    # height dominates OCR accuracy on real CCTV frames far more than the OCR
+    # engine choice does.
+    plate_ocr_target_height: int = 64
+    # Temporal aggregation: a track's plate is considered settled once this
+    # many agreeing reads clear this peak confidence. Until then every
+    # inference cycle re-reads it.
+    plate_min_reads_for_stability: int = 3
+    plate_stable_confidence: float = 0.60
+    # Once settled, re-verify at most this often instead of every cycle — the
+    # main OCR cost saving, while still catching a genuine mid-track correction.
+    plate_reverify_seconds: float = 10.0
+    # A track not seen for this long is dropped from the in-memory accumulator.
+    # ByteTrack never announces that a track id retired, so this is what bounds
+    # the dict on a camera running for days.
+    plate_track_ttl_seconds: float = 120.0
+    # How often a still-visible vehicle's sighting row is refreshed so its
+    # last_seen/dwell stays truthful. Bounds write pressure for a vehicle
+    # parked in frame — without it the row would be rewritten every frame.
+    plate_sighting_refresh_seconds: float = 5.0
+
+    # --- Event correlation ---
+    # A new CRITICAL alert about a vehicle that ALREADY has an open incident
+    # within this window is attached to that incident rather than opening
+    # another one. 15 minutes is long enough to cover a vehicle crossing several
+    # cameras in one run, short enough that a genuinely separate visit hours
+    # later is treated as a new event.
+    incident_correlation_window_seconds: float = 900.0
+    # A vehicle is reported as LIVE only if it was seen this recently. Beyond
+    # it, the UI must say "last known", never imply the vehicle is on camera now.
+    vehicle_live_window_seconds: float = 120.0
+
+    # --- Live event stream (see ws.py) ---
+    # Detections are coalesced into one batch frame per interval instead of one
+    # frame each: N cameras x their inference rate would otherwise be N x rate
+    # React state updates per second in every open dashboard. 250ms still reads
+    # as instant to an operator. Alerts and incidents are never batched.
+    ws_batch_interval_seconds: float = 0.25
+    # Hard cap per batch. If flushing ever stalls, the buffer must not grow
+    # without bound — oldest events are dropped and the batch reports the real
+    # count rather than implying the stream was complete.
+    ws_batch_max_events: int = 200
+
+    # How long shutdown waits for fire-and-forget background work (event-clip
+    # encodes, self-heal log writes) before cancelling it. Comfortably above
+    # clip_post_event_seconds so a clip already collecting frames for a real
+    # alert gets to finish and persist its Evidence row.
+    shutdown_drain_seconds: float = 15.0
+
+    # --- Metrics ---
+    # Shared secret a Prometheus scraper presents as a bearer token. Empty by
+    # default: with no token configured, /api/metrics is reachable only with an
+    # Administrator JWT. There is deliberately no unauthenticated mode — camera
+    # counts, plate-recognition rates and alert volumes are operationally
+    # sensitive. Set it in .env only, never in source.
+    metrics_token: str = ""
 
     # Stream reconnect (P0-A): backoff schedule used both on initial open
     # failure and on a dropped mid-stream read.

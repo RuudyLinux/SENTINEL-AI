@@ -1,3 +1,9 @@
+# Secrets. The root .env holds the compose POSTGRES_PASSWORD/JWT_SECRET that
+# .env.example tells you to create — it must never be committed. .env.example
+# itself is the committed template and carries no real values.
+/.env
+.env.local
+
 # Backend
 backend/.env
 backend/.venv/
@@ -18,6 +24,9 @@ frontend/dev.log
 frontend/next-env.d.ts
 frontend/AGENTS.md
 frontend/CLAUDE.md
+
+# Root-level virtualenv (the backend one is covered above)
+/.venv/
 
 # OS / editor
 .DS_Store

@@ -1,40 +1,88 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
-
-name: Python package
+# Backend CI.
+#
+# Previously this ran `pytest` from the repository ROOT across Python 3.9/3.10/
+# 3.11. The test suite lives in `backend/tests` and imports `app.*`, so from the
+# root pytest collected nothing and the job passed without ever running a test.
+# The code also requires 3.11 (`X | None` in runtime-evaluated annotations,
+# among others), so the 3.9/3.10 legs could never have worked either.
+name: Backend
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+    defaults:
+      run:
+        working-directory: backend
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
-      run: |
-        pytest
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      # opencv-python-headless needs libGL/glib at import time, and the
+      # detection pipeline decodes video through ffmpeg.
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Lint (syntax errors and undefined names only)
+        run: |
+          flake8 app tests --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 app tests --count --exit-zero --max-complexity=12 --max-line-length=127 --statistics
+
+      - name: Test
+        env:
+          # Never let CI reach the real external camera grid, and keep the demo
+          # seed path active so the suite's fixtures behave as documented.
+          SENTINEL_GRID_EMAIL: ""
+          SENTINEL_GRID_PASSWORD: ""
+          SENTINEL_GRID_AUTOCONNECT: "false"
+          CAMERA_CATALOG_BASE_URL: ""
+          DEMO_MODE: "true"
+        run: pytest tests -q
+
+      - name: Verify migrations apply and roll back
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+        env:
+          DB_PATH: ${{ runner.temp }}/migration-check.db
+
+  migration-drift:
+    # Catches the common failure where a model gains a column but no migration
+    # is written: autogenerate against an up-to-date database must produce an
+    # EMPTY migration. Separate job so a drift failure is unambiguous.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0
+      - run: pip install -r requirements.txt
+      - name: Detect model/migration drift
+        env:
+          DB_PATH: ${{ runner.temp }}/drift-check.db
+        run: |
+          alembic upgrade head
+          alembic check

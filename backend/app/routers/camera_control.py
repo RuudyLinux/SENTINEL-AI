@@ -37,6 +37,7 @@ from .. import models
 from ..db import get_db, SessionLocal
 from ..security import require_roles
 from ..audit import log_action
+from ..pipeline.db_retry import close_session
 from ..ws import manager
 from ..pipeline.worker import start_worker, stop_worker
 from ..pipeline import supervisor
@@ -145,7 +146,12 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
     except Exception as exc:
         return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": f"{type(exc).__name__}: {exc}"}
     finally:
-        db.close()
+        # close_session, not db.close(): this session is used by safe_commit,
+        # which hands the actual commit to a worker thread. If this coroutine is
+        # cancelled while that thread is mid-commit, a plain close() races it and
+        # raises IllegalStateChangeError — the same defect fixed in worker.py's
+        # camera loop. See db_retry.close_session.
+        close_session(db)
 
 
 @router.post("")

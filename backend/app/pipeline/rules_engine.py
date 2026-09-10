@@ -20,12 +20,15 @@ every active Zone/watchlist entry, matching this project's existing behavior —
 never actually read here — now enforced, see `_within_schedule`).
 """
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from .. import models
-from ..ws import manager
+from .. import models, metrics
+from ..config import settings
+from ..ws import manager, EventType
+from . import risk
 from .db_retry import safe_commit
+from ..evidence_hash import sha256_file
 
 COOLDOWN_SECONDS = 45.0
 _last_alert_at: dict[tuple, float] = {}
@@ -90,6 +93,59 @@ def _prune_stale_presence(floor_seconds: float) -> None:
         _zone_presence.pop(k, None)
 
 
+def find_incident_for_alert(db: Session, alert_id: str) -> "models.Incident | None":
+    """The incident an alert belongs to.
+
+    Two paths on purpose: an alert that OPENED an incident is linked by
+    `Incident.alert_id` (the original, still-supported relationship), while an
+    alert CORRELATED into an existing incident is linked through
+    `IncidentAlert`. Callers must not have to know which, so every lookup goes
+    through here rather than querying `Incident.alert_id` directly.
+    """
+    link = db.query(models.IncidentAlert).filter(models.IncidentAlert.alert_id == alert_id).first()
+    if link is not None:
+        incident = db.query(models.Incident).filter(models.Incident.id == link.incident_id).first()
+        if incident is not None:
+            return incident
+    return db.query(models.Incident).filter(models.Incident.alert_id == alert_id).first()
+
+
+_PRIORITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def _find_correlatable_incident(
+    db: Session, vehicle: "models.Vehicle | None", camera: models.Camera, at: datetime,
+) -> "models.Incident | None":
+    """An already-open incident this alert is part of, rather than a new event.
+
+    Correlation is deliberately conservative — it only merges on evidence strong
+    enough to be defensible:
+
+    - **same vehicle**, still open, within the correlation window. A recognized
+      plate is a hard identity, so a watchlisted vehicle crossing five cameras
+      in ten minutes is one pursuit, not five incidents.
+    - **same camera, no vehicle identified**, still open, within the window —
+      repeated zone breaches at one location in one window are one situation.
+
+    It never merges on visual similarity or proximity alone. Two different
+    vehicles doing similar things are two incidents, and claiming otherwise
+    would be an identity assertion this system cannot support.
+    """
+    window_start = at - timedelta(seconds=settings.incident_correlation_window_seconds)
+    query = db.query(models.Incident).filter(
+        models.Incident.status != "closed",
+        models.Incident.created_at >= window_start,
+    )
+    if vehicle is not None:
+        query = query.filter(models.Incident.vehicle_id == vehicle.id)
+    else:
+        query = query.filter(
+            models.Incident.camera_id == camera.id,
+            models.Incident.vehicle_id.is_(None),
+        )
+    return query.order_by(models.Incident.created_at.desc()).first()
+
+
 async def evaluate(
     db: Session,
     camera: models.Camera,
@@ -102,6 +158,10 @@ async def evaluate(
     reasons: list[str] = []
     severity = "MEDIUM"
     rule_id = None
+    # Structured inputs for the risk score, collected alongside the human-
+    # readable `reasons` as each rule matches — so the score is computed from
+    # what actually fired, never re-derived by parsing the reason strings.
+    signals = risk.RiskSignals(camera_code=str(camera.camera_code))
 
     # --- watchlist_plate rule (cooldown per camera+vehicle) ---
     if vehicle and vehicle.watchlist_flag and not _on_cooldown((camera.id, "watchlist", vehicle.id)):
@@ -111,6 +171,13 @@ async def evaluate(
         reasons.append(f"Watchlist signal: plate {vehicle.plate_text} matches an active watchlist entry")
         severity = "CRITICAL"
         rule_id = rule.id if rule else None
+        entry = db.query(models.WatchlistEntry).filter(
+            models.WatchlistEntry.entity_type == "plate",
+            models.WatchlistEntry.identifier == vehicle.plate_text,
+            models.WatchlistEntry.active == True,  # noqa: E712
+        ).first()
+        signals.watchlist_priority = entry.priority if entry else "HIGH"
+        signals.plate_text = str(vehicle.plate_text or "")
 
     # --- zone_entry / loitering rules for this camera (cooldown per camera+zone+track) ---
     at = detection.source_timestamp or detection.timestamp or datetime.utcnow()
@@ -133,6 +200,8 @@ async def evaluate(
                 models.AlertRule.rule_type == "zone_entry", models.AlertRule.zone_id == zone.id
             ).first()
             rule_id = rule.id if rule else rule_id
+            signals.zone_severity = str(zone.severity or "MEDIUM")
+            signals.zone_name = str(zone.name or "")
 
         # --- loitering (dwell-time), only for zones an active loitering AlertRule
         # actually targets — configurable-by-rule, unlike zone_entry above which
@@ -157,9 +226,38 @@ async def evaluate(
                     if severity != "CRITICAL":
                         severity = zone.severity if zone.severity in ("HIGH", "CRITICAL") else severity
                     rule_id = loitering_rule.id if rule_id is None else rule_id
+                    signals.loitering_seconds = dwell
 
     if not reasons:
         return alerts
+
+    # --- Risk score ---
+    # Vehicle-history signals are only counted when a vehicle was actually
+    # identified. For a bare zone_entry with no plate there is no vehicle
+    # history to speak of, and inventing zeroes as if there were would be a
+    # different (wrong) statement from having no data.
+    signals.at = detection.source_timestamp or detection.timestamp or datetime.utcnow()
+    if vehicle is not None:
+        signals.plate_confidence = float(vehicle.plate_confidence or 0.0)
+        signals.plate_text = signals.plate_text or str(vehicle.plate_text or "")
+        sightings = db.query(models.Plate).filter(models.Plate.vehicle_id == vehicle.id).all()
+        signals.total_sightings = len(sightings)
+        signals.cameras_visited = len({p.camera_id for p in sightings})
+        signals.plate_reads = sum(p.reads_count or 1 for p in sightings)
+        signals.prior_incidents = db.query(models.Incident).filter(
+            models.Incident.vehicle_id == vehicle.id
+        ).count()
+        signals.related_alerts = db.query(models.Alert).filter(
+            models.Alert.vehicle_id == vehicle.id
+        ).count()
+    assessment = risk.assess(signals)
+
+    # The rule-derived severity acts as a FLOOR, never a ceiling. The risk score
+    # can only escalate an alert, never quietly downgrade one that an explicit
+    # rule already classified as CRITICAL — a scoring change must not be able to
+    # make an existing rule matter less than it did before.
+    if _PRIORITY_ORDER.get(assessment.severity, 0) > _PRIORITY_ORDER.get(severity, 0):
+        severity = assessment.severity
 
     alert = models.Alert(
         camera_id=camera.id,
@@ -171,28 +269,101 @@ async def evaluate(
         reasons=reasons,
         snapshot_path=detection.snapshot_path,
         source_timestamp=detection.source_timestamp,
+        risk_score=assessment.score,
+        risk_factors=assessment.as_dicts(),
     )
     db.add(alert)
     db.flush()
     alerts.append(alert)
+    metrics.ALERTS_TOTAL.labels(camera_code=str(camera.camera_code), severity=severity).inc()
 
-    # Auto-create an incident for CRITICAL alerts (doc §60 flagship flow)
+    # Auto-create — or CORRELATE INTO — an incident for CRITICAL alerts.
+    #
+    # Pre-V2 every CRITICAL alert opened its own incident, so one real event
+    # (watchlisted vehicle enters a restricted zone, then crosses three more
+    # cameras) became four separate incidents an operator had to mentally
+    # reassemble. Now a qualifying alert is attached to the open incident it
+    # belongs to, and the incident's own description/priority/title grow to
+    # describe the whole event.
     incident = None
+    incident_link = None
     incident_evidence = None
+    incident_targets: dict | None = None
     if severity == "CRITICAL":
-        incident = models.Incident(
-            title=f"Potential match — {vehicle.plate_text if vehicle else detection.cls} on {camera.camera_code}",
-            incident_type="watchlist_match" if vehicle else "zone_entry",
-            priority="CRITICAL",
-            status="open",
-            location=camera.location,
-            description="; ".join(reasons),
-            camera_id=camera.id,
-            alert_id=alert.id,
-            vehicle_id=vehicle.id if vehicle else None,
+        existing = _find_correlatable_incident(db, vehicle, camera, signals.at)
+        if existing is not None:
+            linked_alert_ids = {
+                row.alert_id for row in db.query(models.IncidentAlert).filter(
+                    models.IncidentAlert.incident_id == existing.id
+                ).all()
+            }
+            linked_alert_ids.add(str(existing.alert_id) if existing.alert_id else "")
+            linked_alert_ids.discard("")
+            linked_alert_ids.add(str(alert.id))
+            cameras_involved = {
+                row.camera_id for row in db.query(models.Alert).filter(
+                    models.Alert.id.in_(linked_alert_ids)
+                ).all()
+            }
+            correlation_reason = (
+                f"same vehicle ({vehicle.plate_text}) within the correlation window"
+                if vehicle is not None
+                else f"same camera ({camera.camera_code}) within the correlation window"
+            )
+            # Captured into locals BEFORE assignment: `existing` is persistent,
+            # so a rollback expires these mutations back to their committed
+            # values and the retry must reassign from here, not re-read them.
+            subject = f"Watchlisted vehicle {vehicle.plate_text}" if vehicle else f"Restricted-zone activity on {camera.camera_code}"
+            target_title = (
+                f"{subject} — {len(linked_alert_ids)} correlated alerts across "
+                f"{len(cameras_involved)} camera(s)"
+            )
+            # New reasons are appended, never replacing the incident's history —
+            # the description is the running narrative of the whole event.
+            new_reasons = [r for r in reasons if r not in (existing.description or "")]
+            target_description = "; ".join(filter(None, [existing.description or "", *new_reasons]))
+            target_priority = (
+                severity if _PRIORITY_ORDER.get(severity, 0) > _PRIORITY_ORDER.get(str(existing.priority), 0)
+                else existing.priority
+            )
+            target_updated_at = datetime.utcnow()
+            existing.title = target_title
+            existing.description = target_description
+            existing.priority = target_priority
+            existing.updated_at = target_updated_at
+            incident = existing
+            incident_targets = {
+                "title": target_title, "description": target_description,
+                "priority": target_priority, "updated_at": target_updated_at,
+            }
+        else:
+            correlation_reason = "opened this incident"
+            incident = models.Incident(
+                title=f"Potential match — {vehicle.plate_text if vehicle else detection.cls} on {camera.camera_code}",
+                incident_type="watchlist_match" if vehicle else "zone_entry",
+                priority="CRITICAL",
+                status="open",
+                location=camera.location,
+                description="; ".join(reasons),
+                camera_id=camera.id,
+                alert_id=alert.id,
+                vehicle_id=vehicle.id if vehicle else None,
+            )
+            db.add(incident)
+            db.flush()
+
+        # Every alert belonging to an incident is linked here, including the one
+        # that opened it — so a caller never has to check two relationships to
+        # enumerate an incident's alerts.
+        incident_link = models.IncidentAlert(
+            incident_id=incident.id, alert_id=alert.id, correlation_reason=correlation_reason,
         )
-        db.add(incident)
+        db.add(incident_link)
         db.flush()
+        # Split by outcome so the correlation's actual effect is measurable:
+        # a rising `correlated` share against a flat `opened` share is the
+        # alert-noise reduction this feature exists to deliver.
+        metrics.INCIDENTS_TOTAL.labels(outcome="correlated" if incident_targets else "opened").inc()
         if detection.snapshot_path:
             # Final-demo-readiness-phase finding: this Evidence row omitted
             # alert_id/detection_id/event_type/source_timestamp — fields
@@ -207,6 +378,7 @@ async def evaluate(
                 evidence_type="snapshot",
                 camera_id=camera.id,
                 file_path=detection.snapshot_path,
+                sha256=sha256_file(detection.snapshot_path),
                 alert_id=alert.id,
                 detection_id=detection.id,
                 event_type="watchlist_match" if vehicle else "zone_entry",
@@ -215,23 +387,55 @@ async def evaluate(
             )
             db.add(incident_evidence)
 
-    # alert/incident/incident_evidence are all freshly db.add()'d in this
-    # same call — never persisted before — so on a transient SQLite lock a
+    # alert / incident_link / incident_evidence are all freshly db.add()'d in
+    # this same call — never persisted before — so on a transient SQLite lock a
     # rollback only detaches them; their already-set Python attributes
     # (including each one's client-side-generated PK from the db.flush()
     # calls above) survive untouched, so re-add() alone correctly restores
     # them for a retry (verified empirically — see pipeline/db_retry.py).
-    await safe_commit(db, f"camera {camera.camera_code}", reapply=lambda: (
-        db.add(alert),
-        db.add(incident) if incident is not None else None,
-        db.add(incident_evidence) if incident_evidence is not None else None,
-    ))
-    await manager.broadcast("alert", {
+    #
+    # `incident` is the exception: when this alert CORRELATED into an existing
+    # incident, that row is persistent and was mutated in place, so a rollback
+    # reverts its fields rather than merely detaching it. Those fields are
+    # therefore reassigned from `incident_targets`, captured above.
+    def _reapply():
+        db.add(alert)
+        if incident is not None:
+            db.add(incident)
+            for name, value in (incident_targets or {}).items():
+                setattr(incident, name, value)
+        if incident_link is not None:
+            db.add(incident_link)
+        if incident_evidence is not None:
+            db.add(incident_evidence)
+
+    await safe_commit(db, f"camera {camera.camera_code}", reapply=_reapply)
+    # Never batched: an operator waiting even a fraction of a second longer for
+    # a CRITICAL watchlist hit is the wrong trade (see ws.py).
+    await manager.publish(EventType.ALERT_CREATED, {
         "id": alert.id,
         "camera_id": camera.id,
         "camera_code": camera.camera_code,
         "severity": alert.severity,
         "reasons": alert.reasons,
+        "risk_score": alert.risk_score,
+        "risk_factors": alert.risk_factors,
+        "vehicle_id": alert.vehicle_id,
+        "plate_text": str(vehicle.plate_text) if vehicle is not None else None,
+        "incident_id": incident.id if incident is not None else None,
         "timestamp": alert.timestamp.isoformat(),
     })
+    if incident is not None and incident_targets is None:
+        # Only a NEWLY opened incident is announced. A correlated alert joining
+        # an existing incident is not a new incident, and announcing it as one
+        # would recreate exactly the operator-flooding correlation exists to fix.
+        await manager.publish(EventType.INCIDENT_CREATED, {
+            "id": incident.id,
+            "title": incident.title,
+            "priority": incident.priority,
+            "camera_id": incident.camera_id,
+            "vehicle_id": incident.vehicle_id,
+            "alert_id": alert.id,
+            "created_at": incident.created_at.isoformat() if incident.created_at else None,
+        })
     return alerts

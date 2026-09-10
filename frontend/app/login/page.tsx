@@ -54,9 +54,19 @@ export default function LoginPage() {
           className="bg-panel border border-border rounded-lg p-6 space-y-4 animate-slide-up"
           style={{ animationDelay: "80ms" }}
         >
+          {/* htmlFor/id: these labels were visually adjacent to their inputs but
+              not programmatically associated with them, so a screen reader
+              announced two unlabelled text boxes. autoComplete lets a password
+              manager fill them, which matters for an account an operator uses
+              at the start of every shift. */}
           <div>
-            <label className="text-xs text-slate-400">Police ID / Username</label>
+            <label htmlFor="login-username" className="text-xs text-slate-400">
+              Police ID / Username
+            </label>
             <input
+              id="login-username"
+              name="username"
+              autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="mt-1 w-full bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent transition-colors duration-150"
@@ -64,9 +74,14 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <label className="text-xs text-slate-400">Password</label>
+            <label htmlFor="login-password" className="text-xs text-slate-400">
+              Password
+            </label>
             <input
+              id="login-password"
+              name="password"
               type="password"
+              autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="mt-1 w-full bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent transition-colors duration-150"

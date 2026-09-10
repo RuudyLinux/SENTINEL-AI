@@ -16,3 +16,11 @@ reportlab
 httpx
 pytest
 psutil
+# V2: Prometheus exposition for /api/metrics (app/metrics.py).
+prometheus-client
+# V2: schema migrations. SQLite development still uses the additive helpers in
+# app/db.py; on any other backend Alembic owns the schema outright.
+alembic
+# V2: PostgreSQL driver for the production datastore. Unused when DATABASE_URL
+# is unset (SQLite development), so it costs nothing on a dev checkout.
+psycopg[binary]

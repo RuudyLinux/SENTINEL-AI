@@ -1,0 +1,28 @@
+# Without this, `COPY . .` drops the developer's Windows-built .venv into a
+# Linux image — hundreds of MB of binaries that cannot run there and that can
+# shadow the packages pip just installed. The same applies to the local
+# database and evidence store, which are real case data and must come from a
+# volume, never be baked into an image.
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local datastore and operational output — volume-mounted at runtime.
+sentinel.db
+sentinel.db-shm
+sentinel.db-wal
+uploads/
+evidence_store/
+*.log
+
+# Secrets never belong in an image layer.
+.env
+
+# Model weights are downloaded/mounted, not baked in (and *.pt is gitignored,
+# so a build from a clean checkout would not have them anyway).
+*.pt
+
+tests/

@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import background, models
 from ..config import settings
 from ..audit import log_action
 from .correlate import upsert_vehicle_for_plate, get_route
@@ -169,10 +169,13 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
             event_type = "watchlist_match" if alert.vehicle_id else "zone_entry"
             # Real video clip from this camera's own live ring buffer, same
             # mechanism the real pipeline uses on a real alert (worker.py).
-            asyncio.create_task(clips.build_event_clip(
-                camera.id, camera.camera_code, alert.id, det.id,
-                incident.id if incident else None, event_type, ts,
-            ))
+            background.spawn(
+                clips.build_event_clip(
+                    camera.id, camera.camera_code, alert.id, det.id,
+                    incident.id if incident else None, event_type, ts,
+                ),
+                name=f"clip:{camera.camera_code}:{alert.id}",
+            )
         results.append({
             "camera_code": camera_code, "detection_id": det.id, "snapshot_path": snapshot_path,
             "alerts": [{"id": a.id, "severity": a.severity, "reasons": a.reasons} for a in alerts],

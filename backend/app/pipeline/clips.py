@@ -26,6 +26,7 @@ import imageio_ffmpeg
 
 from .. import models
 from ..config import settings
+from ..evidence_hash import sha256_file
 from ..db import SessionLocal
 from ..audit import log_action
 
@@ -165,6 +166,7 @@ async def build_event_clip(
             event_type=event_type,
             source_timestamp=source_timestamp,
             file_path=str(path),
+            sha256=sha256_file(str(path)),
             verification_status="unverified",
         )
         db.add(evidence)

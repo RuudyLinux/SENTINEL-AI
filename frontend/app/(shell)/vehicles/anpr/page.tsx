@@ -16,6 +16,17 @@ export default function AnprPage() {
     e.preventDefault();
     setError(null);
     try {
+      // An exact plate goes straight to that vehicle's investigation page —
+      // the officer typed a specific plate, so landing on a result list they
+      // then have to click through is a wasted step. A partial/near match
+      // still falls back to the list below.
+      try {
+        const exact = await api.get<any>(`/api/vehicles/by-plate/${encodeURIComponent(plate)}`);
+        router.push(`/vehicles/${exact.id}`);
+        return;
+      } catch (err) {
+        if (!(err instanceof ApiError) || err.status !== 404) throw err;
+      }
       const vehicles = await api.get<any[]>(`/api/vehicles?plate=${encodeURIComponent(plate)}`);
       setResults(vehicles);
       setSearched(true);
@@ -51,7 +62,7 @@ export default function AnprPage() {
         <DataTable
           columns={columns}
           rows={results}
-          onRowClick={(v) => router.push(`/vehicles/tracking?vehicle_id=${v.id}`)}
+          onRowClick={(v) => router.push(`/vehicles/${v.id}`)}
           emptyTitle={searched ? "No plate matches found" : "Search a plate to see results"}
           emptyHint="Reads come from real OCR over vehicle crops — accuracy depends on plate visibility in the source footage."
         />

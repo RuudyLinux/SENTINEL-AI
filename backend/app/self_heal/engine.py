@@ -20,9 +20,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from .. import models
+from .. import models, metrics
 from ..db import SessionLocal
-from ..ws import manager
+from ..ws import manager, EventType
 
 logger = logging.getLogger("sentinel.self_heal")
 
@@ -126,7 +126,13 @@ async def record_event(**kwargs) -> "models.SelfHealEvent | None":
     row = await asyncio.to_thread(record_event_sync, **kwargs)
     if row is not None:
         try:
-            await manager.broadcast("self_heal_event", serialize(row))
+            # publish, not broadcast: emits the canonical `self_heal.recovery`
+            # name and the legacy `self_heal_event` alias alongside it, so the
+            # existing Recovery Activity / Problems pages keep working unchanged.
+            metrics.SELF_HEAL_EVENTS.labels(
+                component=str(row.component or "unknown"), status=str(row.status or "unknown"),
+            ).inc()
+            await manager.publish(EventType.SELF_HEAL_RECOVERY, serialize(row))
         except Exception:
             logger.exception("self-heal: broadcast failed, continuing")
     return row

@@ -15,18 +15,20 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("sentinel.worker")
 
-from .. import models
+from .. import models, metrics, background
 from ..db import SessionLocal
 from ..config import settings
-from ..ws import manager
+from ..ws import manager, EventType
 from .source import CameraSource
 from .detector import detect_and_track, release_model
 from .anpr import read_plate, passes_anpr_gate
 from .appearance import compute_signature
-from .correlate import upsert_vehicle_for_plate
-from .rules_engine import evaluate
+from .correlate import upsert_vehicle_for_plate, upsert_plate_sighting, upsert_track
+from . import plate_detect, plate_tracker
+from .rules_engine import evaluate, find_incident_for_alert
 from .timing import compute_source_timestamp
-from .db_retry import safe_commit, safe_flush
+from .db_retry import safe_commit, safe_flush, close_session
+from ..evidence_hash import sha256_file
 from ..self_heal import engine as self_heal
 from . import clips
 
@@ -248,6 +250,151 @@ def _save_snapshot(frame: np.ndarray, prefix: str) -> str:
     return str(path)
 
 
+VEHICLE_CLASSES = ("car", "truck", "bus", "motorbike")
+
+# Fields that a V2 upsert may mutate on an ALREADY-PERSISTENT row. A rollback
+# expires a persistent object's mutations back to their last-committed values
+# (it does not merely detach the object, the way it does for a never-committed
+# one), so a retry has to reassign these from values captured before the
+# rollback — re-add() alone would restore the stale row. Same contract the
+# vehicle/alert reapply closures in this module and correlate.py already follow.
+_PLATE_REAPPLY_FIELDS = (
+    "confidence", "plate_text_normalized", "plate_text_raw", "reads_count",
+    "last_seen", "snapshot_path", "plate_bbox", "vehicle_bbox",
+)
+_TRACK_REAPPLY_FIELDS = ("last_seen", "detection_count", "vehicle_id", "plate_reads")
+
+
+def _snapshot_attrs(row: Any, fields: "tuple[str, ...]") -> "dict[str, Any] | None":
+    """Capture a row's current values for the fields a retry must restore."""
+    if row is None:
+        return None
+    return {name: getattr(row, name) for name in fields}
+
+
+def _restore_row(db: Session, row: Any, values: "dict[str, Any] | None") -> None:
+    """Re-attach a row and reassign the captured values. `db.add` is a no-op for
+    a row that is still attached, and re-attaches one a rollback detached."""
+    if row is None:
+        return
+    db.add(row)
+    for name, value in (values or {}).items():
+        setattr(row, name, value)
+
+
+async def _run_anpr(
+    db: Session, detection: dict[str, Any], det_row: models.Detection, frame: np.ndarray,
+    camera_id: str, camera_code: str, frame_source_ts: datetime | None,
+) -> "tuple[models.Vehicle | None, models.Plate | None, str | None]":
+    """ANPR for one vehicle detection. Returns (vehicle, plate_row, snapshot_path).
+
+    Two paths, chosen per detection:
+
+    **V2 (default)** — requires a ByteTrack track id, because everything it
+    does is anchored to "this specific tracked vehicle". The vehicle crop is
+    narrowed to an actual plate region (plate_detect), OCR runs only when this
+    track still needs a read (plate_tracker.should_ocr), reads VOTE rather than
+    overwrite, and the result is ONE sighting row per (camera, track) that gets
+    updated — not one row per frame.
+
+    **Legacy** — `PLATE_PIPELINE_V2=false`, or a detection with no track id
+    (ByteTrack has not assigned one yet on the object's first frames). Whole
+    vehicle crop straight to OCR, one row per passing frame: the exact pre-V2
+    behavior, preserved rather than approximated, so the escape hatch is real.
+    """
+    x1, y1, x2, y2 = [max(0, int(v)) for v in detection["bbox"]]
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None, None, None
+    vehicle_bbox = [float(x1), float(y1), float(x2), float(y2)]
+    raw_track_id = detection.get("track_id")
+
+    # ---------------- Legacy path ----------------
+    if not settings.plate_pipeline_v2 or raw_track_id is None:
+        raw, normalized, conf = await asyncio.to_thread(read_plate, crop)
+        if not passes_anpr_gate(normalized, conf):
+            return None, None, None
+        snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+        vehicle = await upsert_vehicle_for_plate(db, normalized, conf)
+        plate_row = models.Plate(
+            vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
+            plate_text_raw=raw, plate_text_normalized=normalized,
+            confidence=conf, snapshot_path=snapshot_path,
+            source_timestamp=frame_source_ts,
+            track_id=(str(raw_track_id) if raw_track_id is not None else None),
+            reads_count=1, vehicle_class=detection["cls"],
+            detection_confidence=detection["confidence"], vehicle_bbox=vehicle_bbox,
+        )
+        db.add(plate_row)
+        return vehicle, plate_row, snapshot_path
+
+    # ---------------- V2 path ----------------
+    track_id = str(raw_track_id)
+    state = plate_tracker.touch(camera_id, track_id)
+
+    new_read = False
+    if plate_tracker.should_ocr(camera_id, track_id):
+        ocr_started = time.monotonic()
+        metrics.PLATE_OCR_ATTEMPTS.labels(camera_code=camera_code).inc()
+        located = await asyncio.to_thread(plate_detect.locate_plate, crop)
+        if located is not None:
+            metrics.PLATE_LOCALIZED.labels(camera_code=camera_code).inc()
+            plate_image, rel_bbox = located
+            # Localizer works in the crop's coordinate space; the stored bbox is
+            # full-frame so it can be drawn on a frame or an evidence snapshot
+            # without the caller needing the vehicle box to offset it.
+            plate_bbox = [rel_bbox[0] + x1, rel_bbox[1] + y1, rel_bbox[2] + x1, rel_bbox[3] + y1]
+        else:
+            # No plate region found — fall back to the whole vehicle crop, i.e.
+            # the pre-V2 read. A localization miss degrades the read's quality,
+            # it does not discard it. plate_bbox stays None, which is the honest
+            # record that this read was NOT localized.
+            plate_image, plate_bbox = crop, None
+        raw, normalized, conf = await asyncio.to_thread(read_plate, plate_image)
+        metrics.OCR_SECONDS.labels(camera_code=camera_code).observe(time.monotonic() - ocr_started)
+        if passes_anpr_gate(normalized, conf):
+            metrics.PLATE_OCR_ACCEPTED.labels(camera_code=camera_code).inc()
+            state = plate_tracker.record_read(camera_id, track_id, normalized, conf, raw, plate_bbox)
+            new_read = True
+        else:
+            # Nothing usable this pass. Recorded so an unreadable track (rear of
+            # a truck, plate out of frame) is retried on the reverify interval
+            # rather than on every single inference cycle forever.
+            plate_tracker.mark_ocr_attempt(camera_id, track_id)
+
+    best = state.best()
+    if best is None:
+        return None, None, None
+    plate_text, peak_confidence, reads = best
+    if not plate_tracker.should_persist(camera_id, track_id, new_read):
+        # Nothing changed worth a write; the caller still gets the vehicle so
+        # rule evaluation (watchlist) keeps firing on every frame it should.
+        vehicle = (
+            db.query(models.Vehicle).filter(models.Vehicle.id == state.vehicle_id).first()
+            if state.vehicle_id else None
+        )
+        return vehicle, None, None
+
+    vehicle = await upsert_vehicle_for_plate(db, plate_text, peak_confidence)
+    snapshot_path = None
+    if state.plate_row_id is None:
+        # One evidence snapshot per sighting, taken at the moment the vehicle is
+        # first confidently identified here — not one per OCR frame.
+        snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+    plate_row = await upsert_plate_sighting(
+        db, vehicle=vehicle, camera_id=camera_id, track_id=track_id,
+        detection_id=str(det_row.id), raw_text=state.votes[plate_text].raw,
+        normalized_text=plate_text, confidence=peak_confidence, reads_count=reads,
+        vehicle_class=detection["cls"], detection_confidence=detection["confidence"],
+        vehicle_bbox=vehicle_bbox, plate_bbox=state.last_plate_bbox,
+        snapshot_path=snapshot_path, source_timestamp=frame_source_ts,
+        existing_plate_id=state.plate_row_id,
+    )
+    plate_tracker.bind_plate_row(camera_id, track_id, str(plate_row.id), str(vehicle.id), plate_text)
+    metrics.VEHICLE_SIGHTINGS.labels(camera_code=camera_code).inc()
+    return vehicle, plate_row, plate_row.snapshot_path
+
+
 async def _process_frame(
     db: Session, camera: models.Camera, frame: np.ndarray, frame_idx: int, w: int, h: int,
     frame_source_ts: datetime | None, last_detections: list[dict[str, Any]],
@@ -286,6 +433,7 @@ async def _process_frame(
         st["last_inference_ms"] = inference_ms
         st["inference_ms_ema"] = _ema(st["inference_ms_ema"], inference_ms)
         st["frames_processed"] += 1
+        metrics.INFERENCE_SECONDS.labels(camera_code=camera_code).observe(inference_ms / 1000.0)
         last_detections = detections
 
         for d in detections:
@@ -309,6 +457,7 @@ async def _process_frame(
             flushed = await _safe_flush(db, camera_code, reapply=lambda _det_row=det_row: db.add(_det_row))
             if not flushed:
                 continue
+            metrics.DETECTIONS_TOTAL.labels(camera_code=camera_code, cls=d["cls"]).inc()
 
             # Cross-camera person appearance signature (Phase 5) — visual-similarity
             # only, never biometric/identity. A failure here must never break
@@ -323,24 +472,39 @@ async def _process_frame(
 
             vehicle = None
             plate_row = None
-            if bool(camera.ai_anpr) and d["cls"] in ("car", "truck", "bus", "motorbike"):
-                x1, y1, x2, y2 = [max(0, int(v)) for v in d["bbox"]]
-                crop = frame[y1:y2, x1:x2]
-                raw, normalized, conf = await asyncio.to_thread(read_plate, crop)
-                # Quality gate (P0-C): a single noisy OCR frame is not
-                # trusted — only plausible-format, sufficiently-confident
-                # reads become a Vehicle/Plate correlation record.
-                if passes_anpr_gate(normalized, conf):
-                    snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+            track_row = None
+            if bool(camera.ai_anpr) and d["cls"] in VEHICLE_CLASSES:
+                vehicle, plate_row, anpr_snapshot = await _run_anpr(
+                    db, d, det_row, frame, camera_id, camera_code, frame_source_ts,
+                )
+                if anpr_snapshot:
+                    snapshot_path = anpr_snapshot
                     det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
-                    vehicle = await upsert_vehicle_for_plate(db, normalized, conf)
-                    plate_row = models.Plate(
-                        vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
-                        plate_text_raw=raw, plate_text_normalized=normalized,
-                        confidence=conf, snapshot_path=snapshot_path,
-                        source_timestamp=frame_source_ts,
-                    )
-                    db.add(plate_row)
+
+            # A tracked vehicle is real, followable intelligence whether or not
+            # its plate was ever read — so the Track row is written for every
+            # tracked vehicle, and gets its vehicle_id filled in if and when the
+            # plate identifies it. Throttled (should_persist_track), not
+            # per-frame. models.Track was declared in the original schema but
+            # never written by anything until now.
+            if settings.plate_pipeline_v2 and d["cls"] in VEHICLE_CLASSES and d.get("track_id") is not None:
+                track_key = str(d["track_id"])
+                plate_tracker.touch(camera_id, track_key)
+                if plate_tracker.should_persist_track(camera_id, track_key):
+                    try:
+                        track_row = await upsert_track(
+                            db, camera_id, int(d["track_id"]), d["cls"],
+                            det_row.timestamp or datetime.utcnow(),
+                            vehicle_id=(str(vehicle.id) if vehicle is not None else None),
+                            plate_reads=(plate_row.reads_count or 0) if plate_row is not None else 0,
+                        )
+                        plate_tracker.bind_track_row(camera_id, track_key, str(track_row.id))
+                    except Exception:
+                        # Track bookkeeping is intelligence metadata, not the
+                        # detection record itself — a failure here must never
+                        # cost the detection/plate/alert this frame produced.
+                        logger.exception("camera %s: track upsert failed for track %s", camera_code, track_key)
+                        track_row = None
 
             if not snapshot_path and vehicle is not None and bool(vehicle.watchlist_flag):
                 snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
@@ -374,14 +538,25 @@ async def _process_frame(
             # `vehicle.*`, which could return the stale, reverted value).
             vehicle_target_last_seen = vehicle.last_seen if vehicle is not None else None
             vehicle_target_confidence = vehicle.plate_confidence if vehicle is not None else None
+            # V2: plate_row and track_row can now be PRE-EXISTING persistent rows
+            # that were just UPDATED in place (a vehicle still in frame), not
+            # only freshly-added transient ones. For a persistent row a rollback
+            # expires the mutations back to their last-committed values rather
+            # than merely detaching the object, so re-add() alone would silently
+            # restore the OLD values — the same trap correlate.py and the vehicle
+            # branch above already document. Field values are therefore captured
+            # here, right after they were set, and reassigned on retry.
+            plate_target_values = _snapshot_attrs(plate_row, _PLATE_REAPPLY_FIELDS)
+            track_target_values = _snapshot_attrs(track_row, _TRACK_REAPPLY_FIELDS)
 
             def _reapply_detection_commit(
-                _det_row=det_row, _plate_row=plate_row, _vehicle=vehicle,
+                _det_row=det_row, _plate_row=plate_row, _vehicle=vehicle, _track_row=track_row,
                 _last_seen=vehicle_target_last_seen, _confidence=vehicle_target_confidence,
+                _plate_values=plate_target_values, _track_values=track_target_values,
             ):
                 db.add(_det_row)
-                if _plate_row is not None:
-                    db.add(_plate_row)
+                _restore_row(db, _plate_row, _plate_values)
+                _restore_row(db, _track_row, _track_values)
                 if _vehicle is not None:
                     db.add(_vehicle)  # no-op if already persistent/attached
                     _vehicle.last_seen = _last_seen
@@ -390,7 +565,11 @@ async def _process_frame(
             await _safe_commit(db, camera_code, reapply=_reapply_detection_commit)
             alerts = await evaluate(db, camera, det_row, w, h, vehicle)
             for alert in alerts:
-                incident = db.query(models.Incident).filter(models.Incident.alert_id == alert.id).first()
+                # Via the helper, not a direct Incident.alert_id query: an alert
+                # correlated INTO an existing incident is linked through
+                # IncidentAlert, and a direct query would have found nothing and
+                # silently orphaned this alert's evidence from its incident.
+                incident = find_incident_for_alert(db, str(alert.id))
                 event_type = "watchlist_match" if bool(alert.vehicle_id) else "zone_entry"
 
                 # Evidence backfill: rules_engine.py only attaches a snapshot at
@@ -418,6 +597,10 @@ async def _process_frame(
                         evidence_type="snapshot",
                         camera_id=camera_id,
                         file_path=evidence_snapshot_path,
+                        # Baseline digest taken now, while the file is exactly
+                        # as captured. Hashing it later would only record what
+                        # the file contained at that point and prove nothing.
+                        sha256=await asyncio.to_thread(sha256_file, evidence_snapshot_path),
                         alert_id=alert.id,
                         detection_id=det_row.id,
                         event_type=event_type,
@@ -438,15 +621,46 @@ async def _process_frame(
 
                     await _safe_commit(db, camera_code, reapply=_reapply_evidence_commit)
 
-                asyncio.create_task(clips.build_event_clip(
-                    camera_id, camera_code, str(alert.id), str(det_row.id),
-                    str(incident.id) if incident else None, event_type, frame_source_ts,
-                ))
-            await manager.broadcast("detection", {
+                # Registered so shutdown drains it: this task waits up to
+                # clip_post_event_seconds before writing its Evidence row, and
+                # an untracked one was destroyed by the closing loop, silently
+                # losing evidence for a real alert.
+                background.spawn(
+                    clips.build_event_clip(
+                        camera_id, camera_code, str(alert.id), str(det_row.id),
+                        str(incident.id) if incident else None, event_type, frame_source_ts,
+                    ),
+                    name=f"clip:{camera_code}:{alert.id}",
+                )
+            # Batched by the manager (see ws.py) — N cameras x their inference
+            # rate would otherwise be that many WebSocket frames and React state
+            # updates per second in every open dashboard.
+            await manager.publish(EventType.DETECTION_CREATED, {
+                "detection_id": str(det_row.id),
                 "camera_id": camera_id, "camera_code": camera_code,
                 "cls": d["cls"], "confidence": d["confidence"],
+                "track_id": (str(d["track_id"]) if d.get("track_id") is not None else None),
+                "bbox": d["bbox"],
                 "timestamp": det_row.timestamp.isoformat(),
             })
+            # A recognized plate is its own event: the live control room shows
+            # it as an identification, not as one more anonymous detection. Sent
+            # only when the sighting row was actually written this frame, so a
+            # vehicle sitting in view does not re-announce itself every cycle.
+            if plate_row is not None and vehicle is not None:
+                await manager.publish(EventType.VEHICLE_SIGHTING, {
+                    "plate_id": str(plate_row.id),
+                    "vehicle_id": str(vehicle.id),
+                    "plate_text": str(plate_row.plate_text_normalized or ""),
+                    "plate_confidence": float(plate_row.confidence or 0.0),
+                    "reads_count": int(plate_row.reads_count or 1),
+                    "track_id": plate_row.track_id,
+                    "vehicle_class": str(plate_row.vehicle_class or ""),
+                    "camera_id": camera_id, "camera_code": camera_code,
+                    "watchlist_flag": bool(vehicle.watchlist_flag),
+                    "detection_confidence": float(plate_row.detection_confidence or 0.0),
+                    "timestamp": (plate_row.last_seen or plate_row.timestamp).isoformat(),
+                })
     elif not ai_enabled:
         # AI was toggled off (possibly mid-session, via PATCH) — drop any
         # boxes from when it was last on rather than overlaying stale ones
@@ -591,6 +805,7 @@ async def _camera_loop(camera_id: str) -> None:
                         last_pos_msec = None
                         camera_fps_cached = float(camera.fps)  # type: ignore[arg-type]  # legacy Column() declarative attribute — plain float at runtime
                         st["reconnects"] += 1
+                        metrics.CAMERA_RECONNECTS.labels(camera_code=camera_code_cached).inc()
                         st["started_at"] = session_opened_at.isoformat()
                 else:
                     consecutive_failures = 0
@@ -659,11 +874,14 @@ async def _camera_loop(camera_id: str) -> None:
                 st["recovered_errors"] += 1
                 st["grid_state"] = "ERROR"  # next successful iteration flips this back to CONNECTED/PROCESSING
                 _error_type, _severity = self_heal.classify_exception(exc)
-                asyncio.create_task(self_heal.record_event(
-                    component="worker", camera_id=camera_id, error_type=_error_type, severity=_severity,
-                    message=f"camera {camera_code_cached}: {exc}", recovery_action="CONTINUE_LOOP",
-                    attempt=1, max_attempts=1, status="RECOVERED",
-                ))  # fire-and-forget: this is diagnostic logging, must never delay/block the loop's own recovery below
+                background.spawn(
+                    self_heal.record_event(
+                        component="worker", camera_id=camera_id, error_type=_error_type, severity=_severity,
+                        message=f"camera {camera_code_cached}: {exc}", recovery_action="CONTINUE_LOOP",
+                        attempt=1, max_attempts=1, status="RECOVERED",
+                    ),
+                    name=f"self-heal:{camera_code_cached}",
+                )  # fire-and-forget: this is diagnostic logging, must never delay/block the loop's own recovery below
                 try:
                     db.rollback()
                 except Exception:
@@ -690,7 +908,15 @@ async def _camera_loop(camera_id: str) -> None:
     finally:
         if source is not None:
             source.release()
-        db.close()
+        # close_session, NOT db.close(): a cancellation unwinds the awaits in
+        # this loop immediately, but a DB call already handed to a worker
+        # thread by asyncio.to_thread keeps running there. A plain close() from
+        # this `finally` therefore raced an in-flight commit and raised
+        # IllegalStateChangeError ("Method 'close()' can't be called here") —
+        # which, coming from a finally, escaped to _camera_loop_supervised and
+        # marked a perfectly healthy camera OFFLINE on an ordinary stop.
+        # close_session waits for that thread and never raises.
+        close_session(db)
 
 
 async def _camera_loop_supervised(camera_id: str) -> None:
@@ -753,6 +979,7 @@ def stop_worker(camera_id: str) -> "asyncio.Task[None] | None":
     LATEST_FRAMES.pop(camera_id, None)
     release_model(camera_id)  # drop this camera's YOLO/ByteTrack instance
     clips.release_camera(camera_id)  # drop this camera's event-clip ring buffer
+    plate_tracker.release_camera(camera_id)  # drop this camera's per-track plate votes
     # Real bug found via the live browser test of the Disconnect button:
     # _camera_loop's own cancellation path (`except asyncio.CancelledError:
     # pass`) never updates grid_state, so a deliberately stopped camera kept

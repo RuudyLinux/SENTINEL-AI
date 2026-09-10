@@ -147,7 +147,25 @@ async def upload_video(
 
 
 @router.post("/test-connection")
-async def test_connection(source_type: str = Form(...), source_uri: str = Form(...)):
+async def test_connection(
+    source_type: str = Form(...),
+    source_uri: str = Form(...),
+    user: models.User = Depends(require_roles("Administrator", "Control Room Operator")),
+):
+    """Probe a candidate camera source before registering it.
+
+    Security fix: this was the ONLY camera route with no authorization at all,
+    while every other one requires Administrator/Control Room Operator. Because
+    it opens an operator-supplied URI, leaving it open made the backend an
+    unauthenticated SSRF probe — anyone who could reach it could ask the server
+    to connect to any internal host/port and learn from the ok/detail response
+    whether something was listening there. It also tied up a worker thread for
+    up to source_open_timeout_seconds per anonymous request.
+
+    It is still only a probe against an operator-supplied source, which is
+    inherent to onboarding a camera; requiring the same role as camera creation
+    puts it behind the same trust boundary as the action it precedes.
+    """
     src = CameraSource(source_type, source_uri)
     try:
         # Enforced independently of CAP_PROP_OPEN_TIMEOUT_MSEC, which isn't

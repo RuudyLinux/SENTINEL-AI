@@ -1,0 +1,80 @@
+# SENTINEL VISION — reproducible full-stack environment.
+#
+#   docker compose up --build
+#
+# Brings up PostgreSQL, the FastAPI backend (migrated to head on start) and the
+# Next.js dashboard. No secret is hard-coded here: every credential comes from
+# the environment or .env (see .env.example), and compose substitutes defaults
+# only for values that are not secret.
+#
+# Redis is deliberately absent. Nothing in this system currently needs a broker
+# or a shared cache: the WebSocket fan-out is in-process, and there is no task
+# queue. Adding one now would be infrastructure with no consumer.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sentinel}
+      # No default. Compose fails loudly if it is unset rather than starting a
+      # police datastore on a guessable password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sentinel}
+    volumes:
+      - sentinel_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinel} -d ${POSTGRES_DB:-sentinel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      db:
+        # Waits for the database to actually accept connections, not merely for
+        # the container to exist — otherwise the migration below races startup.
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-sentinel}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sentinel}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env — see .env.example for how to generate one}
+      DEMO_MODE: ${DEMO_MODE:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # Optional real-camera integration. Empty means "not configured", which
+      # the app handles explicitly; it never fabricates cameras.
+      SENTINEL_GRID_EMAIL: ${SENTINEL_GRID_EMAIL:-}
+      SENTINEL_GRID_PASSWORD: ${SENTINEL_GRID_PASSWORD:-}
+      CAMERA_CATALOG_BASE_URL: ${CAMERA_CATALOG_BASE_URL:-}
+    volumes:
+      # Evidence and uploads are real case material — they must outlive the
+      # container, not vanish with a rebuild.
+      - sentinel_evidence:/app/evidence_store
+      - sentinel_uploads:/app/uploads
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    # Alembic owns the schema on PostgreSQL (app/db.py's additive helpers are
+    # SQLite-only), so the schema is brought to head before the app serves.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+        NEXT_PUBLIC_WS_BASE: ${NEXT_PUBLIC_WS_BASE:-ws://localhost:8000}
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  sentinel_db:
+  sentinel_evidence:
+  sentinel_uploads:

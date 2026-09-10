@@ -68,8 +68,34 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
         {"id": i.id, "title": i.title, "status": i.status, "priority": i.priority}
         for i in db.query(models.Incident).filter(models.Incident.title.ilike(like)).limit(20)
     ]
-    results["alerts"] = [
-        {"id": a.id, "severity": a.severity, "camera_id": a.camera_id}
-        for a in db.query(models.Alert).filter(models.Alert.camera_id.ilike(like)).limit(20)
-    ]
+
+    # Bug fix: this previously filtered `Alert.camera_id.ilike(like)` — matching
+    # an opaque internal id column against the operator's free text, so the
+    # alerts section of a global search was permanently empty. Alerts are now
+    # found the way an operator would actually look for them: by the camera they
+    # fired on (code/name, resolved above) and by the vehicle plate involved.
+    alert_filters = []
+    camera_ids = [c["id"] for c in results["cameras"]]
+    if camera_ids:
+        alert_filters.append(models.Alert.camera_id.in_(camera_ids))
+    vehicle_ids = [v["id"] for v in results["vehicles"]]
+    if vehicle_ids:
+        alert_filters.append(models.Alert.vehicle_id.in_(vehicle_ids))
+    if alert_filters:
+        from sqlalchemy import or_
+        alert_rows = (
+            db.query(models.Alert)
+            .filter(or_(*alert_filters))
+            .order_by(models.Alert.timestamp.desc())
+            .limit(20)
+            .all()
+        )
+        results["alerts"] = [
+            {
+                "id": a.id, "severity": a.severity, "status": a.status,
+                "camera_id": a.camera_id, "vehicle_id": a.vehicle_id,
+                "reasons": a.reasons or [], "timestamp": a.timestamp,
+            }
+            for a in alert_rows
+        ]
     return results

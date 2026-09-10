@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logger = logging.getLogger("sentinel.main")
 
 from .db import Base, engine, SessionLocal, ensure_columns, ensure_indexes
-from . import models
+from . import models, background
 from .seed import run_seed
 from .ws import manager
 from .pipeline.worker import start_worker, stop_worker, RUNNING
@@ -19,7 +19,7 @@ from .config import settings
 from .routers import (
     auth, cameras, streams, detections, vehicles, persons, search,
     alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-    analytics, system, self_heal, camera_control,
+    analytics, system, self_heal, camera_control, metrics,
 )
 from .self_heal import engine as self_heal_engine
 
@@ -49,7 +49,7 @@ app.add_middleware(
 
 for r in (auth, cameras, streams, detections, vehicles, persons, search,
           alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-          analytics, system, self_heal, camera_control):
+          analytics, system, self_heal, camera_control, metrics):
     app.include_router(r.router)
 
 
@@ -81,10 +81,46 @@ async def _on_startup():
     ensure_columns("cameras", {"camera_group": "VARCHAR"}, backfill_defaults={"camera_group": "''"})
     ensure_columns("detections", {"appearance_signature": "JSON"})
     ensure_columns("zones", {"loitering_seconds": "FLOAT"})
+    # V2 plate pipeline: per-track sighting fields on `plates`, and the
+    # bookkeeping columns on `tracks` (a table declared since the first schema
+    # but never written until V2 — see models.Track). Backfills are chosen so an
+    # existing row migrates to a TRUE statement about itself: a pre-V2 Plate row
+    # was one single-frame read, so reads_count=1 is correct, while track_id /
+    # plate_bbox / last_seen stay NULL because that information genuinely was
+    # never captured and must not be invented.
+    ensure_columns(
+        "plates",
+        {
+            "track_id": "VARCHAR", "last_seen": "DATETIME", "reads_count": "INTEGER",
+            "vehicle_class": "VARCHAR", "detection_confidence": "FLOAT",
+            "vehicle_bbox": "JSON", "plate_bbox": "JSON",
+        },
+        backfill_defaults={"reads_count": "1", "vehicle_class": "''", "detection_confidence": "0.0"},
+    )
+    ensure_columns(
+        "tracks",
+        {"detection_count": "INTEGER", "plate_reads": "INTEGER"},
+        backfill_defaults={"detection_count": "0", "plate_reads": "0"},
+    )
+    # Explainable risk score on alerts. Existing alerts keep risk_score=0 and an
+    # empty factor list — correct, because no assessment was ever made for them;
+    # a retroactively computed score would be a claim about a decision that was
+    # not taken at the time.
+    ensure_columns(
+        "alerts", {"risk_score": "INTEGER", "risk_factors": "JSON"},
+        backfill_defaults={"risk_score": "0"},
+    )
     # Hot-path query indexes — additive, safe to run every startup.
-    ensure_indexes("detections", ["timestamp", "camera_id"])
+    ensure_indexes("detections", ["timestamp", "camera_id", "track_id"])
     ensure_indexes("alerts", ["severity", "status", "camera_id"])
     ensure_indexes("incidents", ["status"])
+    # Historical plate search and route reconstruction both scan `plates` —
+    # these are what keep an investigation query fast as the table grows.
+    ensure_indexes("plates", ["plate_text_normalized", "vehicle_id", "camera_id", "timestamp", "track_id"])
+    ensure_indexes("tracks", ["camera_id", "yolo_track_id", "vehicle_id"])
+    ensure_indexes("vehicles", ["plate_text", "last_seen"])
+    ensure_indexes("alerts", ["risk_score", "vehicle_id"])
+    ensure_indexes("incident_alerts", ["incident_id", "alert_id"])
     db = SessionLocal()
     try:
         run_seed(db)
@@ -150,6 +186,17 @@ async def _on_shutdown():
             logger.exception("shutdown: stop_worker failed for camera %s, continuing", camera_id)
     if pending_tasks:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
+    # Camera workers are stopped, so nothing new is being spawned — now let the
+    # fire-and-forget work they started finish. An event-clip task waits up to
+    # clip_post_event_seconds before writing its Evidence row, and an untracked
+    # one was simply destroyed when the loop closed, silently losing evidence
+    # for a real alert (see app/background.py).
+    await background.drain(settings.shutdown_drain_seconds)
+    # Same deterministic-cleanup contract as the camera workers above: the
+    # live-event batcher holds a timer task and a buffer of events not yet
+    # sent, so it is stopped (and given a final flush) here rather than being
+    # abandoned when the loop is torn down.
+    await manager.shutdown()
 
 
 @app.get("/api/health")
