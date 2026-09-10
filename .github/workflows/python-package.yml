@@ -54,7 +54,18 @@ jobs:
           SENTINEL_GRID_AUTOCONNECT: "false"
           CAMERA_CATALOG_BASE_URL: ""
           DEMO_MODE: "true"
-        run: pytest tests -q
+        # `python -m pytest`, not bare `pytest`: `-m` prepends the current
+        # directory to sys.path, which is what makes `import app` resolve.
+        # The bare `pytest` console script has no equivalent — pytest's own
+        # rootdir-based sys.path insertion only adds `tests/`'s package root,
+        # not its sibling `app/`. This was never caught locally because every
+        # local run in this project used `python -m pytest` (see README/dev
+        # workflow); the first real CI run surfaced it as
+        # `ModuleNotFoundError: No module named 'app'` at conftest import
+        # time. alembic's own steps below were unaffected because
+        # alembic.ini sets `prepend_sys_path = .`, which is alembic-specific
+        # and has no pytest equivalent for a bare invocation.
+        run: python -m pytest tests -q
 
       - name: Verify migrations apply and roll back
         run: |
