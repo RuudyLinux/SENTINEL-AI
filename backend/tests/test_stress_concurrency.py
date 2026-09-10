@@ -25,7 +25,19 @@ from app.pipeline.worker import CAMERA_STATS, RUNNING
 from app.self_heal import engine as self_heal
 
 N_CAMERAS = 12
-RUN_SECONDS = 2.5
+# CI finding (first real run on GitHub Actions' shared/throttled runner, never
+# exercised there before — the backend Test step silently never ran at all
+# until this pass fixed its `pytest` invocation): 2.5s was tuned against local
+# dev hardware with many real cores. On a constrained CI runner, 12 concurrent
+# tasks each opening a source via asyncio.to_thread (bounded by the default
+# thread-pool's size, itself derived from CPU count) can genuinely take longer
+# than 2.5s just to get every camera through its FIRST open+read before the
+# fixed run window ends — no crash, no lock, no real fault; the assertions
+# this test makes (no crash, real writes land, every camera reaches a healthy
+# end state) are unchanged, this only gives real I/O more wall-clock room to
+# finish on slower/shared hardware. N_CAMERAS is intentionally left at 12 —
+# widening the clock, not shrinking the concurrency being stressed.
+RUN_SECONDS = 6.0
 
 
 class _FakeAlwaysOpenSource:

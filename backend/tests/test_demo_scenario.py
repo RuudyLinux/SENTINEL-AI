@@ -162,7 +162,15 @@ def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_toke
         cameras = db.query(models.Camera).filter(models.Camera.camera_code.in_(["C-014", "C-019"])).all()
         assert len(cameras) == 2
         try:
-            for _ in range(50):  # up to ~5s for a real local video file to open + decode one frame
+            # CI finding (first real run on GitHub Actions — the Test step
+            # silently never ran there at all until this pass fixed its
+            # `pytest` invocation): 5s was tuned against local dev hardware.
+            # Real cv2.VideoCapture open + first-frame decode on a shared,
+            # throttled CI runner took measurably longer with no error of any
+            # kind logged — genuinely slower I/O, not a hang or a bug. The
+            # assertion is unchanged (a real decoded frame must still appear);
+            # this only gives it more wall-clock room to finish on slower hardware.
+            for _ in range(150):  # up to ~15s for a real local video file to open + decode one frame
                 if all(c.id in worker.LATEST_FRAMES for c in cameras):
                     break
                 time.sleep(0.1)
@@ -179,7 +187,12 @@ def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_toke
             # real-concurrency assertions when run immediately after).
             stopped_tasks = [worker.stop_worker(c.id) for c in cameras]
             stopped_tasks = [t for t in stopped_tasks if t is not None]
-            for _ in range(30):
+            # Widened alongside the wait loop above, same reasoning: real
+            # source.release()/task cleanup on slower CI hardware needs more
+            # wall-clock room, and this comment's own warning (bleed into
+            # test_stress_concurrency) is exactly what a too-short budget here
+            # would risk on a slow runner.
+            for _ in range(100):
                 if all(t.done() for t in stopped_tasks):
                     break
                 time.sleep(0.1)
