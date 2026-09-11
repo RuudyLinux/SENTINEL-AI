@@ -38,6 +38,13 @@ def incident_with_plate_everywhere(db_session):
     )
     db_session.add(camera)
     db_session.flush()
+    # `watchlist_flag` is a cache of an actual WatchlistEntry (app/watchlist.py);
+    # the flag alone is a state the pipeline never produces. Added so this
+    # fixture describes a reachable situation.
+    db_session.add(models.WatchlistEntry(
+        entity_type="plate", identifier=plate, priority="CRITICAL", active=True,
+        reason="redaction test",
+    ))
     vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.93, watchlist_flag=True)
     db_session.add(vehicle)
     db_session.flush()

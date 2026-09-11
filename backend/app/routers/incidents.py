@@ -6,6 +6,7 @@ from .. import models, schemas
 from ..db import get_db
 from ..security import get_current_user
 from ..audit import log_action
+from .. import watchlist
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
 
@@ -57,13 +58,11 @@ def incident_summary(incident_id: str, db: Session = Depends(get_db), user: mode
     primary_alert = next((a for a in alerts if a.id == inc.alert_id), alerts[0] if alerts else None)
 
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.id == inc.vehicle_id).first() if inc.vehicle_id else None
-    watchlist_entry = None
-    if vehicle and vehicle.watchlist_flag:
-        watchlist_entry = db.query(models.WatchlistEntry).filter(
-            models.WatchlistEntry.entity_type == "plate",
-            models.WatchlistEntry.identifier == vehicle.plate_text,
-            models.WatchlistEntry.active == True,  # noqa: E712
-        ).first()
+    # Read from the entry, not from the vehicle's cached flag: the summary
+    # tells an investigator this vehicle is on the watchlist, so it must be
+    # true at read time. A stale-True flag would assert a match that had been
+    # deactivated; a stale-False one would hide a live match.
+    watchlist_entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle else None
 
     route = []
     plate_reads_total = 0

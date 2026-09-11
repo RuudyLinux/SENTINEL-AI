@@ -15,7 +15,7 @@ from datetime import datetime
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import models, watchlist
 from . import risk
 from .anpr import review_status_for
 from .appearance import similarity
@@ -76,8 +76,15 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
     if vehicle:
         target_last_seen = now
         target_confidence = max(confidence, vehicle.plate_confidence)
+        # The cached flag is refreshed at every sighting of an existing
+        # vehicle, which is the moment it matters and the only event that
+        # reliably follows a time-based expiry (nothing runs at the instant an
+        # entry's `valid_until` passes). Deactivation and creation refresh it
+        # directly through the watchlist router.
+        target_watchlist_flag = watchlist.plate_entry_in_force(db, normalized_plate) is not None
         vehicle.last_seen = target_last_seen
         vehicle.plate_confidence = target_confidence
+        vehicle.watchlist_flag = target_watchlist_flag
 
         def reapply():
             # `vehicle` is already PERSISTENT here — a rollback expires its
@@ -88,15 +95,12 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
             db.add(vehicle)
             vehicle.last_seen = target_last_seen
             vehicle.plate_confidence = target_confidence
+            vehicle.watchlist_flag = target_watchlist_flag
 
         await safe_flush(db, "upsert_vehicle_for_plate", reapply=reapply)
         return vehicle
 
-    watchlisted = db.query(models.WatchlistEntry).filter(
-        models.WatchlistEntry.entity_type == "plate",
-        models.WatchlistEntry.identifier == normalized_plate,
-        models.WatchlistEntry.active == True,  # noqa: E712
-    ).first()
+    watchlisted = watchlist.plate_entry_in_force(db, normalized_plate)
     vehicle = models.Vehicle(
         plate_text=normalized_plate,
         plate_confidence=confidence,
@@ -419,11 +423,7 @@ def get_vehicle_summary(db: Session, vehicle_id: str, live_window_seconds: float
         and (datetime.utcnow() - last_seen).total_seconds() <= live_window_seconds
     )
 
-    watchlist_entry = db.query(models.WatchlistEntry).filter(
-        models.WatchlistEntry.entity_type == "plate",
-        models.WatchlistEntry.identifier == vehicle.plate_text,
-        models.WatchlistEntry.active == True,  # noqa: E712
-    ).first()
+    watchlist_entry = watchlist.plate_entry_in_force(db, vehicle.plate_text)
 
     assessment = risk.assess(risk.RiskSignals(
         watchlist_priority=watchlist_entry.priority if watchlist_entry else None,

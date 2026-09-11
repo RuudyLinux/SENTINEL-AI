@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
-from .. import models, metrics
+from .. import models, metrics, watchlist
 from ..config import settings
 from ..ws import manager, EventType
 from . import risk
@@ -164,17 +164,25 @@ async def evaluate(
     signals = risk.RiskSignals(camera_code=str(camera.camera_code))
 
     # --- watchlist_plate rule (cooldown per camera+vehicle) ---
-    if vehicle and vehicle.watchlist_flag and not _on_cooldown((camera.id, "watchlist", vehicle.id)):
+    #
+    # The entry is looked up BEFORE the cooldown check, and the alert now
+    # requires one. Previously this fired on `vehicle.watchlist_flag` alone and
+    # substituted priority "HIGH" when no entry was found — so once a vehicle
+    # was flagged, deactivating or expiring its watchlist entry did not stop
+    # the alerts, and each one asserted in its own reason string that the plate
+    # "matches an active watchlist entry" when none existed. The flag is a
+    # cache (see app/watchlist.py); the entry is the authority.
+    #
+    # Order matters: `_on_cooldown` RECORDS the time when it returns False, so
+    # calling it first and then declining to fire would consume the cooldown
+    # window of an alert that was never sent.
+    entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle and vehicle.watchlist_flag else None
+    if entry is not None and not _on_cooldown((camera.id, "watchlist", vehicle.id)):
         rule = db.query(models.AlertRule).filter(
             models.AlertRule.rule_type == "watchlist_plate", models.AlertRule.active == True  # noqa: E712
         ).first()
         rule_id = rule.id if rule else None
-        entry = db.query(models.WatchlistEntry).filter(
-            models.WatchlistEntry.entity_type == "plate",
-            models.WatchlistEntry.identifier == vehicle.plate_text,
-            models.WatchlistEntry.active == True,  # noqa: E712
-        ).first()
-        signals.watchlist_priority = entry.priority if entry else "HIGH"
+        signals.watchlist_priority = entry.priority
         signals.plate_text = str(vehicle.plate_text or "")
 
         # Confidence-aware intelligence: the match itself is never suppressed

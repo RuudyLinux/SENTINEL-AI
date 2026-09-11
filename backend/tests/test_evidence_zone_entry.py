@@ -184,6 +184,16 @@ def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_se
     # this test is about the Evidence row's linkage fields, not confidence
     # gating (see test_watchlist_confidence_gating.py for that) — a 0.0
     # default would now (correctly) cap severity at HIGH, not CRITICAL.
+    # The WatchlistEntry is what actually puts a plate on the watchlist;
+    # `watchlist_flag` is a cache derived from it (app/watchlist.py). This
+    # fixture used to set the flag alone, a state the pipeline never produces
+    # — correlate.upsert_vehicle_for_plate only sets the flag from an entry
+    # lookup — and the watchlist rule now requires the entry, so that the
+    # alert's own "matches an active watchlist entry" reason is true.
+    db_session.add(models.WatchlistEntry(
+        entity_type="plate", identifier="GJ01ZZ9999", priority="CRITICAL", active=True,
+        reason="evidence linkage test",
+    ))
     vehicle = models.Vehicle(plate_text="GJ01ZZ9999", plate_confidence=0.9, watchlist_flag=True)
     db_session.add(vehicle)
     db_session.flush()
