@@ -138,6 +138,48 @@ def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: model
     }
 
 
+def _mask_plate(plate: str) -> str:
+    """First two and last two characters kept, middle masked: GJ05AB1234 ->
+    GJ******34. Enough for an operator to correlate two documents about the
+    same vehicle without the export itself disclosing the registration."""
+    if len(plate) <= 4:
+        return "*" * len(plate)
+    return f"{plate[:2]}{'*' * (len(plate) - 4)}{plate[-2:]}"
+
+
+def _redact_package(package: dict, plate: "str | None") -> dict:
+    """Mask a registration EVERYWHERE it appears in the package.
+
+    Deliberately a whole-document substitution rather than field-by-field
+    masking. The plate reaches this document through at least five
+    independent paths — `vehicle.plate_text`, the rule narrative in
+    `alert.reasons`, `incident.title`, `incident.description` (built by
+    joining those reasons), and `audit_trail[].resource` (a watchlist entry's
+    resource IS the plate) — so masking the obvious field would produce a
+    document that merely LOOKS redacted while still disclosing the
+    registration three other ways. Partial redaction is worse than none,
+    because the reader believes it worked.
+
+    Integrity data is never touched: evidence ids, SHA-256 digests and
+    verification statuses pass through unchanged, so a redacted package can
+    still be verified against the originals.
+    """
+    if not plate:
+        return package
+    masked = _mask_plate(plate)
+    # Serialize, substitute, re-parse: catches every nested occurrence
+    # regardless of which key it arrived under, including ones added later.
+    blob = json.dumps(package, default=str).replace(plate, masked)
+    redacted = json.loads(blob)
+    redacted["redaction"] = {
+        "applied": True,
+        "scheme": "registration masked (first two and last two characters retained)",
+        "note": "Evidence ids, SHA-256 digests and verification statuses are NOT redacted, "
+                "so this package can still be verified against the source evidence.",
+    }
+    return redacted
+
+
 @router.get("/incidents/{incident_id}/package-token")
 def get_package_token(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
@@ -148,12 +190,23 @@ def get_package_token(incident_id: str, db: Session = Depends(get_db), user: mod
 
 
 @router.get("/incidents/{incident_id}/package")
-def generate_package(incident_id: str, token: str, fmt: str = "json", db: Session = Depends(get_db)):
+def generate_package(
+    incident_id: str, token: str, fmt: str = "json", redact: bool = False,
+    db: Session = Depends(get_db),
+):
     """Generate an Evidence Package (doc §29): incident summary, camera timeline,
     vehicle details, evidence list, notes, and audit trail — real data pulled
     from the DB. Triggered via a plain link/new-tab navigation (can't carry a
     bearer header), so it validates a short-lived signed resource token
     instead of dropping auth entirely (P0-E) — see /package-token above.
+
+    `redact=true` masks the vehicle registration throughout the document (see
+    `_redact_package`) for an export going to a wider audience than the
+    investigation itself. It is OPT-IN, not the default: the unredacted
+    package is the evidentiary artefact, and silently degrading it would be
+    the wrong default for a chain-of-custody document. Which mode was used is
+    recorded in the audit trail and inside the package itself, so a reader can
+    always tell whether they are holding a complete export.
     """
     user = get_user_from_resource_token("evidence_package", incident_id, token, db)
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
@@ -193,17 +246,24 @@ def generate_package(incident_id: str, token: str, fmt: str = "json", db: Sessio
         "generated_by": user.username,
     }
 
+    if redact:
+        package = _redact_package(package, vehicle.plate_text if vehicle else None)
+    # The audit trail records WHICH export was produced: a redacted package
+    # and a full one are different disclosures of the same incident.
+    audit_action = "generate_evidence_package_redacted" if redact else "generate_evidence_package"
+    suffix = "_redacted" if redact else ""
+
     if fmt == "json":
-        out_path = settings.evidence_dir / f"package_{incident_id}.json"
+        out_path = settings.evidence_dir / f"package_{incident_id}{suffix}.json"
         out_path.write_text(json.dumps(package, indent=2, default=str))
-        log_action(db, user, "generate_evidence_package", resource=incident_id)
+        log_action(db, user, audit_action, resource=incident_id)
         return FileResponse(out_path, filename=out_path.name, media_type="application/json")
 
     # PDF
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas as pdf_canvas
 
-    out_path = settings.evidence_dir / f"package_{incident_id}.pdf"
+    out_path = settings.evidence_dir / f"package_{incident_id}{suffix}.pdf"
     c = pdf_canvas.Canvas(str(out_path), pagesize=A4)
     width, height = A4
     y = height - 50
@@ -219,5 +279,5 @@ def generate_package(incident_id: str, token: str, fmt: str = "json", db: Sessio
         c.drawString(40, y, line[:110])
         y -= 12
     c.save()
-    log_action(db, user, "generate_evidence_package", resource=incident_id)
+    log_action(db, user, audit_action, resource=incident_id)
     return FileResponse(out_path, filename=out_path.name, media_type="application/pdf")

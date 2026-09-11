@@ -18,6 +18,7 @@ lawful.
 | Configurable evidence retention | `settings.evidence_retention_days` (`app/config.py`) | `None` by default — no automatic expiry until an administrator explicitly sets a period for their deployment. Never a hardcoded number, because no single number is correct across jurisdictions. |
 | Audited, confirmed deletion workflow | `POST /api/governance/purge-expired` (`app/routers/governance.py`) | Administrator-only. Dry-run by default; a real deletion requires BOTH `dry_run: false` AND `confirm: true` in the same request. Every real purge is logged with exactly which evidence ids were removed and by whom. |
 | Evidence export restriction | `app/routers/evidence.py` (`/file-token`, `/package-token`) | Evidence files and packages are served only via short-lived, resource-scoped signed tokens obtained through an RBAC-checked, audited endpoint — never a bare, permanently-valid URL. |
+| Plate redaction in exports | `GET /api/evidence/incidents/{id}/package?redact=true` (`app/routers/evidence.py::_redact_package`) | Opt-in. Masks the registration EVERYWHERE it appears — the plate reaches that document through five independent paths (`vehicle.plate_text`, `alert.reasons`, `incident.title`, `incident.description`, `audit_trail[].resource`), so a field-by-field mask would look redacted while still disclosing it. Evidence ids, SHA-256 digests and verification statuses are never masked, so a redacted package remains verifiable. Which mode was exported is recorded in the audit trail and inside the package. |
 | Purpose/reason logging | `Alert.feedback_reason`, `Plate` review reason, `WatchlistEntry.reason`, incident notes | Operator actions that affect intelligence outcomes carry a stated reason, not just an outcome flag — an auditor reviewing the trail can see *why*, not only *what*. |
 | Operator accountability | `feedback_by`, `reviewed_by`, `acknowledged_by`, `assigned_to`, `AuditLog.username` | Every consequential action is attributable to a named operator, never anonymous. |
 
@@ -27,11 +28,13 @@ lawful.
   mechanism an administrator configures — this platform does not know, and
   does not claim to know, what period is legally required for a given
   deployment.
-- **Plate masking / redaction in exports.** Evidence packages
-  (`GET /api/evidence/incidents/{id}/package`) currently export plate text
-  and images unredacted. If a deployment's policy requires redaction for a
-  particular export audience, that is not yet implemented — flagged here
-  rather than silently assumed to be handled.
+- **Image redaction.** Plate TEXT can now be masked in evidence packages
+  (see the table above), but the evidence IMAGES themselves are exported
+  unaltered — a snapshot still shows the plate. Blurring pixels in an
+  evidence image is deliberately not offered: altering the image would
+  break its capture-time SHA-256, which is the whole basis of the integrity
+  claim. An export that needs redacted imagery should be produced as a
+  separate derived artefact, not by modifying evidence.
 - **Automated legal-hold enforcement.** An administrator can purge expired
   evidence even if it is relevant to an active investigation; there is no
   automatic hold mechanism tied to `Incident.status`. Operationally, keep an
