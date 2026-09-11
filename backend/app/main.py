@@ -19,7 +19,7 @@ from .config import settings
 from .routers import (
     auth, cameras, streams, detections, vehicles, persons, search,
     alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-    analytics, system, self_heal, camera_control, metrics,
+    analytics, system, self_heal, camera_control, metrics, review, governance,
 )
 from .self_heal import engine as self_heal_engine
 
@@ -49,7 +49,7 @@ app.add_middleware(
 
 for r in (auth, cameras, streams, detections, vehicles, persons, search,
           alerts, watchlists, zones, rules, incidents, evidence, users, audit,
-          analytics, system, self_heal, camera_control, metrics):
+          analytics, system, self_heal, camera_control, metrics, review, governance):
     app.include_router(r.router)
 
 
@@ -110,6 +110,35 @@ async def _on_startup():
         "alerts", {"risk_score": "INTEGER", "risk_factors": "JSON"},
         backfill_defaults={"risk_score": "0"},
     )
+    # Human-in-the-loop ANPR review (10/10 roadmap P7). Existing rows keep
+    # review_status=auto_accepted — correct for a read written before review
+    # existed, since it was already treated as usable without one.
+    ensure_columns(
+        "plates",
+        {
+            "review_status": "VARCHAR", "reviewed_by": "VARCHAR",
+            "reviewed_at": "DATETIME", "corrected_text": "VARCHAR",
+        },
+        backfill_defaults={"review_status": "'auto_accepted'"},
+    )
+    # Alert feedback / false-positive measurement (10/10 roadmap P6). Left
+    # NULL for existing alerts — no review ever happened for them, and
+    # defaulting to "confirmed" would fabricate one.
+    ensure_columns(
+        "alerts",
+        {"feedback": "VARCHAR", "feedback_reason": "VARCHAR", "feedback_by": "VARCHAR", "feedback_at": "DATETIME"},
+    )
+    # Evidence provenance completion (10/10 roadmap P8) — model/rule version
+    # active AT CAPTURE. NULL for pre-existing rows: genuinely not recorded.
+    ensure_columns("evidence", {"model_version": "VARCHAR", "rule_version": "VARCHAR"})
+    # Tamper-evident audit chain (10/10 roadmap P9). Existing rows keep
+    # chain_seq/prev_hash/entry_hash NULL — they predate the chain and
+    # verify_chain() reports them honestly as unchained rather than pretending
+    # a retroactive hash covers writes it never actually witnessed.
+    ensure_columns("audit_logs", {"chain_seq": "INTEGER", "prev_hash": "VARCHAR", "entry_hash": "VARCHAR"})
+    ensure_indexes("plates", ["review_status"])
+    ensure_indexes("alerts", ["feedback"])
+    ensure_indexes("audit_logs", ["chain_seq"])
     # Hot-path query indexes — additive, safe to run every startup.
     ensure_indexes("detections", ["timestamp", "camera_id", "track_id"])
     ensure_indexes("alerts", ["severity", "status", "camera_id"])

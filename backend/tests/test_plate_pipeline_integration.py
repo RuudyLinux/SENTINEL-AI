@@ -11,6 +11,7 @@ localizer), because a real EasyOCR pass on a synthetic frame measures nothing.
 Everything between them — association, voting, persistence, dedup, route
 reconstruction — is the real code.
 """
+import itertools
 import asyncio
 from datetime import datetime
 
@@ -85,17 +86,32 @@ def _drive(db_session, monkeypatch, camera, frame, reads, track_id: int = 284):
     return results
 
 
+# Unique-per-test plate texts. These tests assert on COUNTS of Vehicle/Plate
+# rows for a given plate ("exactly one vehicle", "no phantom vehicle"), and the
+# suite shares one on-disk database — so a hardcoded literal makes the result
+# depend on whether some other test happened to create that plate first. Caught
+# by the --random-order gate: under alphabetical ordering these passed purely
+# by luck of scheduling. Numbered in the 3xxx range to stay clear of the
+# GJ05AB1234 literal other modules use, and shaped to satisfy PLATE_RE.
+_plate_counter = itertools.count(3000)
+
+
+def _fresh_plate() -> str:
+    return f"GJ05AB{next(_plate_counter):04d}"
+
+
 class TestPipelineCoherence:
     def test_the_full_chain_produces_one_vehicle_and_one_sighting(self, db_session, monkeypatch, frame):
         """Four OCR frames of the SAME tracked vehicle are one sighting of one
         vehicle — not four vehicles, and not four route hops."""
         camera = _camera(db_session, "INT-C1")
+        plate = _fresh_plate()
         results = _drive(db_session, monkeypatch, camera, frame, [
-            ("GJ05AB1234", 0.72), ("GJ05AB1234", 0.91),
-            ("GJ05AB1234", 0.94), ("GJ05AB1234", 0.89),
+            (plate, 0.72), (plate, 0.91),
+            (plate, 0.94), (plate, 0.89),
         ])
 
-        vehicles = db_session.query(models.Vehicle).filter(models.Vehicle.plate_text == "GJ05AB1234").all()
+        vehicles = db_session.query(models.Vehicle).filter(models.Vehicle.plate_text == plate).all()
         assert len(vehicles) == 1, "repeated OCR of one vehicle must not create duplicate vehicles"
 
         plates = db_session.query(models.Plate).filter(models.Plate.vehicle_id == vehicles[0].id).all()
@@ -117,9 +133,11 @@ class TestPipelineCoherence:
         """The headline guarantee, asserted against the PERSISTED row rather
         than the in-memory tally."""
         camera = _camera(db_session, "INT-C2")
+        plate = _fresh_plate()
+        misread = _fresh_plate()  # a DIFFERENT valid plate: the outlier read
         _drive(db_session, monkeypatch, camera, frame, [
-            ("GJ05AB1234", 0.72), ("GJ05AB1234", 0.91), ("GJ05AB1234", 0.94),
-            ("GJ05AB1284", 0.95),  # one high-confidence misread
+            (plate, 0.72), (plate, 0.91), (plate, 0.94),
+            (misread, 0.95),  # one high-confidence misread
         ])
 
         # Scoped by camera: ByteTrack ids are only unique per camera, so a
@@ -129,9 +147,9 @@ class TestPipelineCoherence:
             models.Plate.camera_id == camera.id, models.Plate.track_id == "284",
         ).all()
         assert len(plates) == 1
-        assert plates[0].plate_text_normalized == "GJ05AB1234"
+        assert plates[0].plate_text_normalized == plate
         assert db_session.query(models.Vehicle).filter(
-            models.Vehicle.plate_text == "GJ05AB1284"
+            models.Vehicle.plate_text == misread
         ).first() is None, "a single outlier read must not create a phantom vehicle"
 
     def test_tracking_continues_while_the_vehicle_stays_visible(self, db_session, monkeypatch, frame):

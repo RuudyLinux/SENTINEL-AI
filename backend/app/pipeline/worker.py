@@ -21,7 +21,7 @@ from ..config import settings
 from ..ws import manager, EventType
 from .source import CameraSource
 from .detector import detect_and_track, release_model
-from .anpr import read_plate, passes_anpr_gate
+from .anpr import read_plate, passes_anpr_gate, review_status_for, better_read
 from .appearance import compute_signature
 from .correlate import upsert_vehicle_for_plate, upsert_plate_sighting, upsert_track
 from . import plate_detect, plate_tracker
@@ -324,6 +324,7 @@ async def _run_anpr(
             track_id=(str(raw_track_id) if raw_track_id is not None else None),
             reads_count=1, vehicle_class=detection["cls"],
             detection_confidence=detection["confidence"], vehicle_bbox=vehicle_bbox,
+            review_status=review_status_for(conf),
         )
         db.add(plate_row)
         return vehicle, plate_row, snapshot_path
@@ -351,6 +352,21 @@ async def _run_anpr(
             # record that this read was NOT localized.
             plate_image, plate_bbox = crop, None
         raw, normalized, conf = await asyncio.to_thread(read_plate, plate_image)
+        # Measured fix (docs/ANPR_ACCURACY.md): localization sometimes returns a
+        # sub-region of the plate, after which OCR reads nothing or garbage —
+        # on a real labelled corpus it cut exact-match from 0.16 to 0.04. When
+        # the localized read fails the quality gate, fall back to the whole
+        # vehicle crop and keep whichever read is genuinely better. The second
+        # OCR pass is only paid on FAILURE, so the ~3x speed win of a
+        # successful localization is preserved.
+        if located is not None and not passes_anpr_gate(normalized, conf):
+            fallback = await asyncio.to_thread(read_plate, crop)
+            raw, normalized, conf = better_read((raw, normalized, conf), fallback)
+            if passes_anpr_gate(normalized, conf):
+                # The winning read came from the whole crop, so the localized
+                # box does not describe it — recorded as null rather than
+                # attaching a bbox that points at the wrong region.
+                plate_bbox = None
         metrics.OCR_SECONDS.labels(camera_code=camera_code).observe(time.monotonic() - ocr_started)
         if passes_anpr_gate(normalized, conf):
             metrics.PLATE_OCR_ACCEPTED.labels(camera_code=camera_code).inc()
@@ -606,6 +622,12 @@ async def _process_frame(
                         event_type=event_type,
                         source_timestamp=frame_source_ts,
                         verification_status="unverified",
+                        # Provenance (10/10 roadmap P8): the model/rule versions
+                        # ACTIVE at capture, stamped once — never updated later,
+                        # so this answers "what produced this" even after
+                        # settings.model_version subsequently changes.
+                        model_version=settings.model_version,
+                        rule_version=settings.rule_version,
                     )
                     db.add(evidence_row)
 

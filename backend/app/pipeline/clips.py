@@ -168,6 +168,8 @@ async def build_event_clip(
             file_path=str(path),
             sha256=sha256_file(str(path)),
             verification_status="unverified",
+            model_version=settings.model_version,
+            rule_version=settings.rule_version,
         )
         db.add(evidence)
         db.commit()

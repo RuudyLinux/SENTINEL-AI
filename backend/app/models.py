@@ -135,7 +135,31 @@ class Track(Base):
 class Vehicle(Base):
     __tablename__ = "vehicles"
     id = Column(String, primary_key=True, default=lambda: uid("veh"))
-    plate_text = Column(String, index=True, nullable=True)
+    # BUG-1 fix (10/10 debugging pass, 2026-09-11): was `index=True` only, no
+    # uniqueness. Two camera workers — each holding its own DB session — that
+    # both saw "no vehicle for this plate yet" for the SAME brand-new plate
+    # within the same race window could each insert a Vehicle row, silently
+    # splitting one real vehicle's identity across two rows: get_route()
+    # builds a cross-camera journey FROM Plate.vehicle_id, so a split vehicle
+    # silently loses half its route/sighting-count/risk signal, with no error
+    # anywhere. `unique=True` makes the SECOND insert fail loudly
+    # (IntegrityError) instead of silently succeeding; see
+    # `pipeline/correlate.py::upsert_vehicle_for_plate` for the recovery path
+    # that catches it and folds the loser into the winner. SQL UNIQUE treats
+    # multiple NULLs as distinct, so vehicles with no plate at all (e.g.
+    # person-only sightings) are unaffected — see
+    # tests/test_vehicle_upsert_race.py.
+    #
+    # Known residual gap: SQLite's `ALTER TABLE ADD COLUMN` (see
+    # db.py::ensure_columns, used for an already-existing SQLite database)
+    # cannot retroactively add a UNIQUE constraint to an existing table — only
+    # a fresh `create_all()` (new deployments, the test suite) or the
+    # Alembic-managed PostgreSQL path actually gets the DB-level guarantee.
+    # An already-running SQLite deployment upgraded in place keeps only the
+    # narrowed race window, not the hard guarantee, until its DB file is
+    # recreated. Documented in docs/THREAT_MODEL.md rather than silently
+    # assumed away.
+    plate_text = Column(String, unique=True, index=True, nullable=True)
     plate_confidence = Column(Float, default=0.0)
     vehicle_type = Column(String, default="")
     color = Column(String, default="")
@@ -190,6 +214,21 @@ class Plate(Base):
     # so it is never filled in with the vehicle box as a substitute.
     vehicle_bbox = Column(JSON, nullable=True)
     plate_bbox = Column(JSON, nullable=True)
+    # --- Human-in-the-loop ANPR review (10/10 roadmap P7) ---
+    # auto_accepted: cleared the confidence gate, no operator action needed.
+    # pending_review: recorded (per the "keep uncertain reads, never discard
+    # them" rule anpr.py already follows) but below plate_min_confidence, or
+    # below watchlist_high_confidence_floor while carrying a watchlist match —
+    # waiting on an operator. corrected: an operator supplied the true text.
+    # rejected: an operator determined the read is not usable intelligence.
+    review_status = Column(String, default="auto_accepted", index=True)
+    reviewed_by = Column(String, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    # The operator-supplied correct plate text, kept SEPARATE from both
+    # plate_text_raw (literal OCR output) and plate_text_normalized (grammar-
+    # repaired OCR output) — three distinct facts: what OCR said, what the
+    # parser resolved it to, and what a human confirmed it actually is.
+    corrected_text = Column(String, nullable=True)
 
 
 class Person(Base):
@@ -268,6 +307,13 @@ class Alert(Base):
     # kept: the reasons say WHAT matched, the factors say how much each mattered.
     risk_score = Column(Integer, default=0, index=True)
     risk_factors = Column(JSON, default=list)
+    # --- Alert feedback / false-positive measurement (10/10 roadmap P6) ---
+    # Null until an operator actually reviews the alert — never defaulted to
+    # "confirmed", which would fabricate a review that never happened.
+    feedback = Column(String, nullable=True, index=True)  # confirmed | false_positive | needs_review
+    feedback_reason = Column(String, nullable=True)
+    feedback_by = Column(String, ForeignKey("users.id"), nullable=True)
+    feedback_at = Column(DateTime, nullable=True)
 
 
 class IncidentAlert(Base):
@@ -332,6 +378,14 @@ class Evidence(Base):
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     event_type = Column(String, default="")  # e.g. watchlist_match | zone_entry
     source_timestamp = Column(DateTime, nullable=True)
+    # --- Evidence provenance completion (10/10 roadmap P8) ---
+    # The model/rule versions ACTIVE at capture time — stamped once, never
+    # updated later, so the record answers "what produced this" even after
+    # settings.model_version / an AlertRule.version subsequently changes.
+    # Null for evidence captured before this field existed (honest gap, not
+    # backfilled with today's version as if it always applied).
+    model_version = Column(String, nullable=True)
+    rule_version = Column(String, nullable=True)
 
 
 class AuditLog(Base):
@@ -344,6 +398,18 @@ class AuditLog(Base):
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
+    # --- Tamper-evident audit chain (10/10 roadmap P9) ---
+    # `id` is a random uid, not insertion-ordered, so the chain needs its own
+    # monotonic position. Assigned in app/audit.py (max(chain_seq)+1), unique
+    # so a concurrent-write race raises instead of silently mis-ordering the
+    # chain — see audit.py's retry loop for how that race is handled.
+    chain_seq = Column(Integer, nullable=True, unique=True, index=True)
+    # sha256 of the PREVIOUS row's entry_hash ("0"*64 for the first row) and
+    # entry_hash = sha256(prev_hash + this row's own canonical fields).
+    # Deleting or editing any row breaks every entry_hash after it — that
+    # break, not any single row's hash alone, is what verify-chain detects.
+    prev_hash = Column(String, nullable=True)
+    entry_hash = Column(String, nullable=True)
 
 
 class SelfHealEvent(Base):

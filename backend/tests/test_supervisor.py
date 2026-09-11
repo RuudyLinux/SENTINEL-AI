@@ -420,7 +420,7 @@ def test_restart_on_sentinel_grid_camera_rejoins_auto_managed_and_clears_operato
     supervisor.OPERATOR_DISCONNECTED.add(cam.id)
     supervisor.AUTO_MANAGED.discard(cam.id)
 
-    supervisor.restart(cam.id, cam.source_type)
+    asyncio.run(supervisor.restart(cam.id, cam.source_type))
 
     # The real invariant under test: restart must leave the camera in
     # EXACTLY the state a fresh Connect would — eligible for the 24/7
@@ -440,7 +440,7 @@ def test_restart_on_sentinel_grid_camera_that_was_never_disconnected_still_ends_
     monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: worker.RUNNING.pop(cid, None))
     supervisor.AUTO_MANAGED.add(cam.id)  # already running/managed, the common case
 
-    supervisor.restart(cam.id, cam.source_type)
+    asyncio.run(supervisor.restart(cam.id, cam.source_type))
 
     assert cam.id in supervisor.AUTO_MANAGED
     assert cam.id not in supervisor.OPERATOR_DISCONNECTED
@@ -454,9 +454,35 @@ def test_restart_on_a_non_grid_camera_never_touches_supervisor_bookkeeping(monke
     monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
     monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: stopped.append(cid))
 
-    supervisor.restart("cam_plain_video_file", "video_file")
+    asyncio.run(supervisor.restart("cam_plain_video_file", "video_file"))
 
     assert started == ["cam_plain_video_file"]
     assert stopped == ["cam_plain_video_file"]
     assert "cam_plain_video_file" not in supervisor.AUTO_MANAGED
     assert "cam_plain_video_file" not in supervisor.OPERATOR_DISCONNECTED
+
+
+def test_restart_actually_awaits_the_old_tasks_cancellation_before_starting_a_new_one(monkeypatch):
+    """BUG-3 investigation (10/10 debugging pass): `restart()` used to be a
+    plain `def` that discarded `stop_worker`'s returned task, relying on
+    unspecified event-loop scheduling order (rather than a guarantee) for
+    the old task's cancellation to be delivered before the new one starts.
+    Now `async def`, awaiting that task explicitly — this proves the ORDER
+    is real, not incidental: the old task's `__await__` must complete before
+    `start_worker` is ever called."""
+    events: list[str] = []
+
+    class _RecordingFakeTask(_FakeTask):
+        def __await__(self):
+            events.append("old_task_awaited")
+            return super().__await__()
+
+    monkeypatch.setattr(supervisor.worker, "stop_worker", lambda cid: _RecordingFakeTask(done=False))
+    monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: events.append("start_worker_called"))
+
+    asyncio.run(supervisor.restart("cam_order_test", "video_file"))
+
+    assert events == ["old_task_awaited", "start_worker_called"], (
+        "the old worker's cancellation must be awaited BEFORE the new worker starts, "
+        f"got order: {events}"
+    )

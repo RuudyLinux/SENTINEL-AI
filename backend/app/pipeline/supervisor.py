@@ -251,7 +251,7 @@ def disconnect(camera_id: str) -> None:
     worker.stop_worker(camera_id)
 
 
-def restart(camera_id: str, source_type: str) -> None:
+async def restart(camera_id: str, source_type: str) -> None:
     """Explicit operator Restart — single source of truth for BOTH the
     single-camera restart endpoint (routers/cameras.py) and the bulk
     Camera Control Center restart action (routers/camera_control.py), so
@@ -269,12 +269,31 @@ def restart(camera_id: str, source_type: str) -> None:
     real state transition, not just cosmetic: OPERATOR_DISCONNECTED is
     cleared and AUTO_MANAGED gains the camera, same as a fresh Connect.
 
-    `worker.stop_worker` must run first and be awaited-by-being-synchronous
-    here (it's a plain function, not a coroutine) so `connect()`'s
-    `start_worker` call sees no still-running task for this camera_id and
-    actually starts a fresh one — start_worker's own dedup guard
-    (`existing and not existing.done()`) would otherwise silently no-op."""
-    worker.stop_worker(camera_id)
+    10/10 debugging pass finding (BUG-3 investigation): this used to be a
+    plain `def` on the reasoning that "`worker.stop_worker` is a plain
+    function, so calling it is synchronous, so it's effectively awaited" —
+    that conflates two different things. `stop_worker`'s own BODY running to
+    completion is not the same as the CANCELLED TASK's cleanup having run:
+    `task.cancel()` only requests cancellation, delivered whenever the event
+    loop next gets a chance to schedule that task (see `stop_worker`'s own
+    docstring, which returns the task for exactly this reason — "a caller
+    that needs a DETERMINISTIC guarantee... can await asyncio.gather(...) on
+    it"). Without awaiting it, `start_worker`'s dedup guard
+    (`existing and not existing.done()`) races the old task's own
+    cancellation delivery on unspecified event-loop scheduling order rather
+    than a guarantee — harmless in practice under CPython's typical FIFO-ish
+    callback ordering (investigated: normal asyncio cancellation semantics
+    mean the old task cannot execute any of its OWN further code once
+    cancelled, only run its `except`/`finally` cleanup, so no plate_tracker/
+    DB write from the old task can land using a stale camera generation), but
+    an IMPLICIT scheduling-order dependency where an EXPLICIT one is free —
+    the mechanism `stop_worker` already exposes for this. Now actually used,
+    mirroring main.py's own shutdown-path idiom
+    (`await asyncio.gather(*pending_tasks, return_exceptions=True)`).
+    """
+    task = worker.stop_worker(camera_id)
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
     if source_type == "sentinel_grid":
         connect(camera_id)
     else:

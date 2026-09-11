@@ -272,6 +272,50 @@ async def _attempt_loop(
     return False
 
 
+async def locked_flush(db: Session) -> None:
+    """One `db.flush()`, under this Session's lock, with NO retry and NO
+    exception swallowing — the thread-safety half of safe_flush's contract
+    (see `_lock_for`/`_locked` above and the module docstring on why a raw
+    unlocked `to_thread(db.flush)` can race `close_session` into
+    `IllegalStateChangeError`), without its lock-only-retries-transient-
+    errors behavior.
+
+    Exists for callers that need to tell a genuine constraint violation
+    (`sqlalchemy.exc.IntegrityError` — e.g. a UNIQUE index catching a
+    real concurrent-insert race, see `correlate.upsert_vehicle_for_plate`)
+    apart from a transient lock (`OperationalError`, which `safe_flush`
+    already retries). `safe_flush`'s retry loop catches BOTH under one
+    generic `except Exception` and never re-raises either — exactly right
+    for "retry until it works or give up quietly", exactly wrong for "this
+    specific exception type means switch strategy", which is what a
+    caller recovering from a real conflict needs to do.
+    """
+    await asyncio.to_thread(_locked, db, db.flush)
+
+
+async def locked_commit(db: Session) -> None:
+    """`db.commit()` under this Session's lock, no retry, no swallowing —
+    same contract as `locked_flush`. Exists for the same reason: a caller
+    that needs a SPECIFIC exception type (or needs the write to actually
+    become visible to OTHER sessions right away, rather than sitting in an
+    open transaction — see `correlate.upsert_vehicle_for_plate`'s early-
+    commit-on-create, which exists so a competing session's conflicting
+    insert resolves to a fast IntegrityError instead of blocking for the
+    full SQLite busy_timeout waiting on a transaction nothing is going to
+    commit until much later) needs a plain, thread-safe commit.
+    """
+    await asyncio.to_thread(_locked, db, db.commit)
+
+
+async def locked_rollback(db: Session) -> None:
+    """`db.rollback()` under this Session's lock — same thread-safety
+    reasoning as `locked_flush` above. A caller recovering from an exception
+    `locked_flush` raised (which already released the lock on its own exit)
+    must still take the lock again for the rollback itself, not call
+    `db.rollback()` bare."""
+    await asyncio.to_thread(_locked, db, db.rollback)
+
+
 async def safe_commit(
     db: Session,
     label: str,

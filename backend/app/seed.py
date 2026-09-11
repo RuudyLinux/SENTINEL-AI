@@ -102,7 +102,20 @@ def reset_demo_data(db: Session) -> dict:
     if not settings.demo_mode:
         raise RuntimeError("reset_demo_data called outside DEMO_MODE — refusing")
 
-    for model in (models.Evidence, models.IncidentNote, models.Incident, models.Alert,
+    # BUG-D fix (final deep-debug pass, 2026-09-11): `models.IncidentAlert` was
+    # MISSING from this list, and it holds foreign keys to BOTH incidents and
+    # alerts — so `DELETE FROM incidents` here violated referential integrity.
+    # That silently "worked" only because SQLite ignores foreign keys unless
+    # `PRAGMA foreign_keys=ON` (now set — see app/db.py); on PostgreSQL, which
+    # has always enforced them, this raised a ForeignKeyViolation, meaning
+    # `POST /api/system/demo/reset` — the flagship judge-demo reset path — was
+    # broken on the production datastore and no SQLite-run test could see it.
+    #
+    # Order matters and is children-first: IncidentAlert before Incident/Alert,
+    # Alert before Detection (Alert.detection_id), everything referencing a
+    # vehicle before Vehicle itself.
+    for model in (models.Evidence, models.IncidentNote, models.IncidentAlert,
+                  models.Incident, models.Alert,
                   models.Plate, models.Track, models.Detection, models.Vehicle):
         db.query(model).delete()
 

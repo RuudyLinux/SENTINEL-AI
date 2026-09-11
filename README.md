@@ -56,8 +56,18 @@ vehicle-intelligence pipeline. Everything below is live in the running system.
   or a classical edge/morphology localizer that needs no extra asset. A
   localization miss falls back to whole-crop OCR, i.e. exactly the old
   behavior — a miss degrades the read, it never drops it. Measured on the
-  benchmark harness: **~3.5x faster per image** than whole-crop OCR, because
+  benchmark harness: **~3x faster per image** than whole-crop OCR, because
   OCR is working on a plate rather than a vehicle.
+
+  **Correction (2026-09-11), and it matters:** this section previously also
+  described localization as the single largest ACCURACY lever available,
+  larger than swapping the OCR engine. That was a reasoned hypothesis that had
+  never been measured. It has now been measured against 25 real labelled
+  Indian plates, and **the opposite is true on that data** — localization
+  roughly *tripled* the character error rate and dropped exact-match to near
+  zero, while keeping the ~3x speed win. See `docs/ANPR_ACCURACY.md` for the
+  numbers, the caveats (n=25, phone photos not CCTV) and what to do about it.
+  The speed claim survived measurement; the accuracy claim did not.
 - **Track ↔ plate association.** Every tracked vehicle now writes a real
   `Track` row (a table declared in the original schema but never written by
   anything until V2), and its `vehicle_id` is filled in once the plate
@@ -237,6 +247,86 @@ guard, one audit-log entry per bulk call, and live per-camera progress over the 
 `connect`/`start` are honest aliases — this codebase has no real distinction between them.
 RBAC is enforced server-side (`require_roles("Administrator", "Control Room Operator")`) —
 a disabled frontend button is a convenience, not the security boundary.
+
+## 10/10 roadmap gap-closure (2026-09-10)
+
+A competition-readiness pass focused on measurable engineering quality over
+architecture changes — see `docs/THREAT_MODEL.md` and
+`docs/PRIVACY_GOVERNANCE.md` for the two new standalone docs this produced.
+
+- **Confidence-aware watchlist alerts**: a watchlist match on a plate read
+  below `WATCHLIST_HIGH_CONFIDENCE_FLOOR` (default 0.60) is capped at HIGH
+  instead of auto-CRITICAL and says so in the alert reason — it still fires
+  (never silenced), it just no longer claims the same certainty as a
+  confidently-read match (`pipeline/rules_engine.py`, `config.py`).
+- **Human-in-the-loop ANPR review**: a Plate sighting below
+  `PLATE_REVIEW_CONFIDENCE_FLOOR` is flagged `pending_review`; operators
+  accept/correct/reject it via `GET/POST /api/review/...`
+  (`pipeline/anpr.py::review_status_for`, `routers/review.py`). Raw OCR,
+  grammar-normalized text, and a human correction are kept as three separate,
+  always-preserved fields — never overwritten into each other.
+- **Alert feedback + precision metrics**: `POST /api/alerts/{id}/feedback`
+  (confirmed/false_positive/needs_review) and
+  `GET /api/analytics/alert-precision`, which reports `insufficient_sample`
+  below a configurable minimum (20) rather than a misleading rate from a
+  handful of reviews (`routers/alerts.py`, `routers/analytics.py`).
+- **Tamper-evident audit chain**: every `AuditLog` row now carries
+  `chain_seq`/`prev_hash`/`entry_hash` — a real (non-blockchain) hash chain,
+  verified end-to-end via `GET /api/audit/verify-chain`
+  (`app/audit.py`). Detects both a modified row and a deleted row.
+- **Evidence provenance completion**: `Evidence.model_version`/`rule_version`
+  stamped at capture time; the evidence/incident UI now shows an exact
+  `VERIFIED`/`TAMPERED`/`UNVERIFIABLE`/`NO CAPTURE-TIME BASELINE`/`NOT YET
+  VERIFIED` badge (`components/EvidenceIntegrityBadge.tsx`) instead of a raw
+  status string.
+- **Incident Investigator Summary**: `GET /api/incidents/{id}/summary`
+  answers what/why/where/evidence/confidence in one call — risk factor
+  breakdown, plate + confidence + observation count, watchlist match detail,
+  cross-camera route, evidence integrity, related alerts — surfaced as a new
+  panel on the incident Overview tab (`routers/incidents.py`,
+  `incidents/[incidentId]/page.tsx`).
+- **Camera capacity benchmark** (`tools/camera_bench.py`): drives real
+  camera workers (real YOLO+ByteTrack+EasyOCR, not a stub) against the
+  bundled demo video at configurable concurrency and reports real FPS/
+  inference-latency/CPU/RSS. Measured on the development machine this pass
+  ran on: 1/3/5 concurrent `video_file` cameras sustained ~7.5-8.4 FPS
+  each with inference cost dropping as OS/model caches warmed; CPU plateaued
+  near saturation by 3 concurrent cameras on that host. **This is a
+  single-host, single-clip measurement — not a claim about any other machine,
+  real RTSP streams, or any specific camera count in production.** Re-run it
+  on target hardware before sizing a real deployment.
+
+  **Correction (2026-09-11): those numbers are weaker evidence than the above
+  implies.** The bundled clip it drives was measured to be **320x240, 10 fps,
+  40 frames (4 seconds), 15 KB — and it contains no vehicles at all** (raw
+  YOLOv8n at conf>=0.05 finds only a "tv"). Decoding that is nothing like
+  decoding a 1080p RTSP stream, and no ANPR work is triggered because nothing
+  is ever detected, so the measured cost is close to a floor rather than a
+  realistic load. Treat the figures as "the pipeline runs N workers without
+  falling over", NOT as a capacity envelope. A real envelope needs real
+  1080p footage with actual vehicles in it — see `docs/ANPR_ACCURACY.md`
+  ("What is still needed") for what to supply.
+- **Disaster recovery test** (`tests/test_disaster_recovery.py`): seeds a
+  real incident/evidence/audit-chain, backs up the SQLite file via SQLite's
+  own online-backup API, destroys the working copy, restores, and proves
+  incidents, evidence hashes, and the audit chain all survive intact.
+  PostgreSQL restore uses the same alembic-managed schema but was not
+  exercised (no PostgreSQL instance available here) — stated explicitly, not
+  implied.
+- **Privacy/governance controls**: configurable `EVIDENCE_RETENTION_DAYS`
+  (`None` by default — no automatic expiry until explicitly set) and an
+  audited, dry-run-by-default, double-confirmed purge workflow
+  (`POST /api/governance/purge-expired`) — see `docs/PRIVACY_GOVERNANCE.md`
+  for what this is (mechanism) and explicitly is not (a legal-compliance
+  claim).
+- **ANPR benchmark framework and real Indian-plate temporal fusion/parsing**
+  (`tools/anpr_bench.py`, `pipeline/plate_tracker.py`,
+  `pipeline/anpr.py::disambiguate_plate`) already existed from an earlier
+  pass and were audited, not rebuilt — see those files' own docstrings.
+  **ANPR accuracy remains UNVALIDATED**: no labelled real-plate corpus exists
+  in this repository (`tools/anpr_corpus/README.md` explains why one isn't
+  shipped) — the benchmark is ready the moment real, labelled images are
+  added there.
 
 ## Known-fixed issues (kept here so they don't get re-introduced)
 

@@ -67,6 +67,34 @@ jobs:
         # and has no pytest equivalent for a bare invocation.
         run: python -m pytest tests -q
 
+      # Inter-test coupling gate (workstream E2). The suite shares one on-disk
+      # SQLite database and several module-global caches, so a test that
+      # asserts on global state can pass purely because of WHERE it happens to
+      # land in alphabetical collection order. Running the same suite in a
+      # randomized order makes that dependency fail loudly instead of lurking.
+      #
+      # Not theoretical — enabling this found four real order-dependent tests
+      # that had been green for the whole project's life:
+      #   * a plate-pipeline test asserting row COUNTS for a hardcoded plate
+      #     another module also used
+      #   * the demo-scenario precondition test, which could no longer delete
+      #     its cameras once foreign keys were enforced
+      #   * three grid tests sharing one set of 30 catalogue records, so
+      #     "created == 30" depended on which ran first
+      #   * a self-heal test suppressed by the module-global dedup cache after
+      #     an unrelated test recorded the same (component, error_type) key
+      #
+      # The seed is printed in the run header; reproduce a failure locally with
+      # `python -m pytest tests --random-order --random-order-seed=<seed>`.
+      - name: Test (randomized order — inter-test coupling gate)
+        env:
+          SENTINEL_GRID_EMAIL: ""
+          SENTINEL_GRID_PASSWORD: ""
+          SENTINEL_GRID_AUTOCONNECT: "false"
+          CAMERA_CATALOG_BASE_URL: ""
+          DEMO_MODE: "true"
+        run: python -m pytest tests -q --random-order
+
       - name: Verify migrations apply and roll back
         run: |
           alembic upgrade head

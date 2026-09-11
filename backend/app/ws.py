@@ -80,10 +80,25 @@ class ConnectionManager:
         Kept as the low-level primitive (and as the pre-V2 entry point, so
         existing call sites and tests behave exactly as before). Prefer
         `publish`, which additionally applies aliasing and batching policy.
+
+        BUG-2 fix (10/10 debugging pass, 2026-09-11): iterates a SNAPSHOT
+        (`list(self.active)`), not `self.active` itself. `await ws.send_text`
+        is a real yield point, and `main.py::websocket_endpoint` runs each
+        connected client's receive-loop as its own concurrent task — the
+        instant ANY client disconnects, that task calls
+        `manager.disconnect(ws)`, mutating this SAME list. Iterating the live
+        list directly meant a disconnect landing between two `send_text`
+        calls could shift a still-connected, still-live client out of the
+        iterator's reach for that one broadcast — silently skipping it,
+        including a CRITICAL `alert.created` event. See
+        tests/test_ws_broadcast_race.py for the deterministic reproduction.
+        `main.py:209` (`for camera_id in list(RUNNING.keys())`) already uses
+        this exact snapshot idiom elsewhere in this codebase for the
+        identical reason; this was the one place it had been missed.
         """
         message = json.dumps({"type": event_type, "data": payload}, default=str)
         dead = []
-        for ws in self.active:
+        for ws in list(self.active):
             try:
                 await ws.send_text(message)
             except Exception:

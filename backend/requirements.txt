@@ -24,3 +24,8 @@ alembic
 # V2: PostgreSQL driver for the production datastore. Unused when DATABASE_URL
 # is unset (SQLite development), so it costs nothing on a dev checkout.
 psycopg[binary]
+# Inter-test coupling gate: runs the suite in a randomized order so a test that
+# depends on shared DB state or a module-global cache fails loudly instead of
+# passing on collection-order luck. Test-only; imports nothing at app runtime.
+# See the "randomized order" step in .github/workflows/python-package.yml.
+pytest-random-order

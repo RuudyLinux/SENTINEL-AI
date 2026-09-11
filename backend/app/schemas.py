@@ -153,8 +153,21 @@ class PlateOut(BaseModel):
     detection_confidence: float = 0.0
     vehicle_bbox: Optional[List[float]] = None
     plate_bbox: Optional[List[float]] = None
+    # Human-in-the-loop ANPR review (10/10 roadmap P7).
+    review_status: str = "auto_accepted"
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    corrected_text: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PlateReviewCorrectRequest(BaseModel):
+    corrected_text: str
+
+
+class PlateReviewRejectRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 class VehicleOut(BaseModel):
@@ -304,8 +317,17 @@ class AlertOut(BaseModel):
     # would assert a decision that was never taken.
     risk_score: int = 0
     risk_factors: List[dict] = []
+    # False-positive feedback (10/10 roadmap P6). Null = not yet reviewed.
+    feedback: Optional[str] = None
+    feedback_reason: Optional[str] = None
+    feedback_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AlertFeedbackRequest(BaseModel):
+    feedback: str  # confirmed | false_positive | needs_review
+    reason: Optional[str] = None
 
 
 class IncidentCreate(BaseModel):
@@ -354,8 +376,21 @@ class EvidenceOut(BaseModel):
     detection_id: Optional[str] = None
     event_type: str = ""
     source_timestamp: Optional[datetime] = None
+    # Provenance completion (10/10 roadmap P8). Null for evidence captured
+    # before this field existed — an honest gap, not backfilled.
+    model_version: Optional[str] = None
+    rule_version: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PurgeExpiredRequest(BaseModel):
+    # Real deletion requires BOTH dry_run=False AND confirm=True — a single
+    # flag flip is not enough to permanently destroy evidence (10/10 roadmap
+    # P13). Mirrors the deliberate two-signal pattern used elsewhere in this
+    # codebase for irreversible actions.
+    dry_run: bool = True
+    confirm: bool = False
 
 
 class AuditOut(BaseModel):

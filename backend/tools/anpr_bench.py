@@ -146,9 +146,32 @@ def _read_paddleocr(image):
     return normalize_plate(text), confidence
 
 
+def _read_easyocr_with_fallback(image):
+    """The CURRENT pipeline strategy: read the localized region, and if that
+    read fails the quality gate, re-read the whole crop and keep the better of
+    the two (see anpr.better_read). Measured because "localized" alone was
+    found to REDUCE accuracy on real plates — this is the fix, so the
+    benchmark has to be able to score it."""
+    from app.pipeline.anpr import better_read, passes_anpr_gate, read_plate
+    from app.pipeline import plate_detect
+
+    located = plate_detect.locate_plate(image)
+    if located is None:
+        _, normalized, confidence = read_plate(image)
+        return normalized, confidence
+    _, normalized, confidence = read_plate(located[0])
+    if not passes_anpr_gate(normalized, confidence):
+        best = better_read(("", normalized, confidence), read_plate(image))
+        normalized, confidence = best[1], best[2]
+    return normalized, confidence
+
+
 CONFIGURATIONS = [
     ("whole-crop + easyocr", _read_easyocr, False),
     ("localized + easyocr", _read_easyocr, True),
+    # `localize=False` because this configuration does its OWN localization
+    # internally (it needs the un-cropped image to fall back to).
+    ("localized+fallback + easyocr", _read_easyocr_with_fallback, False),
     ("localized + paddleocr", _read_paddleocr, True),
 ]
 

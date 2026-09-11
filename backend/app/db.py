@@ -105,6 +105,25 @@ def _set_sqlite_pragmas(dbapi_connection, _record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
+    # BUG-C fix, second half (final deep-debug pass): SQLite ignores every
+    # FOREIGN KEY in this schema unless this is switched on PER CONNECTION —
+    # it defaults to OFF — while the Alembic-managed PostgreSQL schema has
+    # always enforced them. Without this line a referential violation
+    # silently succeeded in dev/demo and raised a ForeignKeyViolation in
+    # production: a divergence no test running on SQLite could ever surface.
+    #
+    # Measured before the fix: deleting a camera left 1 detection, 1 alert,
+    # 1 incident, 1 evidence row (with its capture-time digest), 1 plate and
+    # 1 zone dangling at a camera_id that no longer existed, and the API
+    # returned 200.
+    #
+    # Enabling it required fixing the test harness first (tests/conftest.py's
+    # `client` fixture bulk-deleted Camera rows without clearing the rows
+    # referencing them — 143 errors + 5 failures from that one fixture).
+    # Sequence deliberately taken in that order: fix the fixture, prove the
+    # suite green with FKs still off, THEN flip this on and prove it green
+    # again — so a failure at either step is unambiguous about its cause.
+    cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
 

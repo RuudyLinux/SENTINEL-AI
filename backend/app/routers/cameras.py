@@ -98,6 +98,46 @@ async def sync_sentinel_grid(
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1MB — stream to disk, never buffer the whole file in RAM
 
+# C2 (final deep-debug pass): content validation to go with the extension
+# allow-list, which by itself accepted an arbitrary blob renamed `.mp4`
+# (measured: a PE executable `MZ\x90\x00` and a ZIP `PK\x03\x04` were both
+# stored happily).
+#
+# Deliberately a DENY-list of things that are definitively not video, not an
+# allow-list of known containers. An allow-list would reject legitimate but
+# unusual encodings the deployment might genuinely use, breaking working
+# functionality to defend against a payload that — verified — is never served
+# back over HTTP by anything (uploads_dir has no StaticFiles mount and no
+# FileResponse; it is only ever handed to cv2.VideoCapture). So: refuse what
+# is unambiguously an executable/archive/document/image, pass everything
+# else through, including unrecognized-but-plausible video.
+_NON_VIDEO_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"MZ", "a Windows executable"),
+    (b"\x7fELF", "an ELF executable"),
+    (b"PK\x03\x04", "a ZIP archive (or Office document)"),
+    (b"Rar!", "a RAR archive"),
+    (b"\x1f\x8b", "a gzip archive"),
+    (b"7z\xbc\xaf\x27\x1c", "a 7-Zip archive"),
+    (b"%PDF", "a PDF document"),
+    (b"#!", "a script"),
+    (b"\xca\xfe\xba\xbe", "a Java class file"),
+    (b"\x89PNG", "a PNG image"),
+    (b"\xff\xd8\xff", "a JPEG image"),
+    (b"GIF8", "a GIF image"),
+    (b"BM", "a bitmap image"),
+    (b"<!DOCTYPE", "an HTML document"),
+    (b"<html", "an HTML document"),
+    (b"<?xml", "an XML document"),
+)
+
+
+def _rejected_content_reason(head: bytes) -> "str | None":
+    """Returns why `head` is definitively not video, or None to allow it."""
+    for signature, description in _NON_VIDEO_SIGNATURES:
+        if head.startswith(signature):
+            return description
+    return None
+
 
 @router.post("/upload-video")
 async def upload_video(
@@ -131,10 +171,31 @@ async def upload_video(
                 chunk = await file.read(UPLOAD_CHUNK_BYTES)
                 if not chunk:
                     break
+                if written == 0:
+                    # C2: checked on the FIRST chunk, before any more of the
+                    # upload is accepted — an executable or archive is
+                    # rejected after 1MB, not after 500MB.
+                    reason = _rejected_content_reason(chunk[:16])
+                    if reason is not None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Uploaded file is {reason}, not a video, despite its '{ext}' name.",
+                        )
                 written += len(chunk)
                 if written > max_bytes:
                     raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_mb}MB limit")
                 f.write(chunk)
+        if written == 0:
+            # BUG-B fix (final deep-debug pass): a 0-byte upload was accepted
+            # with a 200 and left a 0-byte file on disk forever. It is not a
+            # video by any definition — registering it as a camera source
+            # produces a camera that can never open its stream, failing
+            # through the full reconnect/backoff budget before going offline,
+            # for a file that was never openable in the first place. Rejected
+            # at the door instead, and the empty file cleaned up by the
+            # HTTPException handler below (same path as the size-cap
+            # rejection). Measured: previously `size=0` orphan retained.
+            raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
     except HTTPException:
         dest.unlink(missing_ok=True)
         raise
@@ -144,6 +205,21 @@ async def upload_video(
 
     log_action(db, user, "upload_video", resource=safe_name)
     return {"path": str(dest), "filename": safe_name, "original_filename": original_name}
+
+
+# C1 (final deep-debug pass): bounds how many source probes may be in flight
+# at once. Module-level so the cap is per-process, matching the resource it
+# protects — the single shared `asyncio.to_thread` executor, which every
+# camera worker also depends on. Created lazily on first use so it binds to
+# the running loop rather than import time.
+_probe_semaphore: "asyncio.Semaphore | None" = None
+
+
+def _get_probe_semaphore() -> asyncio.Semaphore:
+    global _probe_semaphore
+    if _probe_semaphore is None:
+        _probe_semaphore = asyncio.Semaphore(settings.camera_test_connection_max_concurrent)
+    return _probe_semaphore
 
 
 @router.post("/test-connection")
@@ -166,28 +242,49 @@ async def test_connection(
     inherent to onboarding a camera; requiring the same role as camera creation
     puts it behind the same trust boundary as the action it precedes.
     """
-    src = CameraSource(source_type, source_uri)
-    try:
-        # Enforced independently of CAP_PROP_OPEN_TIMEOUT_MSEC, which isn't
-        # reliably honored by every OpenCV/FFmpeg build (Phase 4 finding —
-        # measured ~30s instead of a configured 5s against an unreachable
-        # RTSP endpoint) — this endpoint must still respond in bounded time.
+    # C1: fail fast instead of queueing when the probe budget is already
+    # spent. A queued probe would still occupy a request AND still wait out
+    # the full open timeout behind the ones ahead of it, so refusing is the
+    # honest answer. (`locked()` is checked before acquiring rather than
+    # using a zero timeout: two requests can both observe an unlocked
+    # semaphore and one then waits briefly for the other — bounded by a
+    # single probe, and it never exceeds the concurrency the semaphore
+    # itself enforces, which is the resource being protected.)
+    semaphore = _get_probe_semaphore()
+    if semaphore.locked():
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Too many camera probes in flight (limit {settings.camera_test_connection_max_concurrent}). "
+                "Each probe can hold a worker thread for up to "
+                f"{settings.source_open_timeout_seconds:.0f}s, and that thread pool is shared with live "
+                "camera processing. Retry shortly."
+            ),
+        )
+
+    async with semaphore:
+        src = CameraSource(source_type, source_uri)
         try:
-            ok = await asyncio.wait_for(asyncio.to_thread(src.open), timeout=settings.source_open_timeout_seconds)
-        except asyncio.TimeoutError:
-            return {"ok": False, "detail": f"Source did not respond within {settings.source_open_timeout_seconds:.0f}s"}
-        except NotImplementedError as exc:
-            # e.g. the ONVIF interface stub — an honest, expected failure, not a crash.
-            return {"ok": False, "detail": str(exc)}
-        detail = "Source opened and produced a frame." if ok else "Source could not be opened."
-        if ok:
-            read_ok, _ = await asyncio.to_thread(src.read)
-            ok = ok and read_ok
-            if not read_ok:
-                detail = "Source opened but produced no frame."
-        return {"ok": ok, "detail": detail}
-    finally:
-        await asyncio.to_thread(src.release)
+            # Enforced independently of CAP_PROP_OPEN_TIMEOUT_MSEC, which isn't
+            # reliably honored by every OpenCV/FFmpeg build (Phase 4 finding —
+            # measured ~30s instead of a configured 5s against an unreachable
+            # RTSP endpoint) — this endpoint must still respond in bounded time.
+            try:
+                ok = await asyncio.wait_for(asyncio.to_thread(src.open), timeout=settings.source_open_timeout_seconds)
+            except asyncio.TimeoutError:
+                return {"ok": False, "detail": f"Source did not respond within {settings.source_open_timeout_seconds:.0f}s"}
+            except NotImplementedError as exc:
+                # e.g. the ONVIF interface stub — an honest, expected failure, not a crash.
+                return {"ok": False, "detail": str(exc)}
+            detail = "Source opened and produced a frame." if ok else "Source could not be opened."
+            if ok:
+                read_ok, _ = await asyncio.to_thread(src.read)
+                ok = ok and read_ok
+                if not read_ok:
+                    detail = "Source opened but produced no frame."
+            return {"ok": ok, "detail": detail}
+        finally:
+            await asyncio.to_thread(src.release)
 
 
 @router.post("", response_model=schemas.CameraOut)
@@ -334,7 +431,7 @@ async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: mo
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
-    supervisor.restart(camera_id, str(camera.source_type))
+    await supervisor.restart(camera_id, str(camera.source_type))
     log_action(db, user, "restart_camera", resource=camera.camera_code)
     return {"ok": True}
 
@@ -379,9 +476,63 @@ def stop_camera(camera_id: str, db: Session = Depends(get_db), user: models.User
 
 @router.delete("/{camera_id}")
 def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """BUG-C fix (final deep-debug pass, 2026-09-11): this used to delete the
+    camera row unconditionally and return 200, silently orphaning every
+    record that referenced it. Measured on a single probe camera: 1 detection,
+    1 alert, 1 incident, 1 EVIDENCE row (with its capture-time SHA-256), 1
+    plate sighting and 1 zone were all left pointing at a camera_id that no
+    longer existed — including evidence attached to a still-open incident.
+
+    Two things were wrong at once:
+
+    - **Evidence/incident history was silently detached.** For a platform
+      whose entire evidence story is chain-of-custody, quietly orphaning an
+      open incident's evidence via an unrelated endpoint is the wrong
+      outcome; `docs/PRIVACY_GOVERNANCE.md` already states that evidence and
+      audit history are never silently destroyed. Deletion is now REFUSED
+      (409) while dependent records exist, naming exactly what blocks it, so
+      an operator makes that call deliberately (close/export the incident,
+      or purge evidence through the audited governance workflow) instead of
+      it happening as a side effect.
+    - **SQLite and PostgreSQL disagree.** SQLite does not enforce foreign
+      keys unless `PRAGMA foreign_keys=ON`, which this codebase does not set
+      (see db.py for why it is not simply flipped on), while the
+      Alembic-managed PostgreSQL schema always has. So this request quietly
+      succeeded in dev/demo and would have raised a ForeignKeyViolation →
+      500 in production: a divergence no test running on SQLite could catch.
+      The guard below closes that gap from the application side, giving BOTH
+      backends the same, explainable 409 instead of one silently corrupting
+      and the other 500-ing.
+    """
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
+
+    # Counted rather than just existence-checked: the message has to tell the
+    # operator what is actually in the way, not merely that something is.
+    blockers = {
+        "detections": db.query(models.Detection).filter(models.Detection.camera_id == camera_id).count(),
+        "alerts": db.query(models.Alert).filter(models.Alert.camera_id == camera_id).count(),
+        "incidents": db.query(models.Incident).filter(models.Incident.camera_id == camera_id).count(),
+        "evidence": db.query(models.Evidence).filter(models.Evidence.camera_id == camera_id).count(),
+        "plates": db.query(models.Plate).filter(models.Plate.camera_id == camera_id).count(),
+        "zones": db.query(models.Zone).filter(models.Zone.camera_id == camera_id).count(),
+        "tracks": db.query(models.Track).filter(models.Track.camera_id == camera_id).count(),
+    }
+    held = {name: count for name, count in blockers.items() if count}
+    if held:
+        log_action(db, user, "delete_camera", resource=camera_id, result="FAILURE")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Camera has operational history and cannot be deleted: "
+                + ", ".join(f"{count} {name}" for name, count in sorted(held.items()))
+                + ". Deleting it would detach that history (including any evidence) from its "
+                  "source camera. Disconnect the camera instead, or remove its records through "
+                  "the audited retention workflow first."
+            ),
+        )
+
     stop_worker(camera_id)
     db.delete(camera)
     db.commit()

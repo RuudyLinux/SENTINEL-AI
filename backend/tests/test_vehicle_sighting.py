@@ -45,7 +45,12 @@ def _sighting(db, vehicle, camera, at, *, last_seen=None, confidence=0.9, track_
 class TestSightingUpsert:
     def test_first_read_creates_a_sighting_row(self, db_session):
         camera = _camera(db_session, "V2-C1")
-        vehicle = _vehicle(db_session, "GJ05AB1234")
+        # Not "GJ05AB1234": that literal is also used by the real pipeline in
+        # test_plate_pipeline_integration.py, which runs earlier in the full
+        # suite and persists a real Vehicle row for it — colliding here since
+        # Vehicle.plate_text became unique (BUG-1 fix, 10/10 debugging pass).
+        # Nothing in this test asserts on the specific plate text value.
+        vehicle = _vehicle(db_session, "GJ05AB1230")
         detection = models.Detection(camera_id=camera.id, cls="car", confidence=0.8, bbox=[0, 0, 10, 10])
         db_session.add(detection)
         db_session.flush()

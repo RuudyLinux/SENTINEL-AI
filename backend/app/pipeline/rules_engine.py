@@ -168,8 +168,6 @@ async def evaluate(
         rule = db.query(models.AlertRule).filter(
             models.AlertRule.rule_type == "watchlist_plate", models.AlertRule.active == True  # noqa: E712
         ).first()
-        reasons.append(f"Watchlist signal: plate {vehicle.plate_text} matches an active watchlist entry")
-        severity = "CRITICAL"
         rule_id = rule.id if rule else None
         entry = db.query(models.WatchlistEntry).filter(
             models.WatchlistEntry.entity_type == "plate",
@@ -178,6 +176,22 @@ async def evaluate(
         ).first()
         signals.watchlist_priority = entry.priority if entry else "HIGH"
         signals.plate_text = str(vehicle.plate_text or "")
+
+        # Confidence-aware intelligence: the match itself is never suppressed
+        # for being uncertain, but its severity must not overstate how sure
+        # the plate read actually is. Below the floor, cap at HIGH and say so
+        # in the reason string — the operator sees "needs confirmation" rather
+        # than an unqualified CRITICAL that looks identical to a confident hit.
+        plate_confidence = float(vehicle.plate_confidence or 0.0)
+        if plate_confidence >= settings.watchlist_high_confidence_floor:
+            reasons.append(f"Watchlist signal: plate {vehicle.plate_text} matches an active watchlist entry")
+            severity = "CRITICAL"
+        else:
+            reasons.append(
+                f"Watchlist signal (LOW CONFIDENCE {plate_confidence * 100:.0f}%): plate "
+                f"{vehicle.plate_text} matches an active watchlist entry — requires confirmation"
+            )
+            severity = "HIGH"
 
     # --- zone_entry / loitering rules for this camera (cooldown per camera+zone+track) ---
     at = detection.source_timestamp or detection.timestamp or datetime.utcnow()
@@ -384,6 +398,11 @@ async def evaluate(
                 event_type="watchlist_match" if vehicle else "zone_entry",
                 source_timestamp=detection.source_timestamp,
                 verification_status="unverified",
+                # Provenance (10/10 roadmap P8) — see worker.py's identical
+                # evidence-creation site for why this is stamped once, here,
+                # rather than derived later from settings' current value.
+                model_version=settings.model_version,
+                rule_version=settings.rule_version,
             )
             db.add(incident_evidence)
 

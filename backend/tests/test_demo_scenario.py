@@ -63,11 +63,17 @@ def test_trigger_scenario_refuses_outside_demo_mode(db_session, admin_user, monk
 
 def test_trigger_scenario_requires_demo_cameras_registered(db_session, admin_user, monkeypatch):
     monkeypatch.setattr(settings, "demo_mode", True)
-    # Other tests in this module may have already registered the demo
-    # cameras in this shared test DB — remove them so this test's
-    # precondition ("not registered yet") actually holds.
-    db_session.query(models.Camera).filter(models.Camera.camera_code.in_(["C-014", "C-019"])).delete(synchronize_session=False)
-    db_session.commit()
+    # Any earlier test — in this module OR, under --random-order, anywhere in
+    # the suite — may have registered the demo cameras in this shared test DB,
+    # so this test's precondition ("not registered yet") has to be established,
+    # not assumed. Deleting the Camera rows alone is no longer enough now that
+    # foreign keys are enforced (app/db.py): a demo camera that already has
+    # detections/plates/incidents cannot be removed without its dependents,
+    # and the delete simply fails. `delete_cameras_by_code` clears both, in
+    # the correct order.
+    from conftest import delete_cameras_by_code
+
+    delete_cameras_by_code(db_session, ["C-014", "C-019"])
     with pytest.raises(DemoScenarioError, match="not registered|Demo cameras"):
         asyncio.run(trigger_scenario(db_session, admin_user))
 

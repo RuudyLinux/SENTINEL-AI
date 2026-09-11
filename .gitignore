@@ -21,6 +21,14 @@ backend/*.pt
 # The README explaining what goes here IS tracked.
 backend/tools/anpr_corpus/*
 !backend/tools/anpr_corpus/README.md
+
+# tools/camera_bench.py output — a real measurement, but specific to the
+# machine and moment it was run; not a portable claim to keep in version
+# control (see the "10/10 roadmap gap-closure" README section for one
+# concrete real run's numbers instead).
+backend/camera_bench_report.md
+backend/camera_bench_results.json
+backend/bench_scratch.db*
 *.pyc
 
 # Frontend
@@ -41,3 +49,6 @@ frontend/tsconfig.tsbuildinfo
 
 # Tooling output (Playwright MCP browser-QA logs/snapshots — not project source)
 .playwright-mcp/
+# Playwright run artifacts (traces/screenshots on failure) — regenerated per run.
+frontend/test-results/
+frontend/playwright-report/

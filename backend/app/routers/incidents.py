@@ -36,6 +36,84 @@ def get_incident(incident_id: str, db: Session = Depends(get_db), user: models.U
     return inc
 
 
+@router.get("/{incident_id}/summary")
+def incident_summary(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Investigator Summary (10/10 roadmap P10): everything backing "what
+    happened, why was it flagged, where was it seen, what evidence supports
+    it, how confident are we" gathered into one call, so the incident page
+    does not require an operator to manually chase five different endpoints.
+    Every value here is read from rows already computed elsewhere (risk.py,
+    plate_tracker via the Plate table, correlate.get_route, evidence.verify) —
+    nothing is recomputed or invented for this view.
+    """
+    inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    linked_ids = {row.alert_id for row in db.query(models.IncidentAlert).filter(models.IncidentAlert.incident_id == incident_id).all()}
+    if inc.alert_id:
+        linked_ids.add(inc.alert_id)
+    alerts = db.query(models.Alert).filter(models.Alert.id.in_(linked_ids)).order_by(models.Alert.timestamp.asc()).all() if linked_ids else []
+    primary_alert = next((a for a in alerts if a.id == inc.alert_id), alerts[0] if alerts else None)
+
+    vehicle = db.query(models.Vehicle).filter(models.Vehicle.id == inc.vehicle_id).first() if inc.vehicle_id else None
+    watchlist_entry = None
+    if vehicle and vehicle.watchlist_flag:
+        watchlist_entry = db.query(models.WatchlistEntry).filter(
+            models.WatchlistEntry.entity_type == "plate",
+            models.WatchlistEntry.identifier == vehicle.plate_text,
+            models.WatchlistEntry.active == True,  # noqa: E712
+        ).first()
+
+    route = []
+    plate_reads_total = 0
+    if vehicle:
+        from ..pipeline.correlate import get_route
+        route = get_route(db, vehicle.id)
+        plate_reads_total = sum(hop.get("reads_count", 1) for hop in route)
+
+    evidence_items = db.query(models.Evidence).filter(models.Evidence.incident_id == incident_id).all()
+
+    return {
+        "incident_id": incident_id,
+        "what": inc.title,
+        "why": [reason for a in alerts for reason in (a.reasons or [])],
+        "risk": {
+            "score": primary_alert.risk_score if primary_alert else 0,
+            "factors": primary_alert.risk_factors if primary_alert else [],
+        },
+        "vehicle": {
+            "plate_text": vehicle.plate_text if vehicle else None,
+            "plate_confidence": vehicle.plate_confidence if vehicle else None,
+            "total_plate_reads": plate_reads_total,
+            "watchlist_match": {
+                "priority": watchlist_entry.priority, "reason": watchlist_entry.reason,
+            } if watchlist_entry else None,
+        } if vehicle else None,
+        "where": {
+            "cameras_visited": len({hop["camera_id"] for hop in route}),
+            "route": route,
+        },
+        "related_alerts": [
+            {
+                "id": a.id, "severity": a.severity, "risk_score": a.risk_score,
+                "reasons": a.reasons, "timestamp": a.timestamp.isoformat(),
+                "feedback": a.feedback,
+            }
+            for a in alerts
+        ],
+        "evidence": [
+            {
+                "id": e.id, "evidence_type": e.evidence_type,
+                "verification_status": e.verification_status,
+                "sha256": e.sha256, "model_version": e.model_version, "rule_version": e.rule_version,
+            }
+            for e in evidence_items
+        ],
+        "evidence_fully_verified": bool(evidence_items) and all(e.verification_status == "verified" for e in evidence_items),
+    }
+
+
 @router.get("/{incident_id}/timeline")
 def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()

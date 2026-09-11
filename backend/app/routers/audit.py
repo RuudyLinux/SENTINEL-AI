@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..audit import verify_chain
 from ..db import get_db
 from ..security import require_roles
 
@@ -22,3 +23,13 @@ def list_audit(
     if action:
         q = q.filter(models.AuditLog.action.ilike(f"%{action}%"))
     return q.order_by(models.AuditLog.timestamp.desc()).limit(500).all()
+
+
+@router.get("/verify-chain")
+def verify_audit_chain(
+    db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Auditor")),
+):
+    """Walks the full tamper-evident hash chain (10/10 roadmap P9) and reports
+    whether it is intact, or exactly where it first breaks. See app/audit.py
+    for what the chain actually covers and cannot cover (pre-chain rows)."""
+    return verify_chain(db)

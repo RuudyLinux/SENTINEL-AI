@@ -4,6 +4,7 @@ import { useParams } from "next/navigation";
 import { api, buildTokenedUrl, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import ErrorState from "@/components/ErrorState";
+import EvidenceIntegrityBadge from "@/components/EvidenceIntegrityBadge";
 
 export default function EvidenceDetailPage() {
   const { evidenceId } = useParams<{ evidenceId: string }>();
@@ -57,7 +58,10 @@ export default function EvidenceDetailPage() {
         {evidence.source_timestamp && (
           <div><span className="text-slate-500">Source time:</span> {new Date(evidence.source_timestamp).toLocaleString()}</div>
         )}
-        <div><span className="text-slate-500">Verification:</span> {evidence.verification_status}</div>
+        <div className="flex items-center gap-2"><span className="text-slate-500">Evidence Integrity:</span> <EvidenceIntegrityBadge status={evidence.verification_status} /></div>
+        {(evidence.model_version || evidence.rule_version) && (
+          <div><span className="text-slate-500">Captured by:</span> {evidence.model_version || "—"} / {evidence.rule_version || "—"}</div>
+        )}
         {evidence.sha256 && <div><span className="text-slate-500">SHA-256:</span> <span className="font-mono text-xs break-all">{evidence.sha256}</span></div>}
       </div>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}

@@ -8,13 +8,44 @@ Also: cross-camera PERSON correlation by appearance-similarity signature (Phase
 not face recognition or identity resolution: a ranked visual-similarity candidate
 list only, for an investigator to review manually.
 """
+import asyncio
+import logging
 from datetime import datetime
+
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .. import models
 from . import risk
+from .anpr import review_status_for
 from .appearance import similarity
-from .db_retry import safe_flush
+from .db_retry import locked_commit, locked_rollback, safe_flush
+
+logger = logging.getLogger("sentinel.correlate")
+
+
+async def _merge_into_winner(db: Session, normalized_plate: str, confidence: float, now: datetime) -> "models.Vehicle | None":
+    """BUG-1 recovery path: another session's Vehicle row for this exact
+    plate already won the race and committed between our read and our write.
+    Fold this read's confidence/last_seen into THAT row instead of leaving
+    our own insert attempt as a rejected no-op. Returns None if no such row
+    can be found after all (see caller — that means the conflict was NOT a
+    plate_text collision, and must not be silently absorbed)."""
+    winner = db.query(models.Vehicle).filter(models.Vehicle.plate_text == normalized_plate).first()
+    if winner is None:
+        return None
+    target_last_seen = now
+    target_confidence = max(confidence, winner.plate_confidence or 0.0)
+    winner.last_seen = target_last_seen
+    winner.plate_confidence = target_confidence
+
+    def reapply():
+        db.add(winner)
+        winner.last_seen = target_last_seen
+        winner.plate_confidence = target_confidence
+
+    await safe_flush(db, "upsert_vehicle_for_plate_conflict_resolution", reapply=reapply)
+    return winner
 
 
 async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidence: float) -> models.Vehicle:
@@ -22,10 +53,24 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
     was unguarded against SQLite lock contention — the same root-cause class
     PR #1 fixed in worker.py's detection insert, just in a different, shared
     call site (both worker.py's real live pipeline AND demo_scenario.py call
-    this). Caught live: a real concurrent-camera-write lock here surfaced as
-    an unhandled 500 from the demo-scenario endpoint. Now retried with the
-    same bounded rollback -> reapply -> backoff contract as every other
-    write in the pipeline (db_retry.safe_flush)."""
+    this). Now retried with the same bounded rollback -> reapply -> backoff
+    contract as every other write in the pipeline (db_retry.safe_flush).
+
+    BUG-1 fix (10/10 debugging pass): the read-then-insert below is a classic
+    TOCTOU race across TWO DIFFERENT sessions — each camera worker holds its
+    own session for its stream's whole lifetime (worker.py), so two cameras
+    seeing the same never-before-seen plate within the same race window could
+    each see "nothing yet" and each insert, silently splitting one real
+    vehicle across two rows (see models.py::Vehicle.plate_text for the DB-
+    level half of this fix). The CREATE path below now commits directly
+    (locked_commit — no retry, so IntegrityError reaches here rather than
+    being swallowed by safe_flush's generic retry/give-up handling, and
+    committed rather than merely flushed so a competing session's insert
+    resolves fast instead of blocking on an open transaction — see that
+    call's own comment) and, on a unique-constraint conflict, folds this
+    read into whichever row actually won instead of leaving a rejected,
+    wasted write.
+    """
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == normalized_plate).first()
     now = datetime.utcnow()
     if vehicle:
@@ -43,29 +88,86 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
             db.add(vehicle)
             vehicle.last_seen = target_last_seen
             vehicle.plate_confidence = target_confidence
-    else:
-        watchlisted = db.query(models.WatchlistEntry).filter(
-            models.WatchlistEntry.entity_type == "plate",
-            models.WatchlistEntry.identifier == normalized_plate,
-            models.WatchlistEntry.active == True,  # noqa: E712
-        ).first()
-        vehicle = models.Vehicle(
-            plate_text=normalized_plate,
-            plate_confidence=confidence,
-            first_seen=now,
-            last_seen=now,
-            watchlist_flag=bool(watchlisted),
-        )
-        db.add(vehicle)
 
-        def reapply():
-            # `vehicle` is still TRANSIENT (never committed) — rollback only
-            # detaches it; its already-set attributes (including the
-            # client-generated PK) survive, so re-add() alone restores it.
-            db.add(vehicle)
+        await safe_flush(db, "upsert_vehicle_for_plate", reapply=reapply)
+        return vehicle
 
-    await safe_flush(db, "upsert_vehicle_for_plate", reapply=reapply)
-    return vehicle
+    watchlisted = db.query(models.WatchlistEntry).filter(
+        models.WatchlistEntry.entity_type == "plate",
+        models.WatchlistEntry.identifier == normalized_plate,
+        models.WatchlistEntry.active == True,  # noqa: E712
+    ).first()
+    vehicle = models.Vehicle(
+        plate_text=normalized_plate,
+        plate_confidence=confidence,
+        first_seen=now,
+        last_seen=now,
+        watchlist_flag=bool(watchlisted),
+    )
+    db.add(vehicle)
+    # Committed immediately, not just flushed, deliberately: a genuinely NEW
+    # Vehicle has nothing else in this transaction depending on it yet (the
+    # Plate/Detection rows that reference it are added AFTER this call
+    # returns, by the caller), so nothing is lost by making it durable right
+    # away — and a competing session's conflicting insert needs this row to
+    # actually COMMIT to resolve as a fast IntegrityError. Left merely
+    # flushed (uncommitted), a concurrent camera worker's competing insert
+    # would instead BLOCK on SQLite's write lock for the full busy_timeout
+    # (up to 30s) waiting on a transaction this session has no reason to
+    # commit until it finishes the REST of its own frame's processing —
+    # turning a race this fix is supposed to resolve in milliseconds into a
+    # real multi-second stall on an unrelated camera's pipeline. Found via
+    # tests/test_vehicle_upsert_race.py's real concurrent-asyncio-tasks case,
+    # not by inspection alone.
+    #
+    # A dedicated retry loop, not safe_commit/safe_flush: those two share one
+    # contract (retry ONLY OperationalError, swallow everything else into a
+    # single "attempt failed" outcome with no way for the caller to tell
+    # WHICH exception it was) that is exactly wrong here — an IntegrityError
+    # is a definitive answer needing zero retries and different recovery
+    # (merge into the winner), while OperationalError is the transient
+    # condition needing the retry/backoff. Same attempt count/backoff shape
+    # as db_retry._attempt_loop, so this path is not less resilient to lock
+    # contention than every other write in the pipeline.
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await locked_commit(db)
+            return vehicle
+        except IntegrityError:
+            # Not a lock — a real unique-constraint hit. The DB itself just
+            # proved another session's row for this exact plate already
+            # exists; roll back OUR failed insert and merge into that row.
+            await locked_rollback(db)
+            winner = await _merge_into_winner(db, normalized_plate, confidence, now)
+            if winner is not None:
+                logger.info(
+                    "upsert_vehicle_for_plate: recovered a concurrent-insert race for plate %s "
+                    "by merging into the winning row instead of creating a duplicate.",
+                    normalized_plate,
+                )
+                return winner
+            # A conflict happened but no row exists for this plate —
+            # genuinely unexpected (some OTHER constraint, not the one this
+            # fix targets). Must not be silently absorbed as if it were the
+            # race this function understands.
+            raise
+        except OperationalError:
+            # Genuine lock contention, not a constraint conflict. A failed
+            # commit leaves the Session's transaction unusable (SQLAlchemy
+            # raises PendingRollbackError on the next call otherwise) — roll
+            # back before any further use, same requirement db_retry.py's
+            # own module docstring documents for every other retry path.
+            await locked_rollback(db)
+            if attempt >= max_attempts:
+                logger.warning(
+                    "upsert_vehicle_for_plate: giving up on plate %s after %d attempts — still locked.",
+                    normalized_plate, max_attempts,
+                )
+                raise
+            db.add(vehicle)  # re-add the still-transient object; rollback only detached it
+            await asyncio.sleep(min(0.5, 0.05 * (2 ** (attempt - 1))))
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 async def upsert_track(
@@ -172,6 +274,7 @@ async def upsert_plate_sighting(
         target_snapshot = plate.snapshot_path or snapshot_path
         target_plate_bbox = plate_bbox if plate_bbox is not None else plate.plate_bbox
         target_vehicle_bbox = vehicle_bbox if vehicle_bbox is not None else plate.vehicle_bbox
+        target_review_status = review_status_for(target_confidence, plate.review_status)
         plate.confidence = target_confidence
         plate.plate_text_normalized = target_text
         plate.plate_text_raw = target_raw
@@ -180,6 +283,7 @@ async def upsert_plate_sighting(
         plate.snapshot_path = target_snapshot
         plate.plate_bbox = target_plate_bbox
         plate.vehicle_bbox = target_vehicle_bbox
+        plate.review_status = target_review_status
 
         def reapply():
             db.add(plate)
@@ -191,6 +295,7 @@ async def upsert_plate_sighting(
             plate.snapshot_path = target_snapshot
             plate.plate_bbox = target_plate_bbox
             plate.vehicle_bbox = target_vehicle_bbox
+            plate.review_status = target_review_status
     else:
         plate = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera_id, detection_id=detection_id,
@@ -200,6 +305,7 @@ async def upsert_plate_sighting(
             track_id=track_id, reads_count=reads_count,
             vehicle_class=vehicle_class, detection_confidence=detection_confidence,
             vehicle_bbox=vehicle_bbox, plate_bbox=plate_bbox,
+            review_status=review_status_for(confidence),
         )
         db.add(plate)
 

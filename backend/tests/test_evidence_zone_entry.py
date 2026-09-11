@@ -180,7 +180,11 @@ def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_se
     )
     db_session.add(camera)
     db_session.flush()
-    vehicle = models.Vehicle(plate_text="GJ01ZZ9999", watchlist_flag=True)
+    # plate_confidence set explicitly (above watchlist_high_confidence_floor):
+    # this test is about the Evidence row's linkage fields, not confidence
+    # gating (see test_watchlist_confidence_gating.py for that) — a 0.0
+    # default would now (correctly) cap severity at HIGH, not CRITICAL.
+    vehicle = models.Vehicle(plate_text="GJ01ZZ9999", plate_confidence=0.9, watchlist_flag=True)
     db_session.add(vehicle)
     db_session.flush()
     detection = models.Detection(

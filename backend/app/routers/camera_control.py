@@ -124,7 +124,7 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
             # for a sentinel_grid camera. supervisor.restart is the single
             # shared implementation also used by the single-camera restart
             # endpoint (routers/cameras.py) — reused, not duplicated.
-            supervisor.restart(camera_id, str(camera.source_type))
+            await supervisor.restart(camera_id, str(camera.source_type))
             detail = "Restarted"
         elif action == "disconnect":
             if camera.source_type == "sentinel_grid":

@@ -128,10 +128,39 @@ def _scaletest_cameras(db_session):
     )
 
 
+def _clear_scaletest_cameras(db_session) -> None:
+    """Remove this module's scaletest cameras AND their dependents.
+
+    Three tests in this module sync the same 30 catalogue records, so
+    whichever runs FIRST creates them — which made the idempotency test's
+    `created == 30` assertion depend on test ordering. Invisible under
+    alphabetical collection, caught immediately by the --random-order gate.
+    Dependents must go first: test_upsert_marks_removed_camera_stale...
+    deliberately attaches a real Detection to scaletest15, and foreign keys
+    are now enforced (app/db.py), so deleting the cameras alone fails.
+    """
+    camera_ids = [
+        c.id for c in db_session.query(models.Camera).filter(
+            models.Camera.external_catalog_id.like("grid:scaletest%")
+        ).all()
+    ]
+    if not camera_ids:
+        return
+    db_session.query(models.Detection).filter(
+        models.Detection.camera_id.in_(camera_ids)
+    ).delete(synchronize_session=False)
+    db_session.query(models.Camera).filter(
+        models.Camera.id.in_(camera_ids)
+    ).delete(synchronize_session=False)
+    db_session.commit()
+
+
 def test_upsert_handles_full_30_camera_catalogue_idempotently(db_session):
     """The actual scale this task cares about: 30 catalogue cameras -> 30 database
     cameras, and re-running discovery never duplicates or drops any of them."""
     records = _thirty_catalogue_records()
+    # Precondition established, not assumed — see _clear_scaletest_cameras.
+    _clear_scaletest_cameras(db_session)
 
     summary1 = upsert_grid_cameras(db_session, records)
     assert summary1["created"] == 30

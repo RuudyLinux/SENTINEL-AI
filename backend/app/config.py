@@ -69,6 +69,30 @@ class Settings(BaseSettings):
     # correlation record if it looks like a plate AND clears this confidence.
     plate_min_confidence: float = 0.35
 
+    # Confidence-aware intelligence (V2 gap fix): a watchlist match on a plate
+    # read BELOW this floor must not carry the same alert severity as one read
+    # confidently. The match still fires — a real watchlist hit is never
+    # silenced for being uncertain — but is capped at HIGH instead of
+    # auto-CRITICAL, and the alert says so explicitly, so an operator sees
+    # "watchlist match, needs confirmation" rather than treating a 48%-
+    # confidence read as equivalent evidence to a 94%-confidence one. Set
+    # above plate_min_confidence (the gate for recording a plate at all) and
+    # below plate_stable_confidence (temporal fusion's own "trust this"
+    # threshold) — matching that same read is exactly the case this floor is
+    # for: it passed the gate, but fusion has not corroborated it yet.
+    watchlist_high_confidence_floor: float = 0.60
+
+    # Human-in-the-loop ANPR review (10/10 roadmap P7): a Plate sighting read
+    # below this confidence is stored (already true — the quality gate above
+    # is the only thing that discards a read) AND flagged `pending_review` so
+    # an operator sees it in the review queue rather than the system silently
+    # treating an uncertain read as settled intelligence. Same value as
+    # `watchlist_high_confidence_floor` by design — both express "this is the
+    # confidence level at which this platform trusts a read without a human"
+    # — kept as a separate setting because the review floor governs EVERY
+    # plate, not only ones that also happen to match a watchlist.
+    plate_review_confidence_floor: float = 0.60
+
     # --- V2 plate pipeline (plate localization + per-track confidence voting) ---
     # Master switch. False restores the exact pre-V2 behavior: whole vehicle
     # crop -> OCR -> one Plate row per passing frame. Kept as a real escape
@@ -224,6 +248,20 @@ class Settings(BaseSettings):
     # re-measure before lowering it for a higher concurrency target.
     sentinel_grid_stagger_seconds: float = 3.0
 
+    # Per-endpoint concurrency cap for POST /api/cameras/test-connection
+    # (final deep-debug pass, workstream C1). Each probe occupies a thread
+    # from the SHARED asyncio `to_thread` executor for up to
+    # `source_open_timeout_seconds` (20s) — measured: 8 sequential probes of
+    # unreachable/loopback/malformed URIs each took exactly 20.0s. The
+    # default executor is bounded (min(32, cpu_count+4) workers), and the
+    # SAME pool runs every camera worker's frame reads, inference offloads
+    # and DB commits — so an authorized-but-lower-trust operator firing a
+    # burst of probes could starve unrelated live camera processing for the
+    # full timeout. This caps how many probes may be in flight at once;
+    # beyond it the endpoint fails fast with 429 rather than queueing (a
+    # queued probe still holds a request and still ends up waiting 20s).
+    camera_test_connection_max_concurrent: int = 3
+
     # RTSP transport (Phase 3 P0). The official sandbox requires TCP
     # ("UDP fails across NAT/firewalls") — centralized here as a safe,
     # overridable switch rather than hardcoded in the adapter.
@@ -250,6 +288,18 @@ class Settings(BaseSettings):
     clip_pre_event_seconds: float = 5.0
     clip_post_event_seconds: float = 10.0
     clip_fps: float = 10.0  # nominal playback rate; source frames may be variable-interval
+
+    # --- Privacy / governance controls (10/10 roadmap P13) ---
+    # How long evidence is retained before it becomes eligible for purge via
+    # POST /api/governance/purge-expired. NOT a legal-compliance claim: this
+    # platform has no way to know which retention period applies to a given
+    # deployment's jurisdiction, agency policy, or an active investigation —
+    # an operator/administrator must set this according to the applicable
+    # law/policy for their deployment. See docs/PRIVACY_GOVERNANCE.md. None
+    # (the default) means "no automatic expiry" — evidence is retained
+    # indefinitely until an administrator explicitly configures a period,
+    # never auto-deleted based on an assumed default.
+    evidence_retention_days: int | None = None
 
     model_config = SettingsConfigDict(env_file=".env")
 

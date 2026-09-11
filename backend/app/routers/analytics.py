@@ -80,3 +80,52 @@ def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(ge
         "non_empty_plate_reads": plausible_plate_reads,
         "note": "Precision/recall/exact-match rate require a labeled test set; not computed here. See README.",
     }
+
+
+# Below this many operator-reviewed alerts, a computed rate is noise wearing
+# the costume of a statistic — a single dismissed alert would print "100%
+# false-positive rate". Configurable rather than hardcoded so an operator can
+# raise it for a higher-confidence figure once real usage accumulates.
+MIN_FEEDBACK_SAMPLE_SIZE = 20
+
+
+@router.get("/alert-precision")
+def alert_precision(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Real alert-quality metrics from operator feedback (10/10 roadmap P6).
+
+    Computed ONLY from `Alert.feedback` — the explicit operator judgement
+    (see routers/alerts.py::submit_feedback) — never inferred from `status`,
+    which tracks workflow, not accuracy. Below MIN_FEEDBACK_SAMPLE_SIZE this
+    reports `insufficient_sample` rather than a rate that would misrepresent
+    a handful of reviews as a validated precision figure.
+    """
+    total_alerts = db.query(models.Alert).count()
+    confirmed = db.query(models.Alert).filter(models.Alert.feedback == "confirmed").count()
+    false_positive = db.query(models.Alert).filter(models.Alert.feedback == "false_positive").count()
+    needs_review = db.query(models.Alert).filter(models.Alert.feedback == "needs_review").count()
+    reviewed = confirmed + false_positive + needs_review
+    dismissed = db.query(models.Alert).filter(models.Alert.status == "dismissed").count()
+
+    result = {
+        "total_alerts": total_alerts,
+        "reviewed_alerts": reviewed,
+        "confirmed": confirmed,
+        "false_positive": false_positive,
+        "needs_review": needs_review,
+        "dismissed_status": dismissed,
+        "min_sample_size": MIN_FEEDBACK_SAMPLE_SIZE,
+        "sample_sufficient": reviewed >= MIN_FEEDBACK_SAMPLE_SIZE,
+    }
+    if reviewed < MIN_FEEDBACK_SAMPLE_SIZE:
+        result["precision"] = None
+        result["false_positive_rate"] = None
+        result["note"] = (
+            f"insufficient_sample: only {reviewed} alert(s) have operator feedback "
+            f"(need {MIN_FEEDBACK_SAMPLE_SIZE}) — no rate is reported to avoid a "
+            "misleading figure from a handful of reviews."
+        )
+    else:
+        result["precision"] = round(confirmed / reviewed, 4)
+        result["false_positive_rate"] = round(false_positive / reviewed, 4)
+        result["note"] = f"Computed from {reviewed} operator-reviewed alert(s)."
+    return result
