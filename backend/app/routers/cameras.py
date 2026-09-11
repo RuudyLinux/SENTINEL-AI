@@ -12,6 +12,7 @@ from ..config import settings
 from ..audit import log_action
 from ..pipeline.worker import start_worker, stop_worker, RUNNING, CAMERA_STATS
 from ..pipeline.source import CameraSource
+from ..pipeline.egress_policy import blocked_reason
 from ..pipeline.catalog import fetch_catalog, upsert_from_catalog, CatalogError
 from ..pipeline.sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGridError
 from ..pipeline import supervisor
@@ -242,6 +243,13 @@ async def test_connection(
     inherent to onboarding a camera; requiring the same role as camera creation
     puts it behind the same trust boundary as the action it precedes.
     """
+    # C3: refuse an internal target before spending a probe slot on it. Off by
+    # default — see pipeline/egress_policy.py for why, and for what it does
+    # not defend against (DNS rebinding).
+    refusal = blocked_reason(source_type, source_uri)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
+
     # C1: fail fast instead of queueing when the probe budget is already
     # spent. A queued probe would still occupy a request AND still wait out
     # the full open timeout behind the ones ahead of it, so refusing is the
@@ -297,6 +305,12 @@ async def create_camera(
     # calls asyncio.create_task, which needs a running loop in this thread.
     if db.query(models.Camera).filter(models.Camera.camera_code == payload.camera_code).first():
         raise HTTPException(status_code=400, detail="camera_code already exists")
+    # C3: applied here too, not only to test-connection. A registered camera's
+    # stream is opened by its worker moments later, so gating only the probe
+    # would leave the same reach available by simply skipping the probe.
+    refusal = blocked_reason(payload.source_type, payload.source_uri)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
     camera = models.Camera(**payload.model_dump())
     db.add(camera)
     db.commit()

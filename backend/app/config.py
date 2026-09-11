@@ -262,6 +262,20 @@ class Settings(BaseSettings):
     # queued probe still holds a request and still ends up waiting 20s).
     camera_test_connection_max_concurrent: int = 3
 
+    # Optional egress policy for operator-supplied camera sources (workstream
+    # C3, see pipeline/egress_policy.py). When True, a source whose host
+    # resolves to a loopback, link-local, private, reserved, multicast or
+    # unspecified address is refused instead of opened.
+    #
+    # Default False on purpose, and this is NOT timidity: a great many real
+    # deployments run their cameras on exactly the private ranges this blocks
+    # — a police camera LAN is not the public internet — so defaulting it on
+    # would break working installations to defend against a user who is
+    # already authorized (the endpoint requires Administrator or Control Room
+    # Operator). Turn it on for a hardened deployment where the backend must
+    # never be able to reach internal infrastructure.
+    camera_source_block_private_networks: bool = False
+
     # RTSP transport (Phase 3 P0). The official sandbox requires TCP
     # ("UDP fails across NAT/firewalls") — centralized here as a safe,
     # overridable switch rather than hardcoded in the adapter.

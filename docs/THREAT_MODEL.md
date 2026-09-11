@@ -12,7 +12,7 @@ tests/test_sentinel_grid.py -q`).
 
 | Threat | Control | Test | Result |
 |---|---|---|---|
-| **Camera SSRF** — an operator-supplied camera source URI used to probe/reach internal hosts the backend can see but the caller cannot | `POST /api/cameras/test-connection` requires `Administrator`/`Control Room Operator` (`app/routers/cameras.py:148-149`), closing the previously-unauthenticated probe; bounded open timeout (`settings.source_open_timeout_seconds`) prevents it tying up a worker indefinitely. **Honest limit**: this is a role-gated probe, not a private-IP/hostname blocklist — an authorized operator can still point it at an internal host, which is accepted as inherent to onboarding a real camera by a trusted operator. | `tests/test_route_authorization.py::test_test_connection_rejects_an_anonymous_caller`, `::test_test_connection_rejects_a_role_that_may_not_manage_cameras` | PASS |
+| **Camera SSRF** — an operator-supplied camera source URI used to probe/reach internal hosts the backend can see but the caller cannot | `POST /api/cameras/test-connection` requires `Administrator`/`Control Room Operator` (`app/routers/cameras.py:148-149`), closing the previously-unauthenticated probe; bounded open timeout (`settings.source_open_timeout_seconds`) prevents it tying up a worker indefinitely. An OPT-IN egress policy (`settings.camera_source_block_private_networks`, `app/pipeline/egress_policy.py`) refuses sources resolving to loopback/link-local/private/reserved addresses; it is off by default because many real deployments run cameras on exactly those ranges. **Measured**: active probing of loopback, `0.0.0.0`, link-local, IPv6 loopback, `file://` and malformed URIs returned an identical bounded failure after exactly the configured timeout, so the response discloses nothing about what is listening. **Honest limit**: with the policy off, an authorized operator can still reach an internal host, and even with it on, DNS rebinding is not prevented (see the gaps section). | `tests/test_route_authorization.py::test_test_connection_rejects_an_anonymous_caller`, `::test_test_connection_rejects_a_role_that_may_not_manage_cameras` | PASS |
 | **Camera credential theft** — Sentinel Grid or RTSP credentials leaking via API response, logs, or a stored URL | `sentinel_grid_email`/`sentinel_grid_password` are `.env`-only, never hardcoded, and `CameraOut` (`app/schemas.py`) deliberately omits `source_uri` (which may embed RTSP credentials) from every API response — see the field's own comment in `schemas.py`. | `tests/test_sentinel_grid.py`, `tests/test_supervisor.py` | PASS |
 | **Unauthorized streams** — viewing a live camera feed without authorization | `GET /api/streams/{camera_id}/token` requires a valid JWT (`get_current_user`) and issues a short-lived, resource-scoped token (`stream_token_ttl_seconds`) via `create_resource_token` (`app/routers/streams.py:16-23`) rather than an open stream URL. | `tests/test_ws_auth.py` (same resource-token mechanism as evidence/WS) | PASS |
 | **Evidence tampering** — an evidence file altered after capture but reported as intact | Capture-time SHA-256 (`app/evidence_hash.py`), compared (never re-baselined silently) on `POST /api/evidence/{id}/verify` (`app/routers/evidence.py`) — reports `verified`/`tampered`/`unverifiable`/`no_baseline` honestly; the original digest is never overwritten by a tamper finding. | `tests/test_evidence_integrity.py` (6 cases: unmodified/modified/no-overwrite/no-baseline/missing-file/audited-as-failure) | PASS |
@@ -26,13 +26,17 @@ tests/test_sentinel_grid.py -q`).
 
 ## Threats explicitly NOT covered here (roadmap gaps, not silent omissions)
 
-- **Camera SSRF beyond role-gating** — no private-IP/hostname blocklist. If a
-  deployment must prevent even an authorized operator from probing internal
-  infrastructure, that needs an additional network-layer control (e.g.
-  egress firewalling from the backend host), not just an application check.
-- **Rate limiting on authentication** (`POST /api/auth/login`) — no explicit
-  brute-force lockout/backoff was found in this audit; a real deployment
-  behind a reverse proxy would typically add this at that layer.
+- **DNS rebinding against the camera egress policy.** An opt-in private-range
+  blocklist now exists (`settings.camera_source_block_private_networks`,
+  `app/pipeline/egress_policy.py`), but it resolves the host at validation
+  time while FFmpeg resolves again at connect time. A name answering publicly
+  then privately defeats it. Closing that needs connect-time address pinning,
+  which OpenCV's capture API exposes no hook for — so host-level egress
+  firewalling remains the real control.
+- **The egress policy is off by default**, because many real deployments run
+  cameras on exactly the private ranges it blocks. A deployment that needs it
+  must enable it; left off, camera SSRF remains role-gated only (which active
+  probing showed leaks no scan information — see the SSRF row above).
 - **Multi-tenant isolation** — this platform assumes one deployment serves
   one agency/tenant; there is no tenant-boundary enforcement to audit.
 
