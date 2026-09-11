@@ -11,8 +11,9 @@ from ..audit import log_action
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # In-memory login rate limiter (Phase 11 security baseline) — a first layer
-# against credential brute-forcing, keyed by username (the field an attacker
-# actually varies against is the password, not the source IP). Single-process,
+# against credential brute-forcing, keyed by (username, source IP): see
+# `_limiter_key` for why username alone made targeted account LOCKOUT a
+# credential-free availability attack, and what the pair costs. Single-process,
 # not distributed — documented limitation, not claimed as a full solution.
 # Sliding window: MAX_ATTEMPTS failures within WINDOW_SECONDS locks out further
 # attempts for that username until the window rolls forward; a success clears it.
@@ -44,8 +45,28 @@ _LOGIN_MAX_TRACKED_USERNAMES = 1024
 _failed_attempts: dict[str, list[float]] = {}
 
 
-def _limiter_key(username: str) -> str:
-    return (username or "")[:_LOGIN_KEY_MAX_CHARS]
+def _limiter_key(username: str, ip: str = "") -> str:
+    """Scope the counter to (username, source IP), not username alone.
+
+    Username-only keying made account LOCKOUT trivially reachable: five wrong
+    passwords against a known account — "admin" is documented in this repo's
+    own README — denied that operator login for the whole window, from
+    anywhere. For a control room that is an availability attack requiring no
+    credential at all, and it is worse than the brute-force it defends
+    against, because a control-room operator locked out mid-incident is a
+    real operational failure.
+
+    Scoping by pair means an attacker hammering `admin` from their own
+    address cannot lock out the real admin logging in from theirs.
+
+    The trade-off, stated rather than hidden: an attacker controlling many
+    source addresses now gets `_LOGIN_MAX_ATTEMPTS` tries per address instead
+    of five in total. That is the accepted cost of not being remotely
+    lockout-able, and this limiter was never the only defence — passwords are
+    bcrypt-hashed, every failure is audited, and a real deployment fronts this
+    with a reverse proxy that can rate-limit by address at the edge.
+    """
+    return f"{(username or '')[:_LOGIN_KEY_MAX_CHARS]}|{(ip or '')[:64]}"
 
 
 def _prune_expired(now: float) -> None:
@@ -77,9 +98,9 @@ def _enforce_table_cap(now: float) -> None:
         _failed_attempts.pop(key, None)
 
 
-def _rate_limited(username: str) -> bool:
+def _rate_limited(username: str, ip: str = "") -> bool:
     now = time.monotonic()
-    key = _limiter_key(username)
+    key = _limiter_key(username, ip)
     attempts = [t for t in _failed_attempts.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
     if attempts:
         _failed_attempts[key] = attempts
@@ -91,25 +112,26 @@ def _rate_limited(username: str) -> bool:
     return len(attempts) >= _LOGIN_MAX_ATTEMPTS
 
 
-def _record_failed_attempt(username: str) -> None:
+def _record_failed_attempt(username: str, ip: str = "") -> None:
     now = time.monotonic()
-    _failed_attempts.setdefault(_limiter_key(username), []).append(now)
+    _failed_attempts.setdefault(_limiter_key(username, ip), []).append(now)
     _prune_expired(now)
     _enforce_table_cap(now)
 
 
 @router.post("/login", response_model=schemas.TokenResponse)
 def login(payload: schemas.LoginRequest, request: Request, db: Session = Depends(get_db)):
-    if _rate_limited(payload.username):
-        log_action(db, None, "login_rate_limited", resource=payload.username, result="FAILURE", ip=request.client.host if request.client else "")
+    client_ip = request.client.host if request.client else ""
+    if _rate_limited(payload.username, client_ip):
+        log_action(db, None, "login_rate_limited", resource=payload.username, result="FAILURE", ip=client_ip)
         raise HTTPException(status_code=429, detail="Too many failed login attempts — try again in a minute")
 
     user = db.query(models.User).filter(models.User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.password_hash):
-        _record_failed_attempt(payload.username)
-        log_action(db, None, "login_failed", resource=payload.username, result="FAILURE", ip=request.client.host if request.client else "")
+        _record_failed_attempt(payload.username, client_ip)
+        log_action(db, None, "login_failed", resource=payload.username, result="FAILURE", ip=client_ip)
         raise HTTPException(status_code=401, detail="Incorrect Police ID or password")
-    _failed_attempts.pop(_limiter_key(payload.username), None)
+    _failed_attempts.pop(_limiter_key(payload.username, client_ip), None)
     if not user.active:
         raise HTTPException(status_code=403, detail="Account disabled")
     token = create_access_token(user)

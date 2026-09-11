@@ -51,6 +51,43 @@ class TestBoundedMemory:
         )
 
 
+class TestTargetedLockoutIsNotPossible:
+    """The limiter is scoped to (username, source IP). Username-only keying
+    made account lockout trivially reachable: five wrong passwords against a
+    known account — `admin` is documented in this repo's own README — denied
+    that operator login for the whole window, from anywhere, with no
+    credential required. For a control room that is an availability attack,
+    and worse than the brute force it defends against."""
+
+    def test_an_attacker_cannot_lock_out_an_account_for_a_different_source(self):
+        """Exercised at the limiter directly: TestClient reports one fixed
+        client host for every request, so distinct source addresses cannot be
+        simulated over HTTP."""
+        auth_router._failed_attempts.clear()
+        for _ in range(auth_router._LOGIN_MAX_ATTEMPTS + 2):
+            auth_router._record_failed_attempt("admin", ip="203.0.113.9")
+
+        assert auth_router._rate_limited("admin", ip="203.0.113.9") is True
+        assert auth_router._rate_limited("admin", ip="198.51.100.4") is False, (
+            "a different source address was locked out of the same account — "
+            "targeted account lockout is still possible"
+        )
+
+    def test_the_attacking_source_itself_is_still_limited(self):
+        """Scoping must not remove the protection: the source doing the
+        guessing still gets cut off for that account."""
+        auth_router._failed_attempts.clear()
+        for _ in range(auth_router._LOGIN_MAX_ATTEMPTS):
+            auth_router._record_failed_attempt("admin", ip="203.0.113.9")
+        assert auth_router._rate_limited("admin", ip="203.0.113.9") is True
+
+    def test_one_source_guessing_one_account_does_not_limit_its_other_accounts(self):
+        auth_router._failed_attempts.clear()
+        for _ in range(auth_router._LOGIN_MAX_ATTEMPTS):
+            auth_router._record_failed_attempt("admin", ip="203.0.113.9")
+        assert auth_router._rate_limited("operator1", ip="203.0.113.9") is False
+
+
 class TestRateLimitingStillWorks:
     """The bounds above must not weaken the actual brute-force protection."""
 
