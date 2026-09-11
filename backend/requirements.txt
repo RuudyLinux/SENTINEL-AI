@@ -29,3 +29,5 @@ psycopg[binary]
 # passing on collection-order luck. Test-only; imports nothing at app runtime.
 # See the "randomized order" step in .github/workflows/python-package.yml.
 pytest-random-order
+# Coverage measurement with a CI floor (see python-package.yml). Test-only.
+pytest-cov

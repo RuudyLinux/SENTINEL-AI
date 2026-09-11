@@ -65,7 +65,31 @@ jobs:
         # time. alembic's own steps below were unaffected because
         # alembic.ini sets `prepend_sys_path = .`, which is alembic-specific
         # and has no pytest equivalent for a bare invocation.
-        run: python -m pytest tests -q
+        #
+        # Coverage is measured on this run rather than in a third full pass,
+        # and gated at the MEASURED level (81% total, 4783 statements)
+        # floored to 80. The floor is a ratchet against regression, not an
+        # aspiration: a floor above what the suite actually achieves is just
+        # a red build, and a number nobody measured would be worse than none.
+        #
+        # Read it per-module, not in aggregate. The code the platform's claims
+        # rest on is the well-covered part (risk 99%, plate_tracker 97%, ws
+        # 96%, auth 95%, egress_policy 95%, security 93%); the thin areas are
+        # read-mostly routers (search 24%, watchlists 39%, rules 42%,
+        # incidents 44%). A higher GLOBAL floor would not distinguish the two.
+        #
+        # Worth knowing before anyone removes `--cov` again: enabling it here
+        # initially looked like it BROKE the suite — runs aborted around 25%
+        # with `Assertion fctx->async_lock failed at
+        # libavcodec/pthread_frame.c:178` (pytest exit 3, no traceback), one
+        # run in four completing. Coverage was not the cause. A test had
+        # registered a real `video_file` camera, and `create_camera` starts a
+        # worker for it, so a live FFmpeg decode was left running with no
+        # teardown — precisely the hazard tests/conftest.py's `client` fixture
+        # comment documents. Coverage only changed the timing enough to hit it
+        # almost every run. With that test switched to `mock_vms`, three
+        # consecutive coverage runs pass clean.
+        run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=80
 
       # Inter-test coupling gate (workstream E2). The suite shares one on-disk
       # SQLite database and several module-global caches, so a test that

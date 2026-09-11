@@ -135,8 +135,23 @@ class TestEnforcedAtTheEndpoints:
         assert db_session.query(models.Camera).filter(models.Camera.camera_code == code).count() == 0
 
     def test_a_non_network_camera_is_unaffected_by_the_policy(self, client, admin_token, db_session, policy_on):
-        """A video_file camera reaches no network, so it must register
-        normally even with the policy at its strictest."""
+        """A camera that reaches no network must register normally even with
+        the policy at its strictest.
+
+        Uses `mock_vms`, NOT `video_file`. The first version of this test
+        registered a real video_file camera pointing at the bundled clip, and
+        `create_camera` starts a worker for it — a live FFmpeg decode with no
+        teardown. That reproducibly aborted the whole test process a moment
+        later with
+
+            Assertion fctx->async_lock failed at libavcodec/pthread_frame.c:178
+
+        (pytest exit 3, no traceback, ~1 run in 3), which is exactly the
+        hazard tests/conftest.py's `client` fixture comment documents: API
+        route tests have no business starting real camera AI workers.
+        `mock_vms` is equally non-network, so it proves the same property
+        without decoding anything.
+        """
         import uuid
 
         from app import models
@@ -145,9 +160,8 @@ class TestEnforcedAtTheEndpoints:
         resp = client.post(
             "/api/cameras",
             json={
-                "camera_code": code, "name": "local clip", "source_type": "video_file",
-                "source_uri": "app/demo_assets/car-detection.mp4",
-                "ai_person": False, "ai_vehicle": False, "ai_anpr": False,
+                "camera_code": code, "name": "local source", "source_type": "mock_vms",
+                "source_uri": "", "ai_person": False, "ai_vehicle": False, "ai_anpr": False,
             },
             headers=self._auth(admin_token),
         )
