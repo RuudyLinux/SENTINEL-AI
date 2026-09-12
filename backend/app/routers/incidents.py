@@ -19,8 +19,25 @@ def list_incidents(status: str | None = None, db: Session = Depends(get_db), use
     return q.order_by(models.Incident.created_at.desc()).all()
 
 
+def _require_exists(db: Session, model, value: "str | None", label: str) -> None:
+    """404 for a referenced row that is not there.
+
+    Every one of these columns is a foreign key. Unchecked, an unknown id
+    reached the database and raised an unhandled IntegrityError — a 500
+    carrying a raw "FOREIGN KEY constraint failed" where the caller had simply
+    named something that does not exist. (Before SQLite foreign keys were
+    enforced the same request silently wrote a dangling reference, which is
+    worse: an incident pointing at no camera still renders as an incident.)
+    """
+    if value and not db.query(model).filter(model.id == value).first():
+        raise HTTPException(status_code=404, detail=f"{label} not found")
+
+
 @router.post("", response_model=schemas.IncidentOut)
 def create_incident(payload: schemas.IncidentCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    _require_exists(db, models.Camera, payload.camera_id, "Camera")
+    _require_exists(db, models.Alert, payload.alert_id, "Alert")
+    _require_exists(db, models.Vehicle, payload.vehicle_id, "Vehicle")
     incident = models.Incident(**payload.model_dump())
     db.add(incident)
     db.commit()
@@ -122,7 +139,11 @@ def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: mod
     if inc.alert_id:
         alert = db.query(models.Alert).filter(models.Alert.id == inc.alert_id).first()
         if alert:
-            events.append({"timestamp": alert.timestamp, "label": f"Alert fired: {', '.join(alert.reasons)}"})
+            # `or []`: Alert.reasons is nullable, and joining None raised
+            # "TypeError: can only join an iterable" — a 500 on the timeline of
+            # an otherwise valid incident. The summary endpoint above already
+            # guards the same column this way; this call site did not.
+            events.append({"timestamp": alert.timestamp, "label": f"Alert fired: {', '.join(alert.reasons or [])}"})
     if inc.vehicle_id:
         from ..pipeline.correlate import get_route
         for s in get_route(db, inc.vehicle_id):
@@ -152,6 +173,13 @@ def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depen
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
+    assignee = db.query(models.User).filter(models.User.id == assignee_user_id).first()
+    if not assignee:
+        raise HTTPException(status_code=404, detail="Assignee not found")
+    if not assignee.active:
+        # Assigning to a closed account moves the incident to in_progress with
+        # nobody able to log in and work it — a silently stalled case.
+        raise HTTPException(status_code=400, detail="That account is disabled and cannot be assigned work")
     inc.assigned_to = assignee_user_id
     inc.status = "in_progress"
     inc.updated_at = datetime.utcnow()

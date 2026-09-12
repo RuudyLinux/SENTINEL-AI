@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LoginRequest(BaseModel):
@@ -360,7 +360,11 @@ class IncidentOut(BaseModel):
 
 
 class IncidentNoteCreate(BaseModel):
-    text: str
+    # Bounded: an unvalidated `str` accepted a 2,000,000-character note (200 OK,
+    # measured), which any authenticated user could store repeatedly and which
+    # the incident timeline then has to render. The cap is generous for a real
+    # case note and still refuses a payload that is not one.
+    text: str = Field(min_length=1, max_length=5000)
 
 
 class EvidenceOut(BaseModel):
