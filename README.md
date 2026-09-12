@@ -24,6 +24,21 @@ without a real `POSTGRES_PASSWORD`/`JWT_SECRET` rather than defaulting a police
 datastore to a guessable credential. The backend runs `alembic upgrade head`
 before serving, so the schema is always at head.
 
+**Verification status, stated plainly: the images have NOT been built or run
+in this environment.** Docker Desktop's installer requires an elevation prompt
+that could not be completed here, so nothing below is a claim that
+`docker compose up --build` succeeds — only a real run proves that.
+
+What IS verified, by `backend/tests/test_deployment_contract.py` (16 tests in
+the normal suite), is the contract between these files and the application:
+every file the images COPY exists, every build context exists, the evidence
+and uploads volumes are mounted where `settings.evidence_dir`/`uploads_dir`
+actually write (a mismatch would silently discard captured evidence on the
+next rebuild), every environment key compose sets is one the settings object
+really reads, both healthchecks poll routes that exist, the schema is migrated
+before uvicorn starts, and the secrets have no guessable defaults. That is
+drift protection, not a build.
+
 ### Local development (SQLite, no Docker)
 
 1. **Backend**:
