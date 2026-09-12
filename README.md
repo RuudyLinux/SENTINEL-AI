@@ -438,3 +438,66 @@ architecture changes — see `docs/THREAT_MODEL.md` and
 - **The root `.env` was not gitignored**: only `backend/.env` was. Since `.env.example`
   instructs you to create a root `.env` holding `POSTGRES_PASSWORD` and `JWT_SECRET`, that
   was a direct path to committing production secrets.
+
+### Coverage-driven pass (2026-09-12)
+
+Measuring per-module coverage pointed at the least-tested routers; every one of
+them was hiding a real defect. Each was reproduced before it was fixed, and the
+measurement is quoted with the fix.
+
+- **Search displayed filters it never applied**: `after_hour`, `before_hour` and `entity`
+  were parsed, returned in `parsed_filters`, and rendered to the operator ("Parsed filters:
+  ..."), while every query ignored them — a time-scoped search that is not scoped is worse
+  than one that is absent, because the screen asserts the filter was understood. `after 12am`
+  also parsed to hour 12 (noon), and the raw query was used verbatim as the LIKE pattern, so
+  text and a filter could never match together.
+- **Taking a plate off the watchlist did not take it off**: the alert rule gated on
+  `Vehicle.watchlist_flag`, and nothing recomputed that flag when an entry was deactivated. A
+  cleared plate kept producing CRITICAL alerts — whose own reason text claimed a match to "an
+  active watchlist entry" that no longer existed — and kept having snapshot evidence captured
+  of it. Separately, `valid_until` was stored by the API and never compared to the clock
+  anywhere, so an entry with an end date matched forever.
+- **A live stream outlived the token that authorized it**: `/api/streams/{id}/mjpeg` validated
+  its token once, at connect, then held the response open indefinitely, so
+  `stream_token_ttl_seconds` bounded nothing and disabling an account did not cut its feed.
+  The first version of the fix failed OPEN — `jwt.decode` verifies `exp`, so an expired token
+  cannot be decoded at all and the expiry helper returned `None`, which the generator treated
+  as "no deadline". An unreadable token now falls back to the configured TTL.
+- **Every stream viewer pinned a database connection**: FastAPI holds a `Depends(get_db)`
+  dependency until the response completes, and an MJPEG response is designed not to complete,
+  so each open tile consumed one connection from a pool of 15 while doing nothing but reading
+  JPEG bytes from a dict.
+- **List limits had no ceiling**: measured on a 120-row database, `GET /api/detections`
+  returned 100 by default, all 120 for `limit=-1` (SQLite reads `LIMIT -1` as no limit), and
+  all 120 for `limit=100000000` — the whole detections table in one response for any
+  authenticated user. Incident notes were unbounded too: a 2,000,000-character note returned
+  200.
+- **An administrator could lock out every administrator in one click**: self-disable returned
+  200 and the caller's next request returned 401, and no enable route existed anywhere in the
+  API, so recovery meant editing the database by hand. Correct credentials against a disabled
+  account were also refused silently — the one login event most worth auditing.
+- **Zones and rules accepted configurations that could never fire**: an unknown camera or zone
+  id raised an unhandled `IntegrityError` (a 500 with a raw "FOREIGN KEY constraint failed"),
+  an inverted zone box was stored and listed while matching nothing, `rule_type` was a free
+  string, and deleted zones stayed in the rules page's zone picker — where a rule attached to
+  one silently never fires.
+- **Incident creation, assignment and timeline 500'd on ordinary input**: unknown
+  camera/alert/vehicle ids and unknown assignees hit the same unhandled `IntegrityError`, a
+  disabled account could be assigned work, and `', '.join(alert.reasons)` on a nullable column
+  raised `TypeError: can only join an iterable` — while the summary endpoint in the same file
+  already guarded that exact column.
+- **One malformed row blanked the whole Alert Center**: a single alert with NULL `reasons`
+  made `GET /api/alerts` fail response validation entirely, so the page went empty for every
+  camera rather than for that one line. The per-camera view was also filtered in the browser
+  over rows the server had already truncated to 200, so a camera whose alerts were older than
+  the newest 200 system-wide looked like a camera with no alerts.
+- **The dashboard's hourly chart was SQLite-only**: `/api/analytics/events-by-hour` grouped by
+  `func.strftime(...)`, which SQLAlchemy passes through verbatim. Reproduced against a real
+  PostgreSQL server: `function strftime(unknown, timestamp without time zone) does not exist`
+  — a 500 on the production datastore that every SQLite test passed. Now grouped with
+  `extract`, verified live by `tools/postgres_verify.py` (13/13) and guarded by a test that
+  fails if any app module calls a SQLite-only SQL function again.
+
+Backend coverage moved 81% → 85% across this pass and the CI floor was raised 80 → 84. The
+percentage is the least interesting part: it was useful only as a map of which code had never
+been executed by a test.
