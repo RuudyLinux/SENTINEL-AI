@@ -2,7 +2,7 @@
 per the doc's AI-honesty rule, nothing here is a hard-coded demo number.
 """
 from datetime import datetime, timedelta
-from sqlalchemy import func
+from sqlalchemy import extract, func
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -36,15 +36,40 @@ def overview(db: Session = Depends(get_db), user: models.User = Depends(get_curr
 
 @router.get("/events-by-hour")
 def events_by_hour(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Detections per hour over the last 24 hours.
+
+    Grouped with `extract`, not `strftime`. SQLAlchemy passes an unknown
+    function name straight through to the database, and `strftime` is SQLite's
+    — PostgreSQL, this platform's documented production datastore, has no such
+    function. Verified against a real PostgreSQL server before the fix:
+
+        (psycopg.errors.UndefinedFunction) function strftime(unknown,
+        timestamp without time zone) does not exist
+
+    so the dashboard's 24-hour chart returned 500 in production while passing
+    every test on SQLite — the same dev/prod divergence class as the
+    unenforced SQLite foreign keys. `extract` is translated per dialect by
+    SQLAlchemy, so one query works on both; the label is then formatted in
+    Python rather than in SQL.
+    """
     since = datetime.utcnow() - timedelta(hours=24)
+    parts = (
+        extract("year", models.Detection.timestamp).label("y"),
+        extract("month", models.Detection.timestamp).label("m"),
+        extract("day", models.Detection.timestamp).label("d"),
+        extract("hour", models.Detection.timestamp).label("h"),
+    )
     rows = (
-        db.query(func.strftime("%Y-%m-%d %H:00", models.Detection.timestamp).label("hour"), func.count().label("count"))
+        db.query(*parts, func.count().label("count"))
         .filter(models.Detection.timestamp >= since)
-        .group_by("hour")
-        .order_by("hour")
+        .group_by(*parts)
+        .order_by(*parts)
         .all()
     )
-    return [{"hour": r.hour, "count": r.count} for r in rows]
+    return [
+        {"hour": f"{int(r.y):04d}-{int(r.m):02d}-{int(r.d):02d} {int(r.h):02d}:00", "count": r.count}
+        for r in rows
+    ]
 
 
 @router.get("/alerts-by-type")

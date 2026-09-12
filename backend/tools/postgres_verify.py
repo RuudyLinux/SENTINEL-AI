@@ -130,6 +130,28 @@ def main() -> int:
         fk_rejected = True
     check("foreign keys are enforced (detection -> nonexistent camera rejected)", fk_rejected)
 
+    # --- 4b. analytics queries run on PostgreSQL, not only on SQLite ------
+    # `/api/analytics/events-by-hour` grouped with SQLite's `strftime`, which
+    # SQLAlchemy passes through verbatim, so on PostgreSQL it failed with
+    # "function strftime(unknown, timestamp without time zone) does not
+    # exist" — a 500 on the dashboard's 24-hour chart in production, invisible
+    # to a test suite that runs on SQLite. The real endpoint function is
+    # called here (not a re-written copy of its query) so this check cannot
+    # drift away from what the API actually executes.
+    from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+    from app.routers.analytics import events_by_hour
+
+    _Session = _sessionmaker(bind=engine)
+    _session = _Session()
+    try:
+        events_by_hour(db=_session, user=None)
+        check("analytics events-by-hour executes on PostgreSQL (no SQLite-only SQL)", True)
+    except Exception as exc:
+        check("analytics events-by-hour executes on PostgreSQL (no SQLite-only SQL)", False, repr(exc))
+    finally:
+        _session.close()
+
     # --- 5. BUG-D: the PostgreSQL-only demo-reset failure ------------------
     from sqlalchemy.orm import sessionmaker
 
