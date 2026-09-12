@@ -133,6 +133,12 @@ def login(payload: schemas.LoginRequest, request: Request, db: Session = Depends
         raise HTTPException(status_code=401, detail="Incorrect Police ID or password")
     _failed_attempts.pop(_limiter_key(payload.username, client_ip), None)
     if not user.active:
+        # Audited: correct credentials against a DISABLED account is exactly
+        # the event worth seeing — a revoked operator still holding a working
+        # password, or a credential in use after an account was closed. This
+        # branch previously returned 403 and recorded nothing, so the attempt
+        # left no trace anywhere.
+        log_action(db, None, "login_disabled_account", resource=payload.username, result="FAILURE", ip=client_ip)
         raise HTTPException(status_code=403, detail="Account disabled")
     token = create_access_token(user)
     log_action(db, user, "login", result="SUCCESS", ip=request.client.host if request.client else "")

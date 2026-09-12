@@ -25,13 +25,14 @@ export default function UsersRolesPage() {
     }
   }
 
-  async function disable(id: string) {
+  async function setActive(id: string, active: boolean) {
     setActionError(null);
     try {
-      await api.post(`/api/users/${id}/disable`);
+      await api.post(`/api/users/${id}/${active ? "enable" : "disable"}`);
       reloadUsers();
     } catch (err) {
-      setActionError(err instanceof ApiError ? err.message : "Could not disable user");
+      const fallback = active ? "Could not enable user" : "Could not disable user";
+      setActionError(err instanceof ApiError ? err.message : fallback);
     }
   }
 
@@ -41,7 +42,18 @@ export default function UsersRolesPage() {
     { key: "department", label: "Department" },
     { key: "role", label: "Role" },
     { key: "active", label: "Status", render: (u) => (u.active ? "Active" : "Disabled") },
-    { key: "actions", label: "Actions", render: (u) => u.active && <button onClick={() => disable(u.id)} className="text-xs text-slate-500 hover:text-critical">Disable</button> },
+    // A disabled account can now be restored: the API previously had no
+    // enable route at all, so every disable here was permanent.
+    {
+      key: "actions",
+      label: "Actions",
+      render: (u) =>
+        u.active ? (
+          <button onClick={() => setActive(u.id, false)} className="text-xs text-slate-500 hover:text-critical">Disable</button>
+        ) : (
+          <button onClick={() => setActive(u.id, true)} className="text-xs text-slate-500 hover:text-accent">Enable</button>
+        ),
+    },
   ];
 
   return (
