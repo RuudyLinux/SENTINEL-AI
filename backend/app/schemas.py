@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -308,7 +308,12 @@ class AlertOut(BaseModel):
     status: str
     vehicle_id: Optional[str] = None
     confidence: float
-    reasons: List[str]
+    # Coerced, not merely typed: these columns are nullable JSON, and a single
+    # row with NULL made the WHOLE list endpoint fail response validation
+    # ("Input should be a valid list", input None) — one bad row blanked the
+    # entire Alert Center for every camera, not just its own line. An absent
+    # value means "no reasons recorded", which is exactly an empty list.
+    reasons: List[str] = []
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
@@ -317,6 +322,11 @@ class AlertOut(BaseModel):
     # would assert a decision that was never taken.
     risk_score: int = 0
     risk_factors: List[dict] = []
+
+    @field_validator("reasons", "risk_factors", mode="before")
+    @classmethod
+    def _null_json_is_empty(cls, value):
+        return [] if value is None else value
     # False-positive feedback (10/10 roadmap P6). Null = not yet reviewed.
     feedback: Optional[str] = None
     feedback_reason: Optional[str] = None

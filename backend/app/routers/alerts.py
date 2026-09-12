@@ -20,14 +20,26 @@ _VALID_FEEDBACK = {"confirmed", "false_positive", "needs_review"}
 def list_alerts(
     severity: Optional[str] = None,
     status: Optional[str] = None,
+    camera_id: Optional[str] = None,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
+    """Most recent 200 alerts, narrowed by any combination of the filters.
+
+    `camera_id` is new. The Alert Center offered a per-camera view ("OPEN
+    ALERTS" from the single-camera page) but filtered CLIENT-side over
+    whatever this endpoint had already truncated to 200 — so a camera whose
+    alerts were not among the 200 most recent system-wide showed an empty
+    list, indistinguishable from a camera with no alerts at all. Filtering
+    before the limit is the only way that view can be correct.
+    """
     q = db.query(models.Alert)
     if severity:
         q = q.filter(models.Alert.severity == severity.upper())
     if status:
         q = q.filter(models.Alert.status == status)
+    if camera_id:
+        q = q.filter(models.Alert.camera_id == camera_id)
     return q.order_by(models.Alert.timestamp.desc()).limit(200).all()
 
 
