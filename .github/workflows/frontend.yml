@@ -29,6 +29,12 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      # Unit tests. The e2e job below needs a full running stack and cannot
+      # provoke a 503 or a dropped connection; these can, which is what makes
+      # them worth having for lib/api.ts's retry rules.
+      - name: Unit tests
+        run: npm test
+
       - name: Production build
         run: npm run build
 
