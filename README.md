@@ -285,27 +285,31 @@ architecture changes — see `docs/THREAT_MODEL.md` and
   cross-camera route, evidence integrity, related alerts — surfaced as a new
   panel on the incident Overview tab (`routers/incidents.py`,
   `incidents/[incidentId]/page.tsx`).
-- **Camera capacity benchmark** (`tools/camera_bench.py`): drives real
-  camera workers (real YOLO+ByteTrack+EasyOCR, not a stub) against the
-  bundled demo video at configurable concurrency and reports real FPS/
-  inference-latency/CPU/RSS. Measured on the development machine this pass
-  ran on: 1/3/5 concurrent `video_file` cameras sustained ~7.5-8.4 FPS
-  each with inference cost dropping as OS/model caches warmed; CPU plateaued
-  near saturation by 3 concurrent cameras on that host. **This is a
-  single-host, single-clip measurement — not a claim about any other machine,
-  real RTSP streams, or any specific camera count in production.** Re-run it
-  on target hardware before sizing a real deployment.
+- **Camera capacity benchmark** (`tools/camera_bench.py`): drives real camera
+  workers through the full pipeline (YOLOv8 + ByteTrack + plate localization +
+  EasyOCR) at several camera counts and reports measured FPS, inference
+  latency, CPU and RSS — never a number read off a config value.
 
-  **Correction (2026-09-11): those numbers are weaker evidence than the above
-  implies.** The bundled clip it drives was measured to be **320x240, 10 fps,
-  40 frames (4 seconds), 15 KB — and it contains no vehicles at all** (raw
-  YOLOv8n at conf>=0.05 finds only a "tv"). Decoding that is nothing like
-  decoding a 1080p RTSP stream, and no ANPR work is triggered because nothing
-  is ever detected, so the measured cost is close to a floor rather than a
-  realistic load. Treat the figures as "the pipeline runs N workers without
-  falling over", NOT as a capacity envelope. A real envelope needs real
-  1080p footage with actual vehicles in it — see `docs/ANPR_ACCURACY.md`
-  ("What is still needed") for what to supply.
+  **Which clip you drive it with changes the answer completely**, so `--video`
+  is now explicit. The bundled demo clip is 320x240, 4 seconds, and contains no
+  vehicles at all (raw YOLO sees only a "tv" in it), so it measures
+  decode-and-inference overhead on an empty frame — a floor, not a workload.
+  Measured on one machine (16 cores / 16.9 GB, 25s per stage) against that clip
+  and against a 1080p clip built from real vehicle photographs:
+
+  | cameras | bundled 320x240, no vehicles | 1080p, real vehicles + plates |
+  |---|---|---|
+  | 1 | 8.27 fps, 148 ms inference, 416 MB | **5.64 fps**, 436 ms (p95 1250 ms), 1197 MB |
+  | 3 | 8.34 fps, 40 ms, 590 MB | **2.15 fps** (p95-low 0.59), 1534 MB |
+  | 5 | 7.85 fps, 65 ms, 771 MB | **2.28 fps** (p95-low 0.44), 2012 MB |
+
+  On realistic content this machine sustains roughly **2 fps per camera at
+  three to five cameras**, with the slowest 5% of intervals exceeding two
+  seconds between processed frames, ~870-890% CPU (about 9 of 16 cores) and
+  2 GB RSS at five cameras. No camera went silent at any stage.
+
+  Read as "what this hardware does on this content", NOT as a capacity
+  envelope. A real envelope needs real
 - **Disaster recovery test** (`tests/test_disaster_recovery.py`): seeds a
   real incident/evidence/audit-chain, backs up the SQLite file via SQLite's
   own online-backup API, destroys the working copy, restores, and proves

@@ -143,6 +143,38 @@ reading top row then bottom row, and it also swallows the "IND" country marker.
 Fixing it means grouping fragments into row bands by y, then ordering by x
 within each band. Not yet fixed — recorded here with its reproduction.
 
+## Engine-level levers that were tried and REJECTED (2026-09-12)
+
+Re-measured the baseline first (same corpora, same day): context corpus
+`exact 0.24 / CER 0.3896 / plausible 0.64`, tight corpus `exact 0.28 / CER
+0.3593`. Three standard OCR levers were then measured against it, running the
+SHIPPING configuration and changing only how EasyOCR is invoked. **None is
+adopted**, and the numbers are recorded so nobody spends the afternoon
+re-discovering them.
+
+| Lever | context corpus | tight corpus | Verdict |
+|---|---|---|---|
+| Character allowlist (`A-Z0-9`) | exact 0.24 (=), CER 0.3723 (**better**), plausible 0.68 (better) | exact 0.28 (=), CER 0.3766 (**worse**) | **Rejected** — helps one corpus, hurts the other, moves exact match on neither. Adopting it would mean picking the corpus that flatters it. |
+| `decoder="beamsearch"` | exact 0.24 (=), CER 0.3939 (worse) | exact 0.28 (=), CER 0.3593 (=) | **Rejected** — no gain, and it emits `RuntimeWarning: overflow encountered in scalar add` from easyocr's beam search. |
+| Multi-scale reading (1x/2x/3x, best kept by the pipeline's own `better_read`) | exact 0.24 (=), CER 0.3853 (0.004 better) | not run after the context result | **Rejected** — 0.004 CER for +10% to +45% time is noise at n=25. |
+
+At n=25 one sample is 4 percentage points of exact match, so a CER move of
+±0.017 is under half a character per plate. Every one of these is inside that
+band.
+
+**What this means.** Exact match does not move because the remaining errors are
+not parsing or invocation problems — they are the recognition model reading the
+wrong glyph:
+
+    GJ01DY6855 -> 16J0406855      KA09C2763 -> RA09C2762
+    KL34A465   -> KL34A651        KL07BX7197 -> KL07BXZ197
+
+The last one is the instructive case: `KL07BXZ197` is itself a *valid* Indian
+registration, so no grammar check can reject it — the plate grammar cannot tell
+that `Z` should have been `7` when both parse. Getting past 0.24 needs a
+recognition model trained on Indian plates, not more post-processing. That is a
+data-and-training task, not a code change, and it is not claimed here.
+
 ## Honest limitations
 
 1. **n=25.** A single sample is 4 percentage points of exact-match. Treat
