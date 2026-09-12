@@ -189,7 +189,23 @@ data-and-training task, not a code change, and it is not claimed here.
 5. **Temporal fusion is not exercised.** These are single stills;
    `plate_tracker`'s multi-frame voting — arguably the pipeline's strongest
    accuracy mechanism — cannot help and is therefore unmeasured.
-6. **No PaddleOCR comparison** (not installed).
+6. **No PaddleOCR comparison.** Attempted on 2026-09-12 and abandoned for a
+   real environment conflict, not for lack of trying. Installing
+   `paddlepaddle` + `paddleocr` downgraded numpy (2.4.6 -> 2.3.5) and broke
+   torch outright:
+
+       OSError: [WinError 127] The specified procedure could not be found.
+       Error loading "...	orch\lib\shm.dll" or one of its dependencies.
+
+   Restoring numpy fixed torch, but `import paddle` then loads its own
+   MKL/OpenMP DLLs which shadow torch's, so torch fails the same way in any
+   process that has imported paddle first — and paddleocr pulls torch in. The
+   two cannot share a process on this machine, and torch is what YOLOv8 and
+   EasyOCR (the shipping pipeline) run on, so paddle was uninstalled and the
+   stack verified back to health: `704 passed`, and the benchmark reproduces
+   `exact 0.24 / CER 0.3896` unchanged. A PaddleOCR comparison needs a
+   separate environment; `tools/anpr_bench.py` already has the configuration
+   and skips it with `skipping 'localized + paddleocr' - engine not installed`.
 
 ## What is still needed for a real figure
 
