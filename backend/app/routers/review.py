@@ -17,7 +17,7 @@ queue, not silently changing what the rest of the platform already believes.
 """
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -31,7 +31,10 @@ router = APIRouter(prefix="/api/review", tags=["review"])
 
 @router.get("/queue", response_model=list[schemas.PlateOut])
 def review_queue(
-    limit: int = 100, db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+    # Bounded for the same reason as detections.py: an unvalidated int reaches
+    # SQLite as `LIMIT -1`, which means no limit at all.
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
 ):
     """Plate sightings genuinely waiting on an operator, newest first."""
     return (

@@ -133,6 +133,38 @@ export async function buildTokenedUrl(tokenPath: string, resourcePath: string): 
   return `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}`;
 }
 
+/** A resource token's expiry, in epoch ms, or null if it cannot be read.
+ *  Read for SCHEDULING only — the backend enforces the same `exp`; a client
+ *  that miscomputes this gets a dropped stream, never extra access. */
+function tokenExpiresAt(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const { exp } = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Like buildTokenedUrl, plus the deadline the caller must refresh by.
+ *  The backend now ends an MJPEG stream when its token expires (a stream
+ *  authorized once used to run indefinitely), so a viewer left open past the
+ *  token TTL needs a fresh URL or the picture simply stops updating. The
+ *  timestamp makes the URL differ, which is what forces <img> to reconnect
+ *  rather than sit on the closed stream. */
+export async function buildTokenedStream(
+  tokenPath: string,
+  resourcePath: string,
+): Promise<{ url: string; expiresAt: number | null }> {
+  const token = await fetchResourceToken(tokenPath);
+  const sep = resourcePath.includes("?") ? "&" : "?";
+  return {
+    url: `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}&reconnect=${Date.now()}`,
+    expiresAt: tokenExpiresAt(token),
+  };
+}
+
 export async function openTokenedResource(tokenPath: string, resourcePath: string): Promise<void> {
   const url = await buildTokenedUrl(tokenPath, resourcePath);
   window.open(url, "_blank");

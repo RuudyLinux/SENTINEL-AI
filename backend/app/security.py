@@ -105,3 +105,19 @@ def get_user_from_resource_token(resource: str, resource_id: str, token: str, db
     if user is None or not user.active:
         raise credentials_exc
     return user
+
+
+def resource_token_expiry(token: str) -> "datetime | None":
+    """When this resource token stops being valid, or None if it cannot be read.
+
+    A token's `exp` is enforced at the moment it is presented, which is enough
+    for a request that returns immediately. A long-lived response — an MJPEG
+    stream held open for hours — is authorized once and then never checked
+    again, so the caller needs the deadline to stop at.
+    """
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    exp = payload.get("exp")
+    return datetime.utcfromtimestamp(exp) if exp else None
