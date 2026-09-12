@@ -60,7 +60,13 @@ class TestEventsByHour:
         db_session.add(camera)
         db_session.flush()
         # Two in one hour, one in another — both inside the 24h window.
-        base = datetime.utcnow() - timedelta(hours=3)
+        #
+        # The minute is PINNED. Written as a bare `utcnow() - 3h`, the second
+        # stamp (+20 minutes) landed in the next hour whenever the current
+        # minute was 40 or more, splitting the pair across two buckets and
+        # failing about a third of runs — a flake in a test whose whole
+        # subject is hour bucketing.
+        base = (datetime.utcnow() - timedelta(hours=3)).replace(minute=5, second=0, microsecond=0)
         stamps = [base, base + timedelta(minutes=20), base + timedelta(hours=1)]
         for when in stamps:
             db_session.add(models.Detection(
