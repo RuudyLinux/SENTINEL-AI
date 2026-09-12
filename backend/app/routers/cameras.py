@@ -508,12 +508,14 @@ def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.Us
       an operator makes that call deliberately (close/export the incident,
       or purge evidence through the audited governance workflow) instead of
       it happening as a side effect.
-    - **SQLite and PostgreSQL disagree.** SQLite does not enforce foreign
-      keys unless `PRAGMA foreign_keys=ON`, which this codebase does not set
-      (see db.py for why it is not simply flipped on), while the
-      Alembic-managed PostgreSQL schema always has. So this request quietly
-      succeeded in dev/demo and would have raised a ForeignKeyViolation →
-      500 in production: a divergence no test running on SQLite could catch.
+    - **SQLite and PostgreSQL disagreed.** SQLite does not enforce foreign
+      keys unless `PRAGMA foreign_keys=ON`. At the time this was found the
+      codebase did not set it, while the Alembic-managed PostgreSQL schema
+      always enforced them — so this request quietly succeeded in dev/demo
+      and would have raised a ForeignKeyViolation → 500 in production, a
+      divergence no test running on SQLite could catch. That half is now
+      closed at the source too: db.py sets `PRAGMA foreign_keys=ON` on every
+      SQLite connection, so both backends enforce the same rules.
       The guard below closes that gap from the application side, giving BOTH
       backends the same, explainable 409 instead of one silently corrupting
       and the other 500-ing.

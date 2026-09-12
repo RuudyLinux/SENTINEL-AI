@@ -65,6 +65,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DEMO_VIDEO = Path(__file__).resolve().parent.parent / "app" / "demo_assets" / "car-detection.mp4"
 
+# Which clip the benchmark drives, overridable with --video.
+#
+# This matters more than it looks. The bundled default is 320x240, 4 seconds,
+# and contains NO vehicles — raw YOLO sees only a "tv" in it — so a run against
+# it measures decode-and-inference overhead on an empty frame, NOT the cost of
+# the work a real camera creates: detection boxes, tracking, plate
+# localization and OCR all scale with what is actually in frame. Numbers from
+# the default clip are a floor, and must be quoted as one.
+BENCH_VIDEO = DEMO_VIDEO
+
 
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
@@ -72,6 +82,43 @@ def _percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, int(round(pct / 100 * (len(ordered) - 1))))
     return ordered[idx]
+
+
+# Children-first, because the rows a benchmark run PRODUCES reference the
+# cameras it created. Deleting only the camera rows raised
+#
+#     sqlalchemy.exc.IntegrityError: (sqlite3.IntegrityError)
+#     FOREIGN KEY constraint failed
+#     [SQL: DELETE FROM cameras WHERE cameras.id IN (?)]
+#
+# and aborted the whole run before any report was written. It never showed up
+# while the benchmark drove the bundled demo clip, because that clip contains
+# no vehicles: with nothing detected there were no detections, plates or
+# alerts to reference the camera. Pointing the tool at a clip with real
+# vehicles — which is the entire point of measuring capacity — made the
+# cleanup fail every time.
+#
+# Same ordering as tests/conftest.py's camera wipe, scoped to this run's
+# cameras so a benchmark never touches data it did not create.
+_BENCH_DEPENDENTS_CHILDREN_FIRST = (
+    "Evidence", "IncidentNote", "IncidentAlert", "Incident",
+    "Alert", "Plate", "Track", "Detection", "Zone", "SelfHealEvent",
+)
+
+
+def _delete_bench_cameras(db, camera_ids: list[str]) -> None:
+    from app import models
+
+    if not camera_ids:
+        return
+    for name in _BENCH_DEPENDENTS_CHILDREN_FIRST:
+        model = getattr(models, name, None)
+        column = getattr(model, "camera_id", None) if model is not None else None
+        if column is None:
+            continue
+        db.query(model).filter(column.in_(camera_ids)).delete(synchronize_session=False)
+    db.query(models.Camera).filter(models.Camera.id.in_(camera_ids)).delete(synchronize_session=False)
+    db.commit()
 
 
 async def _run_stage(db_session_factory, count: int, duration: float, stagger: float) -> dict:
@@ -84,7 +131,7 @@ async def _run_stage(db_session_factory, count: int, duration: float, stagger: f
         for i in range(count):
             cam = models.Camera(
                 camera_code=f"BENCH-{uuid.uuid4().hex[:8]}", name=f"Bench camera {i + 1}",
-                source_type="video_file", source_uri=str(DEMO_VIDEO),
+                source_type="video_file", source_uri=str(BENCH_VIDEO),
                 ai_person=True, ai_vehicle=True, ai_anpr=True,
             )
             db.add(cam)
@@ -128,8 +175,7 @@ async def _run_stage(db_session_factory, count: int, duration: float, stagger: f
                     await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-        db.query(models.Camera).filter(models.Camera.id.in_(camera_ids)).delete(synchronize_session=False)
-        db.commit()
+        _delete_bench_cameras(db, camera_ids)
         db.close()
 
     fps_values, inference_ms_values, read_ms_values = [], [], []
@@ -215,7 +261,19 @@ def main() -> int:
     parser.add_argument("--stagger", type=float, default=1.0, help="seconds between starting each camera in a stage")
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--md", type=Path, default=None)
+    parser.add_argument(
+        "--video", type=Path, default=None,
+        help="clip to drive the cameras with (default: the bundled demo clip, which contains no vehicles "
+             "and therefore measures a FLOOR, not a realistic load)",
+    )
     args = parser.parse_args()
+    if args.video is not None:
+        if not args.video.exists():
+            print(f"video not found: {args.video}", file=sys.stderr)
+            return 2
+        global BENCH_VIDEO
+        BENCH_VIDEO = args.video
+    print(f"driving cameras with: {BENCH_VIDEO}")
 
     stages = [int(s.strip()) for s in args.stages.split(",") if s.strip()]
     results = asyncio.run(main_async(stages, args.duration, args.stagger))
