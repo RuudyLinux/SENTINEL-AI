@@ -67,16 +67,26 @@ jobs:
         # and has no pytest equivalent for a bare invocation.
         #
         # Coverage is measured on this run rather than in a third full pass,
-        # and gated at the MEASURED level (81% total, 4783 statements)
-        # floored to 80. The floor is a ratchet against regression, not an
+        # and gated at the MEASURED level (85% total, 4904 statements)
+        # floored to 84. The floor is a ratchet against regression, not an
         # aspiration: a floor above what the suite actually achieves is just
         # a red build, and a number nobody measured would be worse than none.
         #
-        # Read it per-module, not in aggregate. The code the platform's claims
-        # rest on is the well-covered part (risk 99%, plate_tracker 97%, ws
-        # 96%, auth 95%, egress_policy 95%, security 93%); the thin areas are
-        # read-mostly routers (search 24%, watchlists 39%, rules 42%,
-        # incidents 44%). A higher GLOBAL floor would not distinguish the two.
+        # Read it per-module, not in aggregate. The floor moved 80 -> 84 after
+        # the thin routers were tested, and that testing was worth far more
+        # than the number: every one of them was hiding real defects (search
+        # reported filters it never applied; deactivating a watchlist entry
+        # did not stop its alerts; a live stream outlived its token; an
+        # administrator could lock out every administrator; zones and rules
+        # accepted configurations that could never fire; incident creation,
+        # assignment and timeline 500'd on ordinary input). Coverage found
+        # them by forcing the code to be executed, not by the percentage
+        # itself.
+        #
+        # Remaining thin areas are read-mostly routers (incidents 43% before
+        # this work, alerts 52%, analytics 59%, persons 60%). A higher GLOBAL
+        # floor would not distinguish those from the well-covered core
+        # (risk 99%, search 99%, watchlists 98%, zones 97%, auth 97%).
         #
         # Worth knowing before anyone removes `--cov` again: enabling it here
         # initially looked like it BROKE the suite — runs aborted around 25%
@@ -89,7 +99,7 @@ jobs:
         # comment documents. Coverage only changed the timing enough to hit it
         # almost every run. With that test switched to `mock_vms`, three
         # consecutive coverage runs pass clean.
-        run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=80
+        run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=84
 
       # Inter-test coupling gate (workstream E2). The suite shares one on-disk
       # SQLite database and several module-global caches, so a test that
