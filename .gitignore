@@ -52,3 +52,10 @@ frontend/tsconfig.tsbuildinfo
 # Playwright run artifacts (traces/screenshots on failure) — regenerated per run.
 frontend/test-results/
 frontend/playwright-report/
+
+# Coverage artifacts. `.coverage` is a binary SQLite database rewritten by
+# every `pytest --cov` run, so tracking it made an unrelated working-tree
+# change appear after each test run.
+.coverage
+.coverage.*
+htmlcov/
