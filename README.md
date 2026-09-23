@@ -51,18 +51,41 @@ drift protection, not a build.
    cd frontend
    npm run dev
    ```
+
 3. Open http://localhost:3000 → log in (`admin` / `sentinel123`) → **Cameras → Add Camera**
    → upload a short video (or use a webcam) → **Live Cameras** to watch real detections stream
    in, or add a **Restricted Zone** / **Watchlist** entry under Map / Watchlists to see the
    real rules engine fire an alert and auto-create an incident, then **Investigate** →
    **Generate Evidence Package**.
 
+**If port 8000 is taken.** It is a popular default, and an unrelated local
+service holding it is not a hypothetical — it happened here, and the dashboard
+reported only "Login failed" while talking to a stranger's API. Run both
+processes on a free port instead:
+
+```
+cd backend && .venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8008
+cd frontend && NEXT_PUBLIC_API_BASE=http://localhost:8008 NEXT_PUBLIC_WS_BASE=ws://localhost:8008 npm run dev
+```
+
+On PowerShell set them first (`$env:NEXT_PUBLIC_API_BASE="http://localhost:8008"`),
+and note these are read at BUILD time — for `next build` output, change them
+and rebuild; a restart alone will not pick them up.
+
+The login screen now refuses to be silent about this: it calls `/api/health`
+before you type anything and checks the returned service name, so a wrong or
+missing backend is named on the form, and the API base the build was compiled
+against is printed underneath it.
+
+
 ## V2: live plate tracking, vehicle journeys, risk and correlation
 
 V2 turns the ANPR path from "OCR every vehicle crop, every frame" into a real
 vehicle-intelligence pipeline. Everything below is live in the running system.
 
-**Plate pipeline** (`pipeline/plate_detect.py`, `pipeline/plate_tracker.py`):
+**Plate pipeline** (`pipeline/plate_detector.py`, `pipeline/plate_preprocess.py`,
+`pipeline/plate_tracker.py`; `pipeline/plate_detect.py` remains as the
+compatibility facade older callers import):
 
 - **Plate localization.** OCR previously received the whole vehicle bounding box
   — a car, complete with bumper stickers and dealer badges — and returned
@@ -108,6 +131,37 @@ vehicle-intelligence pipeline. Everything below is live in the running system.
   that budget the mapping is strong enough to manufacture `QQ00QQ0000` out of
   noise. A read that already parses is never touched, and confidence is never
   inflated by a repair.
+- **State/UT code validation.** The format regex alone accepts any two letters,
+  so `QQ00QQ0000` and `XX12AB1234` were "valid plates" — OCR noise in the right
+  shape cleared the quality gate and became a real `Vehicle` row. The prefix must
+  now be a code an Indian state or union territory actually issues (legacy codes
+  like `OR`/`TS`/`UA` included, because those vehicles are still on the road),
+  and the Bharat series (`23BH1234AA`) is matched by its own grammar. Measured
+  effect on the labelled corpus: plate-shaped-but-wrong reads fell from 0.64 to
+  0.52 of images, with exact match unchanged at 0.24 — fewer false identities at
+  no cost to correct reads.
+- **Preprocessing variants** (`pipeline/plate_preprocess.py`) — perspective
+  correction for off-axis plates, plus grayscale/CLAHE/denoise/sharpen/threshold
+  renderings of the same crop. **Off by default**: each variant is a full extra
+  OCR pass, and the measured exact-match difference is one sample out of 25.
+  `PLATE_PREPROCESS_VARIANTS` opts in.
+- **Selection by agreement, never by maximum confidence.** When several variants
+  are read, the winner is the text most of them produced, not the one with the
+  highest score. Max-of-N is a biased estimator — it is systematically larger
+  than any single read — so reporting it would inflate every recorded confidence
+  and silently loosen the gates. Reported confidence stays the mean over the
+  agreeing reads; corroboration is reported separately as `variants_agreeing`.
+  Measured: agreement separates correct from wrong reads far more cleanly than
+  confidence does (≤2 of 7 variants agreeing: 0 of 13 correct; ≥5 of 7: 4 of 4).
+- **Multi-variant reading can only TIGHTEN the gate, never loosen it.** A read
+  with high confidence but only one variant agreeing is not corroborated and is
+  refused.
+- **Temporal consensus gates persistence.** A plate becomes trusted intelligence
+  only once `PLATE_MIN_OBSERVATIONS` frames agree on it. Previously the first
+  gate-passing read created a `Vehicle` outright. An uncorroborated read is still
+  recorded — a vehicle crossing frame in one inference cycle is real — but is
+  flagged `pending_review` regardless of its confidence rather than presented as
+  settled.
 
 **Vehicle intelligence**: `GET /api/vehicles/by-plate/{plate}` (normalizes input
 the same way the pipeline does), `/api/vehicles/{id}/summary` (current/last
@@ -342,10 +396,15 @@ architecture changes — see `docs/THREAT_MODEL.md` and
   (`tools/anpr_bench.py`, `pipeline/plate_tracker.py`,
   `pipeline/anpr.py::disambiguate_plate`) already existed from an earlier
   pass and were audited, not rebuilt — see those files' own docstrings.
-  **ANPR accuracy remains UNVALIDATED**: no labelled real-plate corpus exists
-  in this repository (`tools/anpr_corpus/README.md` explains why one isn't
-  shipped) — the benchmark is ready the moment real, labelled images are
-  added there.
+  **ANPR accuracy is MEASURED but only on a small public still-image corpus**
+  (n=25 labelled plates; see `docs/ANPR_ACCURACY.md` for the numbers and the
+  caveats). The current figure is **exact match 0.24, character error rate
+  0.39** — reproducible, and unchanged by the 2026-09-12 architecture pass,
+  which improved the false-positive rate (0.28 → 0.24) rather than accuracy.
+  It is **not** validated on this deployment's cameras: no labelled corpus is
+  shipped in this repository (`tools/anpr_corpus/README.md` explains why), and
+  the still-image corpus cannot exercise temporal fusion at all. The benchmark
+  is ready the moment real, labelled footage is added there.
 
 ## Known-fixed issues (kept here so they don't get re-introduced)
 

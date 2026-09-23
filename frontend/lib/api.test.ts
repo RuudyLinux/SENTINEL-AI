@@ -11,7 +11,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api } from "./api";
+import { ApiError, api, checkBackendIdentity, BACKEND_SERVICE_NAME } from "./api";
 
 function jsonResponse(status: number, body: unknown = {}): Response {
   return {
@@ -108,5 +108,81 @@ describe("transient-failure retry", () => {
       status: 400,
       message: "Zone box is inverted",
     });
+  });
+});
+
+/**
+ * The backend-identity preflight. The bug it exists for: an unrelated local
+ * Python app held port 8000 — the documented default — so the dashboard was
+ * pointed at a stranger's API and reported only "Login failed". Nothing
+ * distinguished a wrong password from a wrong server.
+ */
+describe("backend identity preflight", () => {
+  function healthResponse(status: number, body: unknown, jsonThrows = false): Response {
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      statusText: String(status),
+      headers: { get: () => "application/json" },
+      json: async () => {
+        if (jsonThrows) throw new SyntaxError("Unexpected token <");
+        return body;
+      },
+    } as unknown as Response;
+  }
+
+  it("accepts the real backend", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(200, { ok: true, service: BACKEND_SERVICE_NAME }));
+    await expect(checkBackendIdentity("http://localhost:8000", fetchMock)).resolves.toEqual({ status: "ok" });
+  });
+
+  it("reports nothing listening as unreachable, naming the base URL", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    const result = await checkBackendIdentity("http://localhost:8000", fetchMock);
+    expect(result.status).toBe("unreachable");
+    expect(result.status !== "ok" && result.message).toContain("http://localhost:8000");
+  });
+
+  it("rejects a different app that answers on the same port", async () => {
+    // The actual failure: some other service replies 200 JSON on /api/health.
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(200, { ok: true, service: "some-other-app" }));
+    const result = await checkBackendIdentity("http://localhost:8000", fetchMock);
+    expect(result.status).toBe("wrong-service");
+    expect(result.status !== "ok" && result.message).toContain("some-other-app");
+  });
+
+  it("rejects an answer with no service name rather than assuming it is ours", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(200, { ok: true }));
+    expect((await checkBackendIdentity("http://localhost:8000", fetchMock)).status).toBe("wrong-service");
+  });
+
+  it("rejects a non-JSON body, which is what an unrelated web app serves", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(200, null, true));
+    expect((await checkBackendIdentity("http://localhost:8000", fetchMock)).status).toBe("wrong-service");
+  });
+
+  it("treats a 404 on /api/health as the wrong service, not a dead one", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(404, { detail: "Not Found" }));
+    const result = await checkBackendIdentity("http://localhost:8000", fetchMock);
+    expect(result.status).toBe("wrong-service");
+    expect(result.status !== "ok" && result.message).toContain("404");
+  });
+
+  it("never throws, because its only job is to produce a readable message", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("boom"));
+    await expect(checkBackendIdentity("http://localhost:9999", fetchMock)).resolves.toBeTruthy();
+  });
+
+  it("does not retry — a wrong app answers instantly and consistently", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    await checkBackendIdentity("http://localhost:8000", fetchMock);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends no Authorization header — it runs before anyone has logged in", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(healthResponse(200, { service: BACKEND_SERVICE_NAME }));
+    await checkBackendIdentity("http://localhost:8000", fetchMock);
+    const init = fetchMock.mock.calls[0][1];
+    expect(init?.headers).toBeUndefined();
   });
 });

@@ -6,6 +6,13 @@
 
 # Backend
 backend/.env
+# Any hand-made copy of it too. A real one (backend/.env.bak.031455, holding
+# the live Sentinel Grid password) sat untracked and unignored, one `git add
+# -A` away from being published. The pattern matters more than that one file:
+# the habit of copying .env before editing it is a good one, and it must not
+# be the thing that leaks the secret.
+backend/.env.*
+!backend/.env.example
 backend/.venv/
 backend/__pycache__/
 backend/**/__pycache__/

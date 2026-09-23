@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -21,10 +21,20 @@ def list_alerts(
     severity: Optional[str] = None,
     status: Optional[str] = None,
     camera_id: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent 200 alerts, narrowed by any combination of the filters.
+    """Most recent alerts, narrowed by any combination of the filters.
+
+    The 200 was hard-coded and not client-controllable, so the Alert Center
+    could neither ask for a smaller page nor page past the ceiling. It is now
+    the DEFAULT rather than the only value, bounded exactly like the other
+    transactional lists (incidents, evidence, detections, self-heal): `ge=1`
+    because SQLite reads `LIMIT -1` as no limit at all, `le=500` so an
+    authenticated caller cannot turn one request into a full-table scan.
+    Raising the default would have been the wrong change — 200 is what the
+    screen has always shown and what its filter behaviour was tuned against.
 
     `camera_id` is new. The Alert Center offered a per-camera view ("OPEN
     ALERTS" from the single-camera page) but filtered CLIENT-side over
@@ -40,7 +50,7 @@ def list_alerts(
         q = q.filter(models.Alert.status == status)
     if camera_id:
         q = q.filter(models.Alert.camera_id == camera_id)
-    return q.order_by(models.Alert.timestamp.desc()).limit(200).all()
+    return q.order_by(models.Alert.timestamp.desc()).limit(limit).all()
 
 
 @router.get("/{alert_id}", response_model=schemas.AlertOut)
