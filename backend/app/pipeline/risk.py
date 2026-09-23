@@ -83,6 +83,13 @@ class RiskSignals:
     camera_code: str = ""
     loitering_seconds: float | None = None     # dwell that breached a loitering rule
     plate_confidence: float = 0.0
+    # Whether the plate read was corroborated across frames. Recorded separately
+    # from `plate_confidence` and never blended into it: measured on the labelled
+    # benchmark, OCR confidence does not separate correct reads from wrong ones
+    # (six of seven wrong reads sit at or above the lowest correct read's
+    # confidence), so corroboration is independent evidence rather than more of
+    # the same. Defaults False — unknown provenance is not corroboration.
+    plate_corroborated: bool = False
     plate_reads: int = 0
     cameras_visited: int = 0
     total_sightings: int = 0

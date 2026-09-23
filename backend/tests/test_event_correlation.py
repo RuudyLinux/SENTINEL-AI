@@ -41,7 +41,13 @@ def _watchlisted_vehicle(db, plate: str, priority: str = "CRITICAL") -> models.V
     db.add(models.WatchlistEntry(
         entity_type="plate", identifier=plate, priority=priority, active=True, reason="test",
     ))
-    vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.94, watchlist_flag=True)
+    vehicle = models.Vehicle(
+        plate_text=plate, plate_confidence=0.94, watchlist_flag=True,
+        # A CRITICAL watchlist escalation now requires BOTH a confident read and
+        # corroboration across frames. This fixture models a well-identified vehicle,
+        # so it sets both; see rules_engine._plate_is_corroborated.
+        plate_corroborated=True,
+    )
     db.add(vehicle)
     db.flush()
     return vehicle

@@ -158,6 +158,15 @@ class PlateOut(BaseModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     corrected_text: Optional[str] = None
+    # ANPR explainability. Separate signals, never blended into `confidence`:
+    # which preprocessing variant produced the read, how many variants agreed,
+    # whether the temporal layer corroborated it across frames, and the plate
+    # crop OCR actually read. All optional — rows written before these existed
+    # genuinely have no value and stay null rather than being backfilled.
+    ocr_variant: Optional[str] = None
+    variants_agreeing: Optional[int] = None
+    corroborated: Optional[bool] = None
+    plate_crop_path: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 

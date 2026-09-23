@@ -44,6 +44,35 @@ class _Vote:
     # text. Kept for the audit trail — Plate.plate_text_raw records what OCR
     # literally returned, not only what we cleaned it up to.
     raw: str = ""
+    # Which preprocessing variant produced the most recent read of this text,
+    # and how many variants agreed on it. Provenance for the audit trail: the
+    # two are stored separately from confidence and are never folded into it.
+    variant: str = ""
+    variants_agreeing: int = 1
+
+
+@dataclass(frozen=True)
+class Consensus:
+    """Temporal evidence for one tracked vehicle's plate. See
+    `TrackPlateState.consensus` for what each field means and why they are not
+    combined into a single number."""
+    text: str
+    peak_confidence: float
+    observations: int
+    total_observations: int
+    agreement: float
+    competing_text: "str | None" = None
+    competing_observations: int = 0
+
+    @property
+    def is_corroborated(self) -> bool:
+        """Whether enough independent frames agreed to treat this as settled.
+
+        Purely a count of agreeing observations against the configured
+        threshold — it does not consult confidence, because confidence is a
+        separate signal the caller weighs separately.
+        """
+        return self.observations >= settings.plate_min_observations
 
 
 @dataclass
@@ -59,6 +88,12 @@ class TrackPlateState:
     # Where the plate was last localized, in FULL-FRAME pixel coordinates.
     # None while OCR is still falling back to the whole vehicle crop.
     last_plate_bbox: list[float] | None = None
+    # The plate crop image OCR last actually read, held only until the sighting
+    # row is written and its evidence saved. In-memory and per-track, bounded by
+    # the same TTL prune as the rest of this state — a plate crop is a few KB,
+    # and one per live track is the same order as the frame buffers the worker
+    # already holds.
+    last_plate_crop: object | None = None
     # Set once this track's Plate row exists, so subsequent frames UPDATE that
     # row instead of inserting another one (problem 3 above).
     plate_row_id: str | None = None
@@ -80,6 +115,45 @@ class TrackPlateState:
         text = max(self.votes, key=lambda t: self.votes[t].summed_confidence)
         vote = self.votes[text]
         return text, vote.peak_confidence, vote.reads
+
+    def consensus(self) -> "Consensus | None":
+        """The full temporal picture for this track, or None if nothing was read.
+
+        Reports the winning text alongside every signal that decided it, kept
+        separate rather than collapsed into one score:
+
+        - `peak_confidence` — the best the OCR engine ever actually reported for
+          this text. The honest answer to "how well did we ever read this".
+        - `observations` — how many gate-passing reads agreed on it.
+        - `total_observations` — how many gate-passing reads there were in all.
+        - `agreement` — observations / total_observations, i.e. how UNANIMOUS the
+          track's reads were. A plate read 4 times with 4 agreeing is stronger
+          evidence than one read 4 times with 2 agreeing and 2 saying something
+          else, even at identical confidence.
+        - `competing` — the runner-up text, if any, so an operator can see what
+          the track was confused between rather than only the winner.
+
+        Nothing here is multiplied into a fabricated probability. The gate
+        (`has_consensus`) reasons over the fields explicitly.
+        """
+        best = self.best()
+        if best is None:
+            return None
+        text, peak, reads = best
+        total = self.total_reads()
+        competing = sorted(
+            ((other, vote.reads) for other, vote in self.votes.items() if other != text),
+            key=lambda item: item[1], reverse=True,
+        )
+        return Consensus(
+            text=text,
+            peak_confidence=peak,
+            observations=reads,
+            total_observations=total,
+            agreement=(reads / total) if total else 0.0,
+            competing_text=competing[0][0] if competing else None,
+            competing_observations=competing[0][1] if competing else 0,
+        )
 
     def total_reads(self) -> int:
         return sum(v.reads for v in self.votes.values())
@@ -153,24 +227,75 @@ def record_read(
     confidence: float,
     raw_text: str = "",
     plate_bbox: list[float] | None = None,
+    variant: str = "",
+    variants_agreeing: int = 1,
+    plate_crop=None,
 ) -> TrackPlateState:
     """Add one gate-passing OCR read to this track's vote tally.
 
-    Only reads that already cleared `anpr.passes_anpr_gate` should reach here —
-    voting must not be polluted by reads the quality gate rejected, or a
-    persistent misread of a bumper sticker would out-vote the real plate.
+    Only reads that already cleared the quality gate should reach here — voting
+    must not be polluted by reads the gate rejected, or a persistent misread of
+    a bumper sticker would out-vote the real plate.
+
+    `variant`/`variants_agreeing` are recorded as provenance for the audit
+    trail. They do NOT influence the vote weight: the vote is decided by summed
+    OCR confidence across frames, and letting cross-variant agreement also
+    inflate a frame's weight would count the same corroboration twice.
     """
     state = touch(camera_id, track_id)
     state.last_ocr_mono = time.monotonic()
     if plate_bbox is not None:
         state.last_plate_bbox = plate_bbox
+    if plate_crop is not None:
+        state.last_plate_crop = plate_crop
     vote = state.votes.setdefault(plate_text, _Vote())
     vote.summed_confidence += confidence
     vote.peak_confidence = max(vote.peak_confidence, confidence)
     vote.reads += 1
     if raw_text:
         vote.raw = raw_text
+    if variant:
+        vote.variant = variant
+    vote.variants_agreeing = variants_agreeing
     return state
+
+
+def consensus(camera_id: str, track_id: str) -> "Consensus | None":
+    """The temporal consensus for one track, or None if it has no reads."""
+    state = _TRACKS.get(_key(camera_id, track_id))
+    return state.consensus() if state is not None else None
+
+
+def has_consensus(camera_id: str, track_id: str) -> bool:
+    """Whether this track's plate has enough temporal evidence to be persisted
+    as a trusted sighting.
+
+    The behavior change this exists for: previously the FIRST gate-passing OCR
+    read created a Vehicle and a Plate row. One lucky frame — one
+    plate-shaped-but-wrong read clearing the confidence floor — became a durable
+    vehicle identity, and the benchmark says that class of read is real and
+    common (plate-shaped-but-wrong reads outnumber correct ones on the labelled
+    corpus). Requiring corroboration across frames is the defence the temporal
+    layer was built to provide, and it was not being used to gate persistence.
+
+    What "not enough evidence" does NOT mean here is "throw the read away". A
+    vehicle that crosses the frame inside a single inference cycle gets exactly
+    one read and will never get another; dropping it would lose a real sighting
+    to protect against a hypothetical one. So an uncorroborated read is still
+    persisted — as an UNTRUSTED observation, flagged `pending_review` by
+    `review_status_for` regardless of how confident that single read was, so it
+    reaches an operator instead of being presented as settled intelligence.
+
+    `settings.plate_require_consensus` turns this into a hard gate for
+    deployments that would rather lose the fast-vehicle sighting than hold an
+    uncorroborated one; it is off by default because silently discarding real
+    observations is the worse failure for an investigative system.
+
+    Setting `plate_min_observations = 1` restores the previous behavior
+    outright, so the change is revertible in one env var.
+    """
+    result = consensus(camera_id, track_id)
+    return result is not None and result.is_corroborated
 
 
 def should_persist(camera_id: str, track_id: str, new_read: bool) -> bool:

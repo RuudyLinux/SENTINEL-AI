@@ -161,6 +161,19 @@ class Vehicle(Base):
     # assumed away.
     plate_text = Column(String, unique=True, index=True, nullable=True)
     plate_confidence = Column(Float, default=0.0)
+    # Whether this vehicle's plate has EVER been corroborated across frames
+    # (pipeline/plate_tracker.has_consensus). A separate signal from
+    # plate_confidence and never blended into it: measured on the labelled
+    # benchmark, OCR confidence does not separate correct reads from wrong ones
+    # — correct reads span 0.262-0.990, wrong plate-shaped reads span
+    # 0.260-0.956 — so corroboration is independent evidence rather than more of
+    # the same.
+    #
+    # Ratchets up only: a vehicle identified well at one camera is not
+    # downgraded by a glimpse at the next. NULL on rows written before this
+    # column existed, and read as NOT corroborated — unknown provenance must not
+    # buy CRITICAL alert severity (see pipeline/rules_engine.py).
+    plate_corroborated = Column(Boolean, default=False)
     vehicle_type = Column(String, default="")
     color = Column(String, default="")
     first_seen = Column(DateTime, default=datetime.utcnow)
@@ -229,6 +242,27 @@ class Plate(Base):
     # repaired OCR output) — three distinct facts: what OCR said, what the
     # parser resolved it to, and what a human confirmed it actually is.
     corrected_text = Column(String, nullable=True)
+    # --- ANPR explainability ---
+    # Every field below is a SEPARATE evidence signal, stored unblended so a
+    # sighting can be audited on what actually supported it. `confidence` above
+    # remains the OCR engine's own number and is never adjusted by any of these.
+    #
+    # Which preprocessing variant produced the winning read ("clahe" by default;
+    # see pipeline/plate_preprocess.py). Null on rows written before this
+    # existed — never backfilled with a guess.
+    ocr_variant = Column(String, nullable=True)
+    # How many preprocessing variants agreed on the text. 1 whenever
+    # multi-variant reading is disabled, which is the default.
+    variants_agreeing = Column(Integer, nullable=True)
+    # Whether the temporal layer got enough agreeing observations across frames
+    # to treat this as settled (pipeline/plate_tracker.has_consensus). False
+    # means the sighting is a real observation but an UNCORROBORATED one, and it
+    # is flagged pending_review regardless of how confident the read was.
+    corroborated = Column(Boolean, nullable=True)
+    # The plate region OCR actually read, saved next to the full-frame snapshot
+    # so a reviewer can see the evidence rather than only the text. Null unless
+    # PLATE_DEBUG_CROPS is enabled.
+    plate_crop_path = Column(String, nullable=True)
 
 
 class Person(Base):

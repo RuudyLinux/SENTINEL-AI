@@ -48,7 +48,9 @@ async def _merge_into_winner(db: Session, normalized_plate: str, confidence: flo
     return winner
 
 
-async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidence: float) -> models.Vehicle:
+async def upsert_vehicle_for_plate(
+    db: Session, normalized_plate: str, confidence: float, corroborated: bool = False,
+) -> models.Vehicle:
     """Final-demo-readiness-phase finding: this function's own `db.flush()`
     was unguarded against SQLite lock contention — the same root-cause class
     PR #1 fixed in worker.py's detection insert, just in a different, shared
@@ -82,9 +84,15 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
         # entry's `valid_until` passes). Deactivation and creation refresh it
         # directly through the watchlist router.
         target_watchlist_flag = watchlist.plate_entry_in_force(db, normalized_plate) is not None
+        # Corroboration only ever RATCHETS UP, exactly as confidence does: once
+        # this vehicle's plate has been confirmed across frames, a later
+        # single-frame sighting does not un-confirm it. A vehicle identified
+        # well at one camera must not be downgraded by a glimpse at the next.
+        target_corroborated = bool(vehicle.plate_corroborated) or bool(corroborated)
         vehicle.last_seen = target_last_seen
         vehicle.plate_confidence = target_confidence
         vehicle.watchlist_flag = target_watchlist_flag
+        vehicle.plate_corroborated = target_corroborated
 
         def reapply():
             # `vehicle` is already PERSISTENT here — a rollback expires its
@@ -96,6 +104,7 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
             vehicle.last_seen = target_last_seen
             vehicle.plate_confidence = target_confidence
             vehicle.watchlist_flag = target_watchlist_flag
+            vehicle.plate_corroborated = target_corroborated
 
         await safe_flush(db, "upsert_vehicle_for_plate", reapply=reapply)
         return vehicle
@@ -107,6 +116,7 @@ async def upsert_vehicle_for_plate(db: Session, normalized_plate: str, confidenc
         first_seen=now,
         last_seen=now,
         watchlist_flag=bool(watchlisted),
+        plate_corroborated=bool(corroborated),
     )
     db.add(vehicle)
     # Committed immediately, not just flushed, deliberately: a genuinely NEW
@@ -249,6 +259,10 @@ async def upsert_plate_sighting(
     snapshot_path: str | None,
     source_timestamp: datetime | None,
     existing_plate_id: str | None,
+    corroborated: bool = True,
+    ocr_variant: str = "",
+    variants_agreeing: int = 1,
+    plate_crop_path: str | None = None,
 ) -> models.Plate:
     """Create — or update — the single Plate sighting row for this vehicle's
     presence on this camera.
@@ -278,7 +292,8 @@ async def upsert_plate_sighting(
         target_snapshot = plate.snapshot_path or snapshot_path
         target_plate_bbox = plate_bbox if plate_bbox is not None else plate.plate_bbox
         target_vehicle_bbox = vehicle_bbox if vehicle_bbox is not None else plate.vehicle_bbox
-        target_review_status = review_status_for(target_confidence, plate.review_status)
+        target_review_status = review_status_for(target_confidence, plate.review_status, corroborated)
+        target_plate_crop = plate.plate_crop_path or plate_crop_path
         plate.confidence = target_confidence
         plate.plate_text_normalized = target_text
         plate.plate_text_raw = target_raw
@@ -288,6 +303,10 @@ async def upsert_plate_sighting(
         plate.plate_bbox = target_plate_bbox
         plate.vehicle_bbox = target_vehicle_bbox
         plate.review_status = target_review_status
+        plate.ocr_variant = ocr_variant or plate.ocr_variant
+        plate.variants_agreeing = variants_agreeing
+        plate.corroborated = corroborated
+        plate.plate_crop_path = target_plate_crop
 
         def reapply():
             db.add(plate)
@@ -300,6 +319,10 @@ async def upsert_plate_sighting(
             plate.plate_bbox = target_plate_bbox
             plate.vehicle_bbox = target_vehicle_bbox
             plate.review_status = target_review_status
+            plate.ocr_variant = ocr_variant or plate.ocr_variant
+            plate.variants_agreeing = variants_agreeing
+            plate.corroborated = corroborated
+            plate.plate_crop_path = target_plate_crop
     else:
         plate = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera_id, detection_id=detection_id,
@@ -309,7 +332,9 @@ async def upsert_plate_sighting(
             track_id=track_id, reads_count=reads_count,
             vehicle_class=vehicle_class, detection_confidence=detection_confidence,
             vehicle_bbox=vehicle_bbox, plate_bbox=plate_bbox,
-            review_status=review_status_for(confidence),
+            review_status=review_status_for(confidence, None, corroborated),
+            ocr_variant=ocr_variant or None, variants_agreeing=variants_agreeing,
+            corroborated=corroborated, plate_crop_path=plate_crop_path,
         )
         db.add(plate)
 

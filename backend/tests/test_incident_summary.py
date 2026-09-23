@@ -30,7 +30,10 @@ def _watchlisted_incident(db):
     db.flush()
     plate = f"GJ05SU{uuid.uuid4().hex[:4].upper()}"
     db.add(models.WatchlistEntry(entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="stolen vehicle"))
-    vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.93, watchlist_flag=True)
+    vehicle = models.Vehicle(
+        plate_text=plate, plate_confidence=0.93, watchlist_flag=True,
+        plate_corroborated=True,  # CRITICAL now needs corroboration as well as confidence
+    )
     db.add(vehicle)
     db.flush()
     detection = models.Detection(

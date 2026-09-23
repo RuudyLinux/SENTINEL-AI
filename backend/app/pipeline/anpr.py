@@ -4,6 +4,7 @@ confidence. Garbage reads are kept with their real (low) confidence rather
 than silently discarded, so ANPR quality can be measured honestly.
 """
 import re
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 import numpy as np
@@ -11,6 +12,69 @@ import numpy as np
 from ..config import settings
 
 PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}$")
+
+# Bharat (BH) series — the 2021 all-India registration for transferable
+# vehicles. It does NOT follow the state-code grammar above: it is
+# YY + "BH" + 4 digits + 1-2 letters, e.g. "23BH1234AA". Matched separately
+# rather than by loosening PLATE_RE, which would also start accepting
+# digit-leading garbage in the state-code position.
+BH_SERIES_RE = re.compile(r"^\d{2}BH\d{4}[A-Z]{1,2}$")
+
+# Every registration prefix issued by an Indian state or union territory.
+#
+# Why this matters more than it looks: without it, PLATE_RE accepts any two
+# letters, so "QQ00QQ0000", "XX12AB1234" and "ZZ99ZZ9999" are all "valid
+# plates". That is exactly the dangerous failure class the benchmark measures —
+# a read that is plate-SHAPED but wrong clears the quality gate and becomes a
+# real Vehicle row. Constraining the first two characters to codes that actually
+# exist is a check against reality, not a heuristic, and it costs nothing.
+#
+# Kept as data rather than a regex alternation so it is greppable, testable and
+# amendable when a new UT code is issued.
+INDIAN_STATE_CODES = frozenset({
+    # States
+    "AP",  # Andhra Pradesh
+    "AR",  # Arunachal Pradesh
+    "AS",  # Assam
+    "BR",  # Bihar
+    "CG",  # Chhattisgarh
+    "GA",  # Goa
+    "GJ",  # Gujarat
+    "HR",  # Haryana
+    "HP",  # Himachal Pradesh
+    "JH",  # Jharkhand
+    "JK",  # Jammu and Kashmir (UT since 2019; code still issued)
+    "KA",  # Karnataka
+    "KL",  # Kerala
+    "MH",  # Maharashtra
+    "ML",  # Meghalaya
+    "MN",  # Manipur
+    "MP",  # Madhya Pradesh
+    "MZ",  # Mizoram
+    "NL",  # Nagaland
+    "OD",  # Odisha (current)
+    "OR",  # Odisha (legacy code, still on the road)
+    "PB",  # Punjab
+    "RJ",  # Rajasthan
+    "SK",  # Sikkim
+    "TN",  # Tamil Nadu
+    "TG",  # Telangana (current)
+    "TS",  # Telangana (legacy code, still on the road)
+    "TR",  # Tripura
+    "UK",  # Uttarakhand (current)
+    "UA",  # Uttarakhand (legacy code, still on the road)
+    "UP",  # Uttar Pradesh
+    "WB",  # West Bengal
+    # Union territories
+    "AN",  # Andaman and Nicobar Islands
+    "CH",  # Chandigarh
+    "DD",  # Daman and Diu / Dadra and Nagar Haveli and Daman and Diu
+    "DN",  # Dadra and Nagar Haveli (legacy)
+    "DL",  # Delhi
+    "LA",  # Ladakh
+    "LD",  # Lakshadweep
+    "PY",  # Puducherry
+})
 
 # --- Positional character disambiguation ------------------------------------
 # Measured with tools/anpr_bench.py: the single most common real failure is not
@@ -97,9 +161,59 @@ def order_fragments(results: list) -> list:
     return ordered
 
 
+@dataclass(frozen=True)
+class OcrCandidate:
+    """One preprocessing variant's reading of the same plate crop."""
+    variant: str
+    raw: str
+    normalized: str
+    confidence: float
+    # (text, confidence) per OCR fragment, in reading order. The character-level
+    # detail EasyOCR actually exposes — kept for the audit trail so a read can be
+    # inspected without re-running OCR.
+    fragments: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class OcrRead:
+    """The structured result of reading one plate crop.
+
+    Every field is a SEPARATE, independently-meaningful signal. They are
+    deliberately not combined into a single score:
+
+    - `confidence` is what the OCR engine reported, and nothing else. It is
+      never adjusted upward for agreement, never floored, never blended.
+    - `variants_agreeing` / `variant_count` describe corroboration ACROSS
+      preprocessing variants. Measured on the labelled corpus, this separates
+      correct from incorrect reads far more cleanly than `confidence` does
+      (<=2 of 7 agreeing: 0 of 13 correct; >=5 of 7: 4 of 4 correct), which is
+      exactly why it is reported rather than folded in.
+
+    A read of `0.91` confidence with 1 of 7 variants agreeing and a read of
+    `0.57` with 5 of 7 agreeing are different kinds of evidence. The gate
+    (`passes_anpr_gate`) reasons over both explicitly; this object refuses to
+    pre-digest them into one number that would hide the difference.
+    """
+    raw: str
+    normalized: str
+    confidence: float
+    variant: str = ""
+    variants_agreeing: int = 1
+    variant_count: int = 1
+    candidates: tuple[OcrCandidate, ...] = field(default=())
+
+    def as_tuple(self) -> tuple[str, str, float]:
+        """The legacy 3-tuple contract `read_plate` has always returned."""
+        return self.raw, self.normalized, self.confidence
+
+
 def read_plate(crop: np.ndarray) -> tuple[str, str, float]:
     """Returns (raw_text, normalized_text, confidence). Confidence is the
     real mean OCR confidence over detected text fragments; 0.0 if nothing read.
+
+    Unchanged contract. `read_plate_structured` is the richer interface; this
+    stays because the worker's legacy path, the benchmark and the existing tests
+    are written against the tuple.
     """
     if crop is None or crop.size == 0:
         return "", "", 0.0
@@ -127,8 +241,125 @@ def read_plate(crop: np.ndarray) -> tuple[str, str, float]:
     return raw, normalized, float(confidence)
 
 
+def read_candidate(crop: np.ndarray, variant: str) -> OcrCandidate:
+    """Read ONE preprocessing variant, keeping the per-fragment detail.
+
+    Same OCR work `read_plate` does — the fragments are simply not thrown away,
+    so a stored read can be audited without re-running the engine.
+    """
+    if crop is None or crop.size == 0:
+        return OcrCandidate(variant=variant, raw="", normalized="", confidence=0.0)
+    results = get_reader().readtext(crop)
+    if not results:
+        return OcrCandidate(variant=variant, raw="", normalized="", confidence=0.0)
+    results = order_fragments(results)
+    raw = "".join(result[1] for result in results)
+    confidence = sum(result[2] for result in results) / len(results)
+    fragments = tuple((str(result[1]), float(result[2])) for result in results)
+    normalized = disambiguate_plate(extract_plate(normalize_plate(raw)))
+    return OcrCandidate(
+        variant=variant, raw=raw, normalized=normalized,
+        confidence=float(confidence), fragments=fragments,
+    )
+
+
+def select_candidate(candidates: "list[OcrCandidate] | tuple[OcrCandidate, ...]") -> OcrRead:
+    """Choose between several variants' readings of the SAME plate crop.
+
+    Selection is by AGREEMENT, not by confidence. Measured on the 25-plate
+    labelled corpus (docs/ANPR_ACCURACY.md), picking the highest-confidence of
+    seven variant reads gave exact 0.24 / CER 0.3160 and pushed false positives
+    UP (0.28 -> 0.40); grouping by text and picking the most-agreed gave exact
+    0.28 / CER 0.2814 with false positives at 0.32, and on the cheaper
+    `original+sharpen+adaptive` set held false positives at the baseline 0.28
+    while improving the wrong-rate among accepted reads from 0.58 to 0.50.
+
+    Highest-confidence selection is also a biased estimator: the maximum of N
+    samples is systematically larger than any one of them, so reporting it would
+    inflate the recorded confidence of every read and silently loosen the
+    downstream gates. This deliberately does not do that.
+
+    Reported confidence is the MEAN over the reads that agreed on the winning
+    text — a statement about what the OCR engine said, nothing more. It is not
+    raised because several variants agreed; the agreement is reported separately
+    as `variants_agreeing` so the gate can weigh it explicitly.
+
+    Ties (equal agreement) break toward a gate-passing read, then toward summed
+    confidence. An empty read never beats a non-empty one.
+    """
+    candidates = tuple(candidates)
+    if not candidates:
+        return OcrRead(raw="", normalized="", confidence=0.0, variant="", variants_agreeing=0, variant_count=0)
+
+    groups: dict[str, list[OcrCandidate]] = {}
+    for candidate in candidates:
+        if candidate.normalized:
+            groups.setdefault(candidate.normalized, []).append(candidate)
+
+    if not groups:
+        # Every variant read nothing usable. The honest answer is the empty read,
+        # reported with a real variant name so the record says which image was
+        # tried rather than implying none was.
+        return OcrRead(
+            raw=candidates[0].raw, normalized="", confidence=candidates[0].confidence,
+            variant=candidates[0].variant, variants_agreeing=0,
+            variant_count=len(candidates), candidates=candidates,
+        )
+
+    def group_rank(text: str) -> tuple:
+        members = groups[text]
+        gate_passes = any(passes_format_and_confidence(m.normalized, m.confidence) for m in members)
+        return (len(members), gate_passes, sum(m.confidence for m in members))
+
+    winner_text = max(groups, key=group_rank)
+    members = groups[winner_text]
+    # The representative read is the agreeing member whose own confidence is
+    # highest — it is only used for `raw`/`variant` provenance, NOT to set the
+    # reported confidence, which stays the mean over all agreeing members.
+    representative = max(members, key=lambda m: m.confidence)
+    return OcrRead(
+        raw=representative.raw,
+        normalized=winner_text,
+        confidence=sum(m.confidence for m in members) / len(members),
+        variant=representative.variant,
+        variants_agreeing=len(members),
+        variant_count=len(candidates),
+        candidates=candidates,
+    )
+
+
+def read_plate_structured(
+    variants: "list[tuple[str, np.ndarray]]",
+) -> OcrRead:
+    """Read every supplied `(variant_name, image)` and select between them.
+
+    With the default single-variant configuration this runs exactly one OCR pass
+    and returns that read verbatim — the same work, the same confidence and the
+    same cost as before this function existed.
+    """
+    if not variants:
+        return OcrRead(raw="", normalized="", confidence=0.0, variant="", variants_agreeing=0, variant_count=0)
+    return select_candidate([read_candidate(image, name) for name, image in variants])
+
+
 def looks_like_plate(normalized: str) -> bool:
-    return bool(PLATE_RE.match(normalized))
+    """Whether a normalized read is a well-formed Indian registration.
+
+    Two accepted grammars — the state-coded form (`GJ05AB1234`) and the Bharat
+    series (`23BH1234AA`) — and, for the state-coded form, the prefix must be a
+    code an Indian state or UT actually issues.
+
+    The state-code check is the cheapest false-positive defence available here.
+    The format regex alone accepts `QQ00QQ0000`, so OCR noise that happens to
+    land in the right shape becomes a "valid plate", clears the quality gate and
+    creates a real Vehicle row. Requiring a prefix that exists tests the read
+    against reality rather than against a pattern.
+    """
+    if not normalized:
+        return False
+    if BH_SERIES_RE.match(normalized):
+        return True
+    return bool(PLATE_RE.match(normalized)) and normalized[:2] in INDIAN_STATE_CODES
 
 
 def disambiguate_plate(normalized: str) -> str:
@@ -216,12 +447,50 @@ def extract_plate(normalized: str) -> str:
     return best or normalized
 
 
+def passes_format_and_confidence(normalized: str, confidence: float) -> bool:
+    """Format gate + confidence floor. The two signals that have always gated a
+    read; kept as its own function because `select_candidate` needs to ask the
+    question without the agreement rule below applying recursively."""
+    return bool(normalized) and looks_like_plate(normalized) and confidence >= settings.plate_min_confidence
+
+
 def passes_anpr_gate(normalized: str, confidence: float) -> bool:
     """The single quality gate (P0-C): a normalized OCR read only becomes a
     Vehicle/Plate correlation record when it looks like a plate AND clears
     the configured confidence floor. Extracted as its own function so it's
-    directly unit-testable without a real OCR/frame pipeline."""
-    return bool(normalized) and looks_like_plate(normalized) and confidence >= settings.plate_min_confidence
+    directly unit-testable without a real OCR/frame pipeline.
+
+    Unchanged signature and unchanged behavior. `passes_read_gate` is the
+    variant-aware form for callers holding a full `OcrRead`.
+    """
+    return passes_format_and_confidence(normalized, confidence)
+
+
+def passes_read_gate(read: OcrRead) -> bool:
+    """The quality gate for a structured read, reasoning over BOTH signals.
+
+    Format and confidence must pass exactly as before. When more than one
+    preprocessing variant was actually read, the winning text must ALSO have
+    been produced by at least `plate_min_variants_agreeing` of them.
+
+    This direction is deliberate and load-bearing: multi-variant reading can
+    only ever make the gate STRICTER, never looser. Selecting among several
+    reads shifts the reported confidence distribution upward (the agreeing
+    subset skews toward easier crops), and without this rule that drift alone
+    would push borderline reads over `plate_min_confidence` and over
+    `plate_review_confidence_floor` — quietly auto-accepting reads that a
+    single-variant pipeline would have sent to a human. A read with high
+    confidence but only one variant agreeing is NOT corroborated evidence, and
+    is not treated as such.
+
+    With one variant configured (the default) `variant_count` is 1, the
+    agreement rule cannot fire, and this is identical to `passes_anpr_gate`.
+    """
+    if not passes_format_and_confidence(read.normalized, read.confidence):
+        return False
+    if read.variant_count <= 1:
+        return True
+    return read.variants_agreeing >= settings.plate_min_variants_agreeing
 
 
 def better_read(
@@ -264,7 +533,9 @@ def better_read(
 _HUMAN_REVIEW_STATES = {"corrected", "rejected"}
 
 
-def review_status_for(confidence: float, current: str | None = None) -> str:
+def review_status_for(
+    confidence: float, current: str | None = None, corroborated: bool = True,
+) -> str:
     """Human-in-the-loop ANPR review (10/10 roadmap P7): whether a Plate
     sighting needs an operator's eyes.
 
@@ -275,9 +546,19 @@ def review_status_for(confidence: float, current: str | None = None) -> str:
     is auto-promoted back to `auto_accepted`, EXCEPT once a human has already
     acted on it: `corrected`/`rejected` are terminal states a fresh OCR
     frame must never silently overwrite.
+
+    `corroborated=False` means the temporal layer never got enough agreeing
+    observations of this plate (see `plate_tracker.has_consensus`). Such a read
+    is ALWAYS flagged for review, however confident that single frame was — a
+    high-confidence read observed once is not corroborated evidence, and
+    treating it as settled is exactly the "one lucky frame becomes a vehicle
+    identity" failure this gate exists to prevent. Confidence and corroboration
+    are separate signals and neither substitutes for the other.
     """
     if current in _HUMAN_REVIEW_STATES:
         return current
+    if not corroborated:
+        return "pending_review"
     if confidence >= settings.plate_review_confidence_floor:
         return "auto_accepted"
     return "pending_review"

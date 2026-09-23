@@ -310,8 +310,22 @@ export default function VehicleInvestigationPage() {
                   {/* A null plate_bbox means OCR fell back to the whole vehicle
                       crop — a genuinely lower-quality read, shown rather than hidden. */}
                   {!s.plate_bbox && " · not localized"}
+                  {/* Which preprocessing variant produced the read, and how many
+                      variants agreed. Only meaningful once multi-variant reading
+                      is enabled; hidden entirely on rows that predate it. */}
+                  {s.ocr_variant && ` · ${s.ocr_variant}`}
+                  {s.variants_agreeing > 1 && ` · ${s.variants_agreeing} variants agree`}
                 </span>
-                <span className="text-xs text-slate-400">{Math.round((s.confidence ?? 0) * 100)}%</span>
+                <span className="text-xs text-slate-400">
+                  {Math.round((s.confidence ?? 0) * 100)}%
+                  {/* Confidence and corroboration are separate facts. An
+                      uncorroborated read is a real observation that only one
+                      frame supports — shown as such rather than folded into the
+                      percentage, which would misrepresent what OCR reported. */}
+                  {s.corroborated === false && (
+                    <span className="block text-[10px] text-amber-500/80">uncorroborated</span>
+                  )}
+                </span>
                 <span className="text-xs text-slate-500 text-right">
                   {new Date(s.timestamp).toLocaleTimeString()}
                 </span>

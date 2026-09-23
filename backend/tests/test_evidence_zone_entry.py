@@ -194,7 +194,10 @@ def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_se
         entity_type="plate", identifier="GJ01ZZ9999", priority="CRITICAL", active=True,
         reason="evidence linkage test",
     ))
-    vehicle = models.Vehicle(plate_text="GJ01ZZ9999", plate_confidence=0.9, watchlist_flag=True)
+    vehicle = models.Vehicle(
+        plate_text="GJ01ZZ9999", plate_confidence=0.9, watchlist_flag=True,
+        plate_corroborated=True,  # CRITICAL now needs corroboration as well as confidence
+    )
     db_session.add(vehicle)
     db_session.flush()
     detection = models.Detection(

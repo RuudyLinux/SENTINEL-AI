@@ -146,6 +146,21 @@ def _find_correlatable_incident(
     return query.order_by(models.Incident.created_at.desc()).first()
 
 
+def _plate_is_corroborated(vehicle: models.Vehicle) -> bool:
+    """Whether this vehicle's plate has ever been corroborated across frames.
+
+    Read straight off the Vehicle row rather than queried from its sightings:
+    rule evaluation runs per detection, and an extra query per alert is real
+    cost on a multi-camera deployment. `correlate.upsert_vehicle_for_plate`
+    maintains the flag.
+
+    NULL/False — rows predating the column, and the legacy single-frame ANPR
+    path — read as NOT corroborated. The safe default for a missing safety
+    signal is "not satisfied".
+    """
+    return bool(getattr(vehicle, "plate_corroborated", False))
+
+
 async def evaluate(
     db: Session,
     camera: models.Camera,
@@ -190,10 +205,45 @@ async def evaluate(
         # the plate read actually is. Below the floor, cap at HIGH and say so
         # in the reason string — the operator sees "needs confirmation" rather
         # than an unqualified CRITICAL that looks identical to a confident hit.
+        #
+        # CORROBORATION IS A SEPARATE GATE, and it is not optional (A1, 2026-09-12).
+        #
+        # Measured on the labelled benchmark: OCR confidence does NOT separate
+        # correct reads from wrong ones. Correct reads span 0.262-0.990; wrong
+        # plate-shaped reads span 0.260-0.956, and SIX OF SEVEN wrong reads sit
+        # at or above the lowest correct read's confidence. No threshold on this
+        # corpus reaches precision above 0.5 — see docs/ANPR_ACCURACY.md, "A1".
+        #
+        # The concrete failure that forces this: `UP84AE9889` was misread as
+        # `UP81AE9889` at confidence 0.956. Under a confidence-only gate that
+        # single uncorroborated frame clears the 0.60 floor, raises a CRITICAL
+        # watchlist alert and auto-opens an incident — naming a vehicle that was
+        # never there. In a police deployment that is a wrongful-stop risk, and
+        # it is exactly what the temporal layer was built to prevent.
+        #
+        # So CRITICAL now requires BOTH a confident read AND corroboration across
+        # frames. An uncorroborated match is still raised — a real watchlist hit
+        # is never silenced — but capped at HIGH and labelled, so an operator
+        # confirms before acting. `corroborated=None` (rows written before this
+        # existed, and the legacy single-frame path) is treated as NOT
+        # corroborated: unknown provenance must not buy CRITICAL severity.
         plate_confidence = float(vehicle.plate_confidence or 0.0)
-        if plate_confidence >= settings.watchlist_high_confidence_floor:
+        corroborated = _plate_is_corroborated(vehicle)
+        signals.plate_corroborated = corroborated
+        # The escape hatch is real, not decoration: a deployment that would
+        # rather have the previous confidence-only escalation can set
+        # WATCHLIST_REQUIRE_CORROBORATION=false in one env var.
+        corroboration_satisfied = corroborated or not settings.watchlist_require_corroboration
+        if plate_confidence >= settings.watchlist_high_confidence_floor and corroboration_satisfied:
             reasons.append(f"Watchlist signal: plate {vehicle.plate_text} matches an active watchlist entry")
             severity = "CRITICAL"
+        elif plate_confidence >= settings.watchlist_high_confidence_floor:
+            reasons.append(
+                f"Watchlist signal (UNCORROBORATED, read {plate_confidence * 100:.0f}%): plate "
+                f"{vehicle.plate_text} matches an active watchlist entry, but only ONE frame "
+                f"supports the read — requires confirmation"
+            )
+            severity = "HIGH"
         else:
             reasons.append(
                 f"Watchlist signal (LOW CONFIDENCE {plate_confidence * 100:.0f}%): plate "

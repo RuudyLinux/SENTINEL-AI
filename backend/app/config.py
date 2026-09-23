@@ -82,6 +82,27 @@ class Settings(BaseSettings):
     # for: it passed the gate, but fusion has not corroborated it yet.
     watchlist_high_confidence_floor: float = 0.60
 
+    # A watchlist match may only reach CRITICAL if the plate read was also
+    # CORROBORATED across frames (pipeline/plate_tracker.has_consensus), not
+    # merely confident.
+    #
+    # Measured (docs/ANPR_ACCURACY.md, "A1"): OCR confidence does not separate
+    # correct reads from wrong ones on the labelled benchmark. Correct reads
+    # span 0.262-0.990; wrong plate-shaped reads span 0.260-0.956, and six of
+    # seven wrong reads sit at or above the lowest correct read's confidence. No
+    # confidence threshold on that corpus reaches precision above 0.5.
+    #
+    # The failure this prevents is concrete: `UP84AE9889` was misread as
+    # `UP81AE9889` at 0.956 confidence. Under a confidence-only gate that single
+    # frame clears the floor, raises a CRITICAL watchlist alert and auto-opens an
+    # incident about a vehicle that was never there.
+    #
+    # Default True because a wrongful stop is worse than a delayed one. The
+    # match is never suppressed — it still fires at HIGH, labelled
+    # "UNCORROBORATED" — so nothing is lost, only the automatic escalation.
+    # Set False to restore the previous confidence-only behaviour.
+    watchlist_require_corroboration: bool = True
+
     # Human-in-the-loop ANPR review (10/10 roadmap P7): a Plate sighting read
     # below this confidence is stored (already true — the quality gate above
     # is the only thing that discards a read) AND flagged `pending_review` so
@@ -111,6 +132,61 @@ class Settings(BaseSettings):
     # height dominates OCR accuracy on real CCTV frames far more than the OCR
     # engine choice does.
     plate_ocr_target_height: int = 64
+
+    # --- Preprocessing variants (pipeline/plate_preprocess.py) ---
+    # Comma-separated names from plate_preprocess.VARIANT_NAMES. Each one
+    # enabled costs a FULL EXTRA OCR PASS per plate — the single most expensive
+    # operation in the camera loop — so the default is the one variant that
+    # reproduces the pre-existing behavior exactly (upscale -> gray -> CLAHE).
+    #
+    # Measured on the 25-plate labelled corpus (docs/ANPR_ACCURACY.md):
+    # "original,sharpen,adaptive" gives CER 0.3896 -> 0.3030 at 3x the OCR
+    # cost, with exact match moving by a single sample (inside this corpus's
+    # noise band, so NOT an accuracy improvement). Offered as an opt-in
+    # recovery/diagnostic mode; not imposed as a default on a CCTV deployment.
+    plate_preprocess_variants: str = "clahe"
+    # Fallback when the above is empty or names nothing valid, so OCR always
+    # receives exactly one image rather than none.
+    plate_preprocess_default_variant: str = "clahe"
+
+    # --- Persistence gate (pipeline/plate_tracker.py) ---
+    # How many gate-passing OCR observations must AGREE on the same plate text
+    # before that text becomes a durable Vehicle/Plate sighting. 1 preserves the
+    # previous behavior (persist on the first passing read). 2 means a single
+    # lucky frame can no longer create a vehicle record.
+    #
+    # Reads below this threshold are NOT discarded — they stay in the track's
+    # accumulator and are reported as untrusted, exactly as the "keep uncertain
+    # reads" rule elsewhere in this pipeline requires.
+    plate_min_observations: int = 2
+    # What happens to a read that never reaches the threshold above.
+    #
+    # False (default): it is still persisted, but as an UNTRUSTED observation —
+    # forced to `pending_review` regardless of its confidence, so an operator
+    # sees it rather than the system presenting one frame as settled fact. This
+    # is what keeps a genuinely fast-moving vehicle, seen in a single inference
+    # cycle, from being lost entirely.
+    #
+    # True: uncorroborated reads are not persisted at all. Available for
+    # deployments that would rather lose that sighting than hold an
+    # uncorroborated one; off by default because silently discarding real
+    # observations is the worse failure for an investigative system.
+    plate_require_consensus: bool = False
+    # Minimum variants that must agree before a multi-variant read counts as
+    # corroborated. Only consulted when multi-variant preprocessing is enabled;
+    # with one variant every read trivially has agreement 1 and this is unused.
+    # Measured: on the labelled corpus, reads with <=2 of 7 variants agreeing
+    # were correct 0 times out of 13, while >=5 of 7 were correct 4 times out of
+    # 4 — agreement separates correct from incorrect far more cleanly than OCR
+    # confidence does.
+    plate_min_variants_agreeing: int = 2
+
+    # Save the plate region OCR actually read alongside the full-frame evidence
+    # snapshot, so a reviewer can see what the read was based on instead of
+    # taking the text on trust. Off by default: it is one extra small image
+    # write per NEW sighting (not per frame), and a deployment under storage
+    # pressure should opt in rather than be opted in.
+    plate_debug_crops: bool = False
     # Temporal aggregation: a track's plate is considered settled once this
     # many agreeing reads clear this peak confidence. Until then every
     # inference cycle re-reads it.
@@ -261,6 +337,7 @@ class Settings(BaseSettings):
     # beyond it the endpoint fails fast with 429 rather than queueing (a
     # queued probe still holds a request and still ends up waiting 20s).
     camera_test_connection_max_concurrent: int = 3
+
 
     # Optional egress policy for operator-supplied camera sources (workstream
     # C3, see pipeline/egress_policy.py). When True, a source whose host

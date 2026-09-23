@@ -136,6 +136,27 @@ async def _on_startup():
     # verify_chain() reports them honestly as unchained rather than pretending
     # a retroactive hash covers writes it never actually witnessed.
     ensure_columns("audit_logs", {"chain_seq": "INTEGER", "prev_hash": "VARCHAR", "entry_hash": "VARCHAR"})
+    # ANPR explainability: which preprocessing variant produced the read, how
+    # many variants agreed, whether the temporal layer corroborated it, and the
+    # plate crop OCR actually looked at. All left NULL for existing rows —
+    # genuinely unrecorded. `corroborated` in particular is NOT backfilled to
+    # true: a pre-existing row was written under a pipeline that persisted on a
+    # single read, so claiming it was corroborated would assert evidence that
+    # was never gathered. NULL reads as "unknown", which is the truth.
+    ensure_columns(
+        "plates",
+        {
+            "ocr_variant": "VARCHAR", "variants_agreeing": "INTEGER",
+            "corroborated": "BOOLEAN", "plate_crop_path": "VARCHAR",
+        },
+    )
+    # Corroboration on the vehicle (A1 precision hardening). NOT backfilled to
+    # true: existing rows were written by a pipeline that escalated watchlist
+    # alerts on confidence alone, so claiming they were corroborated would
+    # assert evidence that was never gathered. NULL reads as "not corroborated",
+    # which caps their watchlist alerts at HIGH until a fresh corroborated
+    # sighting arrives — the safe direction for a missing safety signal.
+    ensure_columns("vehicles", {"plate_corroborated": "BOOLEAN"})
     ensure_indexes("plates", ["review_status"])
     ensure_indexes("alerts", ["feedback"])
     ensure_indexes("audit_logs", ["chain_seq"])

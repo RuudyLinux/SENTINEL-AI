@@ -73,7 +73,8 @@ def test_concurrent_cross_camera_alerts_never_open_two_incidents_for_one_vehicle
         db_session.add(models.WatchlistEntry(
             entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="stress",
         ))
-        vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.95, watchlist_flag=True)
+        vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.95, watchlist_flag=True,
+                                 plate_corroborated=True)
         db_session.add(vehicle)
         db_session.commit()
         vehicle_id = vehicle.id
@@ -138,7 +139,8 @@ def test_the_second_alert_correlates_rather_than_opening_its_own_incident(db_ses
     db_session.add(models.WatchlistEntry(
         entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="stress",
     ))
-    vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.95, watchlist_flag=True)
+    vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.95, watchlist_flag=True,
+                                 plate_corroborated=True)
     db_session.add(vehicle)
     db_session.commit()
     vehicle_id = vehicle.id

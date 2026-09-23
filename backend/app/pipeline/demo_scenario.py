@@ -133,7 +133,12 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
         # unhandled 500. Same bounded retry contract as the rest of the
         # pipeline now applies here too.
         await safe_flush(db, "demo_scenario", reapply=lambda _det=det: db.add(_det))
-        vehicle = await upsert_vehicle_for_plate(db, plate, sighting_confidence)
+        # `corroborated=True`: the scenario models a vehicle read confidently and
+        # repeatedly across a real multi-camera journey, which is exactly the
+        # case that legitimately escalates to CRITICAL. Passing False here would
+        # demo an uncorroborated single-frame read, which the pipeline correctly
+        # caps at HIGH — an accurate demo of the wrong thing.
+        vehicle = await upsert_vehicle_for_plate(db, plate, sighting_confidence, corroborated=True)
         plate_row = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera.id, detection_id=det.id,
             plate_text_raw=plate, plate_text_normalized=plate,

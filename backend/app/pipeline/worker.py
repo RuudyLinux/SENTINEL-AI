@@ -21,10 +21,13 @@ from ..config import settings
 from ..ws import manager, EventType
 from .source import CameraSource
 from .detector import detect_and_track, release_model
-from .anpr import read_plate, passes_anpr_gate, review_status_for, better_read
+from .anpr import (
+    read_plate, passes_anpr_gate, review_status_for, better_read,
+    read_plate_structured, passes_read_gate, looks_like_plate,
+)
 from .appearance import compute_signature
 from .correlate import upsert_vehicle_for_plate, upsert_plate_sighting, upsert_track
-from . import plate_detect, plate_tracker
+from . import plate_detect, plate_detector, plate_preprocess, plate_tracker
 from .rules_engine import evaluate, find_incident_for_alert
 from .timing import compute_source_timestamp
 from .db_retry import safe_commit, safe_flush, close_session
@@ -261,6 +264,11 @@ VEHICLE_CLASSES = ("car", "truck", "bus", "motorbike")
 _PLATE_REAPPLY_FIELDS = (
     "confidence", "plate_text_normalized", "plate_text_raw", "reads_count",
     "last_seen", "snapshot_path", "plate_bbox", "vehicle_bbox",
+    # The ANPR explainability fields are mutated on the same persistent row by
+    # upsert_plate_sighting, so they need the same rollback treatment — without
+    # this a retry would restore the last-committed provenance onto a row whose
+    # text and confidence were reassigned from the new read.
+    "ocr_variant", "variants_agreeing", "corroborated", "plate_crop_path",
 )
 _TRACK_REAPPLY_FIELDS = ("last_seen", "detection_count", "vehicle_id", "plate_reads")
 
@@ -280,6 +288,109 @@ def _restore_row(db: Session, row: Any, values: "dict[str, Any] | None") -> None
     db.add(row)
     for name, value in (values or {}).items():
         setattr(row, name, value)
+
+
+def _rejection_reason(read) -> str:
+    """Why the quality gate turned a read down. One of a small fixed set, so it
+    can be a Prometheus label without unbounded cardinality."""
+    if not read.normalized:
+        return "no_text"
+    if not looks_like_plate(read.normalized):
+        return "bad_format"
+    if read.confidence < settings.plate_min_confidence:
+        return "low_confidence"
+    return "low_variant_agreement"
+
+
+async def _read_plate_for_track(
+    crop: np.ndarray, camera_code: str, offset_x: int, offset_y: int,
+) -> "tuple[Any, list[float] | None, np.ndarray | None]":
+    """Localize a plate in a vehicle crop and read it.
+
+    Returns `(OcrRead, full_frame_plate_bbox_or_None, plate_crop_or_None)`.
+
+    Sequence, and why each step is where it is:
+
+    1. **Detect** candidate plate regions. Only the best is read — each extra
+       region is a full OCR pass, the most expensive operation in the loop.
+    2. **Crop + perspective-correct + preprocess** that region. Perspective
+       correction only fires when the detector recovered a genuinely skewed
+       quad, so a front-on plate does not pay for a warp.
+    3. **Read** every configured preprocessing variant and select between them
+       by agreement (`anpr.select_candidate`). With the default single-variant
+       configuration this is one OCR pass, exactly as before.
+    4. **Fall back to the whole vehicle crop** if the localized read fails the
+       gate. Measured (docs/ANPR_ACCURACY.md): localization sometimes returns a
+       sub-region of the plate, after which OCR reads nothing — on a labelled
+       corpus that cut exact match from 0.16 to 0.04. The fallback pass is paid
+       ONLY on failure, so a successful localization keeps its ~3x speed win.
+    """
+    metrics.PLATE_DETECT_ATTEMPTS.labels(camera_code=camera_code).inc()
+    detect_started = time.monotonic()
+    boxes = await asyncio.to_thread(plate_detector.detect_plates, crop)
+    metrics.PLATE_DETECT_SECONDS.labels(camera_code=camera_code).observe(
+        time.monotonic() - detect_started
+    )
+
+    plate_bbox: list[float] | None = None
+    plate_crop_image: np.ndarray | None = None
+    variants: list[tuple[str, np.ndarray]] = []
+    if boxes:
+        box = boxes[0]
+        metrics.PLATE_LOCALIZED.labels(camera_code=camera_code, source=box.source).inc()
+        metrics.PLATE_DETECT_CONFIDENCE.labels(
+            camera_code=camera_code, source=box.source,
+        ).observe(box.confidence)
+        plate_crop_image = plate_detector.crop_plate(crop, box)
+        if plate_crop_image is not None:
+            variants = await asyncio.to_thread(
+                plate_preprocess.build_variants, plate_crop_image,
+                plate_detector.quad_in_crop(box, crop),
+            )
+            # The localizer works in the crop's coordinate space; the stored
+            # bbox is full-frame so it can be drawn on a frame or an evidence
+            # snapshot without the caller needing the vehicle box to offset it.
+            plate_bbox = [
+                box.x1 + offset_x, box.y1 + offset_y, box.x2 + offset_x, box.y2 + offset_y,
+            ]
+    if not variants:
+        # No plate region found — read the whole vehicle crop, i.e. the
+        # pre-localization behavior. A localization miss degrades the read's
+        # quality, it does not discard it. plate_bbox stays None, which is the
+        # honest record that this read was NOT localized.
+        variants = await asyncio.to_thread(
+            plate_preprocess.build_variants, crop, None,
+        )
+        plate_bbox, plate_crop_image = None, None
+
+    ocr_started = time.monotonic()
+    read = await asyncio.to_thread(read_plate_structured, variants)
+    if plate_bbox is not None and not passes_read_gate(read):
+        fallback_variants = await asyncio.to_thread(plate_preprocess.build_variants, crop, None)
+        fallback = await asyncio.to_thread(read_plate_structured, fallback_variants)
+        if _better_structured_read(read, fallback) is fallback:
+            # The winning read came from the whole crop, so the localized box
+            # does not describe it — recorded as null rather than attaching a
+            # bbox that points at the wrong region.
+            read, plate_bbox, plate_crop_image = fallback, None, None
+    metrics.OCR_SECONDS.labels(camera_code=camera_code).observe(time.monotonic() - ocr_started)
+    return read, plate_bbox, plate_crop_image
+
+
+def _better_structured_read(first, second):
+    """Pick the more trustworthy of two structured reads of the same plate.
+
+    Same ranking as `anpr.better_read` — gate-pass beats non-pass, then
+    non-empty beats empty, then higher confidence — lifted to `OcrRead` so the
+    variant/agreement provenance travels with the winner instead of being
+    flattened back to a tuple and lost.
+    """
+    first_passes, second_passes = passes_read_gate(first), passes_read_gate(second)
+    if first_passes != second_passes:
+        return first if first_passes else second
+    if bool(first.normalized) != bool(second.normalized):
+        return first if first.normalized else second
+    return first if first.confidence >= second.confidence else second
 
 
 async def _run_anpr(
@@ -335,44 +446,23 @@ async def _run_anpr(
 
     new_read = False
     if plate_tracker.should_ocr(camera_id, track_id):
-        ocr_started = time.monotonic()
-        metrics.PLATE_OCR_ATTEMPTS.labels(camera_code=camera_code).inc()
-        located = await asyncio.to_thread(plate_detect.locate_plate, crop)
-        if located is not None:
-            metrics.PLATE_LOCALIZED.labels(camera_code=camera_code).inc()
-            plate_image, rel_bbox = located
-            # Localizer works in the crop's coordinate space; the stored bbox is
-            # full-frame so it can be drawn on a frame or an evidence snapshot
-            # without the caller needing the vehicle box to offset it.
-            plate_bbox = [rel_bbox[0] + x1, rel_bbox[1] + y1, rel_bbox[2] + x1, rel_bbox[3] + y1]
-        else:
-            # No plate region found — fall back to the whole vehicle crop, i.e.
-            # the pre-V2 read. A localization miss degrades the read's quality,
-            # it does not discard it. plate_bbox stays None, which is the honest
-            # record that this read was NOT localized.
-            plate_image, plate_bbox = crop, None
-        raw, normalized, conf = await asyncio.to_thread(read_plate, plate_image)
-        # Measured fix (docs/ANPR_ACCURACY.md): localization sometimes returns a
-        # sub-region of the plate, after which OCR reads nothing or garbage —
-        # on a real labelled corpus it cut exact-match from 0.16 to 0.04. When
-        # the localized read fails the quality gate, fall back to the whole
-        # vehicle crop and keep whichever read is genuinely better. The second
-        # OCR pass is only paid on FAILURE, so the ~3x speed win of a
-        # successful localization is preserved.
-        if located is not None and not passes_anpr_gate(normalized, conf):
-            fallback = await asyncio.to_thread(read_plate, crop)
-            raw, normalized, conf = better_read((raw, normalized, conf), fallback)
-            if passes_anpr_gate(normalized, conf):
-                # The winning read came from the whole crop, so the localized
-                # box does not describe it — recorded as null rather than
-                # attaching a bbox that points at the wrong region.
-                plate_bbox = None
-        metrics.OCR_SECONDS.labels(camera_code=camera_code).observe(time.monotonic() - ocr_started)
-        if passes_anpr_gate(normalized, conf):
+        read, plate_bbox, plate_crop_image = await _read_plate_for_track(
+            crop, camera_code, offset_x=x1, offset_y=y1,
+        )
+        if passes_read_gate(read):
             metrics.PLATE_OCR_ACCEPTED.labels(camera_code=camera_code).inc()
-            state = plate_tracker.record_read(camera_id, track_id, normalized, conf, raw, plate_bbox)
+            metrics.OCR_CONFIDENCE.labels(camera_code=camera_code).observe(read.confidence)
+            metrics.PLATE_VARIANTS_AGREEING.labels(camera_code=camera_code).observe(read.variants_agreeing)
+            state = plate_tracker.record_read(
+                camera_id, track_id, read.normalized, read.confidence, read.raw, plate_bbox,
+                variant=read.variant, variants_agreeing=read.variants_agreeing,
+                plate_crop=plate_crop_image,
+            )
             new_read = True
         else:
+            metrics.PLATE_OCR_REJECTED.labels(
+                camera_code=camera_code, reason=_rejection_reason(read),
+            ).inc()
             # Nothing usable this pass. Recorded so an unreadable track (rear of
             # a truck, plate out of frame) is retried on the reverify interval
             # rather than on every single inference cycle forever.
@@ -382,6 +472,15 @@ async def _run_anpr(
     if best is None:
         return None, None, None
     plate_text, peak_confidence, reads = best
+    # Temporal gate: a plate only becomes TRUSTED intelligence once enough
+    # independent frames agreed on it. An uncorroborated read is still recorded
+    # (a vehicle crossing the frame in one inference cycle is real and must not
+    # be lost) but is forced to `pending_review` below, so one lucky frame can
+    # no longer present itself as a settled vehicle identity.
+    corroborated = plate_tracker.has_consensus(camera_id, track_id)
+    if not corroborated and settings.plate_require_consensus:
+        # Strict mode: the operator has chosen to hold nothing uncorroborated.
+        return None, None, None
     if not plate_tracker.should_persist(camera_id, track_id, new_read):
         # Nothing changed worth a write; the caller still gets the vehicle so
         # rule evaluation (watchlist) keeps firing on every frame it should.
@@ -391,12 +490,24 @@ async def _run_anpr(
         )
         return vehicle, None, None
 
-    vehicle = await upsert_vehicle_for_plate(db, plate_text, peak_confidence)
+    vehicle = await upsert_vehicle_for_plate(db, plate_text, peak_confidence, corroborated)
     snapshot_path = None
+    plate_crop_path = None
     if state.plate_row_id is None:
         # One evidence snapshot per sighting, taken at the moment the vehicle is
         # first confidently identified here — not one per OCR frame.
         snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+        # The plate region that produced the read, saved alongside the full
+        # frame so an operator reviewing a sighting can see what OCR actually
+        # looked at rather than having to trust the text. Best-effort and
+        # opt-in: a failure here must never cost the sighting itself.
+        if settings.plate_debug_crops and state.last_plate_crop is not None:
+            plate_crop_path = await asyncio.to_thread(
+                _save_snapshot, state.last_plate_crop, f"{camera_code}_plate",
+            )
+    metrics.PLATE_CONSENSUS_REACHED.labels(
+        camera_code=camera_code, outcome="corroborated" if corroborated else "uncorroborated",
+    ).inc()
     plate_row = await upsert_plate_sighting(
         db, vehicle=vehicle, camera_id=camera_id, track_id=track_id,
         detection_id=str(det_row.id), raw_text=state.votes[plate_text].raw,
@@ -405,6 +516,10 @@ async def _run_anpr(
         vehicle_bbox=vehicle_bbox, plate_bbox=state.last_plate_bbox,
         snapshot_path=snapshot_path, source_timestamp=frame_source_ts,
         existing_plate_id=state.plate_row_id,
+        corroborated=corroborated,
+        ocr_variant=state.votes[plate_text].variant,
+        variants_agreeing=state.votes[plate_text].variants_agreeing,
+        plate_crop_path=plate_crop_path,
     )
     plate_tracker.bind_plate_row(camera_id, track_id, str(plate_row.id), str(vehicle.id), plate_text)
     metrics.VEHICLE_SIGHTINGS.labels(camera_code=camera_code).inc()
