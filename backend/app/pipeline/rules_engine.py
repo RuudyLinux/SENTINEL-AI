@@ -19,6 +19,7 @@ every active Zone/watchlist entry, matching this project's existing behavior —
 `schedule_start`/`schedule_end` window (previously declared on the model/schema but
 never actually read here — now enforced, see `_within_schedule`).
 """
+import asyncio
 import time
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
@@ -37,7 +38,11 @@ COOLDOWN_SECONDS = 45.0
 # origin, so a second worker cannot compare its cooldowns with this one's (both
 # fire, every alert doubles), and a restart resets that origin, which silently
 # re-fires every alert the cooldown was suppressing. See app/runtime_state.py.
-_alert_claims = runtime_state.ExpiringClaims()
+#
+# Redis-backed when settings.redis_url is set and reachable at startup, so the
+# same cooldown now holds across every worker process, not just this one —
+# in-process otherwise, identical to before this line existed.
+_alert_claims = runtime_state.build_claims_store("alert_cooldown", settings)
 
 # Loitering dwell-time tracking: (camera_id, zone_id, track_key) -> (first_seen_mono,
 # last_seen_mono), monotonic wall-clock, mirroring _last_alert_at's style. Pruned of
@@ -55,15 +60,27 @@ def _bbox_center_in_zone(bbox: list[float], frame_w: int, frame_h: int, zone: mo
     return zone.x1 <= cx <= zone.x2 and zone.y1 <= cy <= zone.y2
 
 
-def _on_cooldown(key: tuple) -> bool:
+async def _on_cooldown(key: tuple) -> bool:
     """True when this key fired recently, so the alert must be suppressed.
 
     The polarity is kept even though it is the inverse of `claim()`: every
     caller already relies on "checking the cooldown is what records it", and
     the ordering comment at the watchlist rule below depends on that side
     effect being here rather than at the call site.
+
+    `async` only because the Redis-backed store needs to be. This function is
+    called synchronously from inside `evaluate()`, which is awaited directly
+    in the per-frame camera loop (worker.py) — a blocking network round trip
+    here would stall every camera's frame processing at once. The in-process
+    store (`is_local = True`, the default with no Redis configured) is a
+    dict operation and stays on this coroutine directly, at its original
+    cost; only the Redis-backed store's genuinely blocking call is dispatched
+    to a thread, so a deployment that never sets REDIS_URL pays nothing extra
+    for a distribution mechanism it isn't using.
     """
-    return not _alert_claims.claim(key, COOLDOWN_SECONDS)
+    if _alert_claims.is_local:
+        return not _alert_claims.claim(key, COOLDOWN_SECONDS)
+    return not await asyncio.to_thread(_alert_claims.claim, key, COOLDOWN_SECONDS)
 
 
 def _parse_hhmm(value: str) -> "tuple[int, int] | None":
@@ -200,7 +217,7 @@ async def evaluate(
     # calling it first and then declining to fire would consume the cooldown
     # window of an alert that was never sent.
     entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle and vehicle.watchlist_flag else None
-    if entry is not None and not _on_cooldown((camera.id, "watchlist", vehicle.id)):
+    if entry is not None and not await _on_cooldown((camera.id, "watchlist", vehicle.id)):
         rule = db.query(models.AlertRule).filter(
             models.AlertRule.rule_type == "watchlist_plate", models.AlertRule.active == True  # noqa: E712
         ).first()
@@ -272,7 +289,7 @@ async def evaluate(
         if not _within_schedule(zone, at):
             continue
 
-        if not _on_cooldown((camera.id, "zone", zone.id, track_key)):
+        if not await _on_cooldown((camera.id, "zone", zone.id, track_key)):
             reasons.append(f"Restricted-zone entry: '{zone.name}' on {camera.camera_code}")
             if zone.severity == "CRITICAL" or severity != "CRITICAL":
                 severity = zone.severity if zone.severity in ("HIGH", "CRITICAL") else severity
@@ -298,7 +315,7 @@ async def evaluate(
                 first_seen, _ = _zone_presence.get(presence_key, (now_mono, now_mono))
                 _zone_presence[presence_key] = (first_seen, now_mono)
                 dwell = now_mono - first_seen
-                if dwell >= zone.loitering_seconds and not _on_cooldown((camera.id, "loitering", zone.id, track_key)):
+                if dwell >= zone.loitering_seconds and not await _on_cooldown((camera.id, "loitering", zone.id, track_key)):
                     reasons.append(
                         f"Loitering: object present in '{zone.name}' on {camera.camera_code} "
                         f"for over {int(zone.loitering_seconds)}s"

@@ -22,6 +22,7 @@ from typing import Any
 from .. import models, metrics
 from ..db import SessionLocal
 from .. import runtime_state
+from ..config import settings
 from ..ws import manager, EventType
 
 logger = logging.getLogger("sentinel.self_heal")
@@ -56,7 +57,14 @@ _DEDUP_WINDOW_S = 10.0
 # Shared-state seam (app/runtime_state.py): this was a `time.monotonic()` dict,
 # which a second process cannot read and a restart resets. The effect of either
 # is the same — the burst of repeats this exists to swallow gets written anyway.
-_recovered_claims = runtime_state.ExpiringClaims()
+#
+# This call site stays sync and is never awaited: `record_event_sync` (below)
+# is either run directly (a synchronous caller already off the event loop) or
+# reached through `record_event`'s `await asyncio.to_thread(record_event_sync,
+# ...)`, so a blocking Redis call inside it is already off the loop either way
+# — no async wrapper needed here the way rules_engine's cooldown check needed
+# one.
+_recovered_claims = runtime_state.build_claims_store("self_heal_dedup", settings)
 
 
 def _key(component: str, camera_id: str | None) -> tuple[str, str]:

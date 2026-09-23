@@ -364,6 +364,25 @@ class Settings(BaseSettings):
     # Absolute ceiling for the automatic calculation.
     worker_thread_pool_max: int = 160
 
+    # --- Distributed runtime state (app/runtime_state.py) --------------------
+    # Empty (the default): every worker/API process keeps the alert cooldown,
+    # self-heal dedup window and login rate limiter in its own memory — correct
+    # for exactly one process, and the existing behaviour of every deployment
+    # before this setting existed.
+    #
+    # Set to a real Redis URL (e.g. redis://redis:6379/0) and the same three
+    # move to Redis, shared across every process talking to it: two workers no
+    # longer double-fire an alert, a restart no longer clears every cooldown or
+    # every login lockout. If Redis is configured but unreachable at startup,
+    # this fails OPEN to the in-process store — logged once, not fatal — the
+    # same "never let optional infrastructure take down the app" stance this
+    # codebase already takes with the camera grid and self-heal discovery.
+    redis_url: str = ""
+    # How long a startup Redis ping may take before falling back. Short on
+    # purpose: this blocks app startup, and a slow Redis is not meaningfully
+    # different from an absent one for this decision.
+    redis_connect_timeout_seconds: float = 2.0
+
     # Optional egress policy for operator-supplied camera sources (workstream
     # C3, see pipeline/egress_policy.py). When True, a source whose host
     # resolves to a loopback, link-local, private, reserved, multicast or

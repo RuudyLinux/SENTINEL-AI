@@ -39,8 +39,12 @@ far-future expiry that would suppress alerts until the clock caught up.
 """
 from __future__ import annotations
 
+import logging
 import time
+import uuid
 from typing import Callable, Hashable
+
+logger = logging.getLogger("sentinel.runtime_state")
 
 Clock = Callable[[], float]
 
@@ -75,6 +79,13 @@ class ExpiringClaims:
     Expired entries are dropped on write, and the bound is a backstop for the
     case where writes arrive faster than entries expire.
     """
+
+    #: False for the Redis-backed sibling below. A caller on a hot path (the
+    #: camera loop) uses this to decide whether a claim needs to be dispatched
+    #: to a thread — an in-process claim is a dict operation and dispatching
+    #: it would only add thread-pool overhead for nothing; a Redis claim is a
+    #: network round trip and MUST NOT run directly on the event loop.
+    is_local = True
 
     def __init__(self, *, max_keys: int = 10_000, clock: Clock = time.time) -> None:
         self._claimed_at: dict[Hashable, float] = {}
@@ -145,6 +156,8 @@ class SlidingWindow:
     lockout, which is why an entry already at the limit is never evicted.
     """
 
+    is_local = True  # see ExpiringClaims.is_local
+
     def __init__(self, *, max_keys: int = 10_000, clock: Clock = time.time) -> None:
         self._events: dict[Hashable, list[float]] = {}
         self._max_keys = max_keys
@@ -205,3 +218,260 @@ class SlidingWindow:
         )
         for _, _, key in evictable[: len(self._events) - self._max_keys]:
             self._events.pop(key, None)
+
+
+# --- Redis-backed implementations -----------------------------------------
+#
+# Same two interfaces, same call signatures, a network round trip instead of
+# a dict lookup. `redis` is imported lazily inside build_*() rather than at
+# module scope: REDIS_URL is empty on most deployments (every one before this
+# module existed), and this module must import cleanly whether or not the
+# `redis` package happens to be installed at all.
+#
+# Failure policy, applied uniformly: a Redis error is logged ONCE per process
+# (further errors during an outage would otherwise flood the log for as long
+# as Redis stays down) and the call then returns the value that FAILS OPEN --
+# `claim()` returns True (the action proceeds; a real alert firing when Redis
+# hiccups is the same direction this codebase already takes with a missing
+# corroboration signal -- see Vehicle.plate_corroborated's NULL handling), and
+# `count()`/`record()` return 0 (nothing is rate-limited; the login limiter's
+# own comment already says an availability failure is worse than the
+# brute-force it defends against). Redis being down must never be the reason
+# a real alert is silently swallowed or an operator is locked out.
+
+
+def _redis_key(prefix: str, key: Hashable) -> str:
+    """A key repr is used rather than str() -- repr distinguishes ("a", "b")
+    from "a", "b" and 1 from "1", which str() does not, and two logically
+    different in-process keys colliding into one Redis key would silently
+    merge their cooldowns."""
+    return f"{prefix}:{key!r}"
+
+
+class RedisExpiringClaims:
+    """ExpiringClaims, shared across every process pointed at the same
+    Redis. SET key 1 NX EX ttl is the whole implementation: NX makes the set
+    conditional on the key not existing, so "check, then claim" is one atomic
+    round trip rather than two -- the same race a separate GET-then-SET would
+    have between two processes is exactly what NX exists to close.
+    """
+
+    is_local = False
+
+    def __init__(self, client, prefix: str) -> None:
+        self._client = client
+        self._prefix = prefix
+        self._warned = False
+
+    def _warn_once(self, exc: Exception) -> None:
+        if not self._warned:
+            self._warned = True
+            logger.warning(
+                "runtime_state: Redis unavailable for %s (%s) -- failing open "
+                "until it recovers; further errors this process are not "
+                "logged individually",
+                self._prefix, exc,
+            )
+
+    def claim(self, key: Hashable, ttl_seconds: float) -> bool:
+        import math
+        try:
+            granted = self._client.set(
+                _redis_key(self._prefix, key), "1",
+                nx=True, ex=max(1, math.ceil(ttl_seconds)),
+            )
+            return bool(granted)
+        except Exception as exc:  # redis.RedisError and friends
+            self._warn_once(exc)
+            return True  # fail open: the action proceeds
+
+    def release(self, key: Hashable) -> None:
+        try:
+            self._client.delete(_redis_key(self._prefix, key))
+        except Exception as exc:
+            self._warn_once(exc)
+
+    def clear(self) -> None:
+        """Test/ops use only -- a real deployment never clears this wholesale.
+        scan_iter rather than KEYS: KEYS blocks the whole Redis server on a
+        large keyspace, which nothing here needs even for a test."""
+        try:
+            for k in self._client.scan_iter(match=f"{self._prefix}:*", count=500):
+                self._client.delete(k)
+        except Exception as exc:
+            self._warn_once(exc)
+
+    def __len__(self) -> int:
+        try:
+            return sum(1 for _ in self._client.scan_iter(match=f"{self._prefix}:*", count=500))
+        except Exception as exc:
+            self._warn_once(exc)
+            return 0
+
+
+class RedisSlidingWindow:
+    """SlidingWindow, shared across every process. Each key is a Redis sorted
+    set: the score is the event's wall-clock time, so
+    ZREMRANGEBYSCORE key -inf (now-window) prunes everything outside the
+    window in one call and ZCARD counts what is left -- the same two-step
+    "prune, then count" the in-process version does, just server-side instead
+    of by rebuilding a Python list.
+
+    The member has to be unique per event (a Redis set cannot hold the same
+    member twice), which a bare timestamp is not on a fast machine -- a short
+    random suffix is appended so two events in the same millisecond both
+    count.
+    """
+
+    is_local = False
+
+    def __init__(self, client, prefix: str) -> None:
+        self._client = client
+        self._prefix = prefix
+        self._warned = False
+
+    def _warn_once(self, exc: Exception) -> None:
+        if not self._warned:
+            self._warned = True
+            logger.warning(
+                "runtime_state: Redis unavailable for %s (%s) -- failing open "
+                "until it recovers; further errors this process are not "
+                "logged individually",
+                self._prefix, exc,
+            )
+
+    def record(self, key: Hashable, window_seconds: float, *, limit: int) -> int:
+        import math
+        redis_key = _redis_key(self._prefix, key)
+        try:
+            now = time.time()
+            member = f"{now!r}:{uuid.uuid4().hex[:8]}"
+            pipe = self._client.pipeline()
+            pipe.zremrangebyscore(redis_key, "-inf", now - window_seconds)
+            pipe.zadd(redis_key, {member: now})
+            # Safety TTL well past the window: an abandoned key (an attacker
+            # who stops, an account nobody logs into again) is not left in
+            # Redis forever. Not the mechanism that expires individual
+            # events -- ZREMRANGEBYSCORE above is -- only a backstop for the
+            # key itself.
+            pipe.expire(redis_key, max(1, math.ceil(window_seconds * 2)))
+            pipe.zcard(redis_key)
+            results = pipe.execute()
+            return int(results[-1])
+        except Exception as exc:
+            self._warn_once(exc)
+            return 0  # fail open: nothing is rate-limited
+
+    def count(self, key: Hashable, window_seconds: float) -> int:
+        redis_key = _redis_key(self._prefix, key)
+        try:
+            now = time.time()
+            pipe = self._client.pipeline()
+            pipe.zremrangebyscore(redis_key, "-inf", now - window_seconds)
+            pipe.zcard(redis_key)
+            results = pipe.execute()
+            return int(results[-1])
+        except Exception as exc:
+            self._warn_once(exc)
+            return 0
+
+    def forget(self, key: Hashable) -> None:
+        try:
+            self._client.delete(_redis_key(self._prefix, key))
+        except Exception as exc:
+            self._warn_once(exc)
+
+    def clear(self) -> None:
+        try:
+            for k in self._client.scan_iter(match=f"{self._prefix}:*", count=500):
+                self._client.delete(k)
+        except Exception as exc:
+            self._warn_once(exc)
+
+    def __len__(self) -> int:
+        try:
+            return sum(1 for _ in self._client.scan_iter(match=f"{self._prefix}:*", count=500))
+        except Exception as exc:
+            self._warn_once(exc)
+            return 0
+
+
+def _try_connect(redis_url: str, connect_timeout: float):
+    """One ping at startup, not a connection pool health check on every call.
+
+    A Redis that is merely SLOW is treated the same as one that is absent --
+    this blocks application startup, and a slow dependency is not a distinct
+    case worth a separate policy from a missing one. If it accepts real
+    connections but degrades later, that is what each store's own per-call
+    fail-open handles; this function only decides which implementation to
+    hand back at boot.
+    """
+    try:
+        import redis as redis_module
+    except ImportError:
+        logger.warning(
+            "runtime_state: REDIS_URL is set but the `redis` package is not "
+            "installed -- falling back to in-process state"
+        )
+        return None
+    try:
+        client = redis_module.Redis.from_url(
+            redis_url, socket_connect_timeout=connect_timeout, socket_timeout=connect_timeout,
+        )
+        client.ping()
+        return client
+    except Exception as exc:
+        logger.warning(
+            "runtime_state: could not reach Redis at startup (%s) -- falling "
+            "back to in-process state for this process's lifetime", exc,
+        )
+        return None
+
+
+#: Set once at startup by the first build_claims_store/build_sliding_window
+#: call (see get_redis_client). Reused so every store shares one connection
+#: pool rather than opening a new one per cooldown/limiter.
+_redis_client = "unattempted"
+
+
+def get_redis_client(settings):
+    """The shared client, or None if REDIS_URL is unset or unreachable.
+
+    Connects at most once per process -- later calls, even after a transient
+    failure, reuse that decision rather than re-probing Redis on every store
+    construction. A process that started without Redis stays that way; that
+    matches every other "discover once at boot" pattern in this codebase
+    (the camera catalogue, the self-heal supervisor)."""
+    global _redis_client
+    if _redis_client == "unattempted":
+        if settings.redis_url:
+            _redis_client = _try_connect(settings.redis_url, settings.redis_connect_timeout_seconds)
+        else:
+            _redis_client = None
+    return _redis_client
+
+
+def build_claims_store(name: str, settings, *, max_keys: int = 10_000):
+    """The store a module should hold at import time -- in-process unless
+    REDIS_URL resolves to a reachable Redis, in which case every process
+    pointed at the same URL shares one claim table under this `name`.
+
+    `max_keys` only bounds the in-process fallback (Redis manages its own
+    memory and eviction as a separate service, and has no equivalent
+    per-store cap in this client) -- but it is accepted unconditionally
+    rather than only in the fallback branch, so a caller's choice of bound
+    does not silently stop applying the moment Redis becomes reachable.
+    """
+    client = get_redis_client(settings)
+    if client is None:
+        return ExpiringClaims(max_keys=max_keys)
+    return RedisExpiringClaims(client, prefix=f"sentinel:claims:{name}")
+
+
+def build_sliding_window(name: str, settings, *, max_keys: int = 10_000):
+    """The window-counter equivalent of build_claims_store. Same `max_keys`
+    caveat: it bounds the in-process fallback only."""
+    client = get_redis_client(settings)
+    if client is None:
+        return SlidingWindow(max_keys=max_keys)
+    return RedisSlidingWindow(client, prefix=f"sentinel:window:{name}")

@@ -1,4 +1,9 @@
 fastapi
+# V2: distributed runtime state (app/runtime_state.py) — alert cooldown,
+# self-heal dedup, login rate limiting — shared across processes when
+# REDIS_URL is set. Unused (falls back to in-process) when it is unset, so it
+# costs nothing on a single-node dev checkout.
+redis
 uvicorn[standard]
 sqlalchemy
 pydantic-settings

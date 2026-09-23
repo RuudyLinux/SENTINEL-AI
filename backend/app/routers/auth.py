@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..db import get_db
 from .. import runtime_state
+from ..config import settings
 from ..security import verify_password, create_access_token, get_current_user
 from ..audit import log_action
 
@@ -48,7 +49,9 @@ _LOGIN_MAX_TRACKED_USERNAMES = 1024
 # matters beyond tidiness: a monotonic reading is per-process, so with a second
 # API process the same five failures are counted twice and neither side ever
 # reaches the limit, and a restart cleared every lockout outright.
-_failed_attempts = runtime_state.SlidingWindow(max_keys=_LOGIN_MAX_TRACKED_USERNAMES)
+_failed_attempts = runtime_state.build_sliding_window(
+    "login_attempts", settings, max_keys=_LOGIN_MAX_TRACKED_USERNAMES,
+)
 
 
 def _limiter_key(username: str, ip: str = "") -> str:
