@@ -20,10 +20,10 @@ from app.pipeline import rules_engine
 @pytest.fixture(autouse=True)
 def _clean_cooldowns():
     # Module-level dicts shared across the whole test session otherwise.
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
 
 
@@ -112,7 +112,7 @@ class TestIncidentCorrelation:
         first = _evaluate(db_session, camera_a, _detection(db_session, camera_a), vehicle)[0]
         # Cleared so the cooldown (a separate concern) does not suppress the
         # second alert — this test is about correlation, not dedup.
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera_b, _detection(db_session, camera_b), vehicle)[0]
 
         incidents = db_session.query(models.Incident).filter(models.Incident.vehicle_id == vehicle.id).all()
@@ -126,7 +126,7 @@ class TestIncidentCorrelation:
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(db_session, f"GJ05LK{uuid.uuid4().hex[:4].upper()}")
         first = _evaluate(db_session, camera, _detection(db_session, camera), vehicle)[0]
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera, _detection(db_session, camera), vehicle)[0]
 
         incident = rules_engine.find_incident_for_alert(db_session, first.id)
@@ -143,7 +143,7 @@ class TestIncidentCorrelation:
         vehicle = _watchlisted_vehicle(db_session, plate)
 
         _evaluate(db_session, camera_a, _detection(db_session, camera_a), vehicle)
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera_b, _detection(db_session, camera_b), vehicle)[0]
 
         incident = rules_engine.find_incident_for_alert(db_session, second.id)
@@ -159,7 +159,7 @@ class TestIncidentCorrelation:
         vehicle_b = _watchlisted_vehicle(db_session, f"GJ05BB{uuid.uuid4().hex[:4].upper()}")
 
         first = _evaluate(db_session, camera, _detection(db_session, camera), vehicle_a)[0]
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera, _detection(db_session, camera), vehicle_b)[0]
 
         assert rules_engine.find_incident_for_alert(db_session, first.id).id != \
@@ -176,7 +176,7 @@ class TestIncidentCorrelation:
         incident = rules_engine.find_incident_for_alert(db_session, first.id)
         incident.created_at = datetime.utcnow() - timedelta(hours=3)
         db_session.commit()
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera, _detection(db_session, camera), vehicle)[0]
 
         assert rules_engine.find_incident_for_alert(db_session, second.id).id != incident.id
@@ -191,7 +191,7 @@ class TestIncidentCorrelation:
         incident = rules_engine.find_incident_for_alert(db_session, first.id)
         incident.status = "closed"
         db_session.commit()
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         second = _evaluate(db_session, camera, _detection(db_session, camera), vehicle)[0]
 
         second_incident = rules_engine.find_incident_for_alert(db_session, second.id)

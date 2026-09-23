@@ -45,13 +45,13 @@ def real_cameras(db_session):
 
 
 def test_record_event_sync_persists_a_real_row(db_session):
-    # `_last_recovered_at` is module-global dedup state: a RECOVERED event for
+    # `_recovered_claims` is module-global dedup state: a RECOVERED event for
     # the same (component, camera_id, error_type) recorded recently by ANY
     # earlier test suppresses this one, and record_event_sync then correctly
     # returns None. The concurrency tests genuinely produce
     # ("database", None, "SQLITE_LOCK") events, which is exactly this key.
     # Caught by the --random-order gate; invisible under alphabetical order.
-    self_heal._last_recovered_at.clear()
+    self_heal._recovered_claims.clear()
     row = self_heal.record_event_sync(
         component="database", error_type="SQLITE_LOCK", severity="warning",
         message="test lock event", recovery_action="ROLLBACK_RETRY",
@@ -132,7 +132,7 @@ def test_repeated_recovered_events_for_the_same_condition_are_deduped(real_camer
     (component, camera_id, error_type) within the dedup window is suppressed
     (returns None, no new row); a still-real FAILED for the same key is
     never suppressed."""
-    self_heal._last_recovered_at.clear()
+    self_heal._recovered_claims.clear()
     first = self_heal.record_event_sync(
         component="database", camera_id="cam_dedup", error_type="SQLITE_LOCK",
         message="lock 1", status="RECOVERED", severity="warning",

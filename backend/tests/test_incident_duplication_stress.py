@@ -34,10 +34,10 @@ ROUNDS = 12
 
 @pytest.fixture(autouse=True)
 def _clean_cooldowns():
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
 
 
@@ -68,7 +68,7 @@ def test_concurrent_cross_camera_alerts_never_open_two_incidents_for_one_vehicle
     failures = []
 
     for round_index in range(ROUNDS):
-        rules_engine._last_alert_at.clear()
+        rules_engine._alert_claims.clear()
         plate = f"GJ05DS{uuid.uuid4().hex[:4].upper()}"
         db_session.add(models.WatchlistEntry(
             entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="stress",
@@ -134,7 +134,7 @@ def test_the_second_alert_correlates_rather_than_opening_its_own_incident(db_ses
     winner's incident (recorded with a correlation reason), not be silently
     dropped. A test that only counted incidents would pass if the second
     alert vanished entirely."""
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     plate = f"GJ05DC{uuid.uuid4().hex[:4].upper()}"
     db_session.add(models.WatchlistEntry(
         entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="stress",

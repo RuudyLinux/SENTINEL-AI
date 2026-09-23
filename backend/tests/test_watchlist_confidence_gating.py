@@ -18,10 +18,10 @@ from app.pipeline import rules_engine
 
 @pytest.fixture(autouse=True)
 def _clean_cooldowns():
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
 
 

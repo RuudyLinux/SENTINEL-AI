@@ -43,10 +43,10 @@ def _make_camera_and_full_frame_zone(db_session, severity="HIGH", camera_code=No
 
 @pytest.fixture(autouse=True)
 def _clear_rule_engine_state():
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
 
 
@@ -207,7 +207,7 @@ def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_se
     db_session.add(detection)
     db_session.commit()
 
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     alerts = asyncio.run(rules_engine.evaluate(db_session, camera, detection, 640, 480, vehicle))
     assert len(alerts) == 1
     assert alerts[0].severity == "CRITICAL"

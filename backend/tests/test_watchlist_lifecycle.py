@@ -41,9 +41,9 @@ from app.pipeline import correlate, rules_engine
 
 @pytest.fixture(autouse=True)
 def _clean_cooldowns():
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
 
 
 @pytest.fixture

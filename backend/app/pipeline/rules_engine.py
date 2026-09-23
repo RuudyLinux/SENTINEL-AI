@@ -28,10 +28,16 @@ from ..config import settings
 from ..ws import manager, EventType
 from . import risk
 from .db_retry import safe_commit
+from .. import runtime_state
 from ..evidence_hash import sha256_file
 
 COOLDOWN_SECONDS = 45.0
-_last_alert_at: dict[tuple, float] = {}
+# Was a bare `dict[tuple, float]` of `time.monotonic()` readings. Two problems
+# that dict could not solve: a monotonic reading is measured from a per-process
+# origin, so a second worker cannot compare its cooldowns with this one's (both
+# fire, every alert doubles), and a restart resets that origin, which silently
+# re-fires every alert the cooldown was suppressing. See app/runtime_state.py.
+_alert_claims = runtime_state.ExpiringClaims()
 
 # Loitering dwell-time tracking: (camera_id, zone_id, track_key) -> (first_seen_mono,
 # last_seen_mono), monotonic wall-clock, mirroring _last_alert_at's style. Pruned of
@@ -50,12 +56,14 @@ def _bbox_center_in_zone(bbox: list[float], frame_w: int, frame_h: int, zone: mo
 
 
 def _on_cooldown(key: tuple) -> bool:
-    now = time.monotonic()
-    last = _last_alert_at.get(key)
-    if last is not None and now - last < COOLDOWN_SECONDS:
-        return True
-    _last_alert_at[key] = now
-    return False
+    """True when this key fired recently, so the alert must be suppressed.
+
+    The polarity is kept even though it is the inverse of `claim()`: every
+    caller already relies on "checking the cooldown is what records it", and
+    the ordering comment at the watchlist rule below depends on that side
+    effect being here rather than at the call site.
+    """
+    return not _alert_claims.claim(key, COOLDOWN_SECONDS)
 
 
 def _parse_hhmm(value: str) -> "tuple[int, int] | None":

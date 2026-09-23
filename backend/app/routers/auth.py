@@ -1,10 +1,10 @@
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..db import get_db
+from .. import runtime_state
 from ..security import verify_password, create_access_token, get_current_user
 from ..audit import log_action
 
@@ -42,7 +42,13 @@ _LOGIN_WINDOW_SECONDS = 60.0
 #     tests/test_login_ratelimit_hardening.py).
 _LOGIN_KEY_MAX_CHARS = 128
 _LOGIN_MAX_TRACKED_USERNAMES = 1024
-_failed_attempts: dict[str, list[float]] = {}
+# Both bounds above now live in the shared store (app/runtime_state.py), which
+# carries this module's eviction policy verbatim — including the rule that an
+# entry already at the limit is never evicted. The move off `time.monotonic()`
+# matters beyond tidiness: a monotonic reading is per-process, so with a second
+# API process the same five failures are counted twice and neither side ever
+# reaches the limit, and a restart cleared every lockout outright.
+_failed_attempts = runtime_state.SlidingWindow(max_keys=_LOGIN_MAX_TRACKED_USERNAMES)
 
 
 def _limiter_key(username: str, ip: str = "") -> str:
@@ -69,54 +75,19 @@ def _limiter_key(username: str, ip: str = "") -> str:
     return f"{(username or '')[:_LOGIN_KEY_MAX_CHARS]}|{(ip or '')[:64]}"
 
 
-def _prune_expired(now: float) -> None:
-    """Drop entries whose attempts have all aged out. Cheap, and it is what
-    keeps the table bounded in the normal case (a real deployment's failed
-    logins are few and expire on their own)."""
-    stale = [
-        key for key, attempts in _failed_attempts.items()
-        if not any(now - t < _LOGIN_WINDOW_SECONDS for t in attempts)
-    ]
-    for key in stale:
-        _failed_attempts.pop(key, None)
-
-
-def _enforce_table_cap(now: float) -> None:
-    """Hard bound for the adversarial case: a spray fast enough that nothing
-    has expired yet. Evicts the entries FURTHEST from being rate limited
-    (fewest recent attempts, oldest first) and never an entry already at the
-    limit — so the eviction cannot be used to clear a real lockout."""
-    if len(_failed_attempts) <= _LOGIN_MAX_TRACKED_USERNAMES:
-        return
-    evictable = [
-        (len(attempts), min(attempts, default=now), key)
-        for key, attempts in _failed_attempts.items()
-        if len(attempts) < _LOGIN_MAX_ATTEMPTS
-    ]
-    evictable.sort()
-    for _, _, key in evictable[: len(_failed_attempts) - _LOGIN_MAX_TRACKED_USERNAMES]:
-        _failed_attempts.pop(key, None)
-
-
 def _rate_limited(username: str, ip: str = "") -> bool:
-    now = time.monotonic()
-    key = _limiter_key(username, ip)
-    attempts = [t for t in _failed_attempts.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
-    if attempts:
-        _failed_attempts[key] = attempts
-    else:
-        # Nothing recent — drop the entry entirely rather than leaving an
-        # empty list behind (the original leak: an empty list still pinned
-        # the attacker-supplied key in the dict forever).
-        _failed_attempts.pop(key, None)
-    return len(attempts) >= _LOGIN_MAX_ATTEMPTS
+    """Read-only: counting must not itself count as an attempt, or a client
+    polling the login endpoint would lock out the account it is asking about.
+    `count()` still drops an entry whose attempts have all aged out, which is
+    what kept an empty list from pinning an attacker-supplied key forever."""
+    attempts = _failed_attempts.count(_limiter_key(username, ip), _LOGIN_WINDOW_SECONDS)
+    return attempts >= _LOGIN_MAX_ATTEMPTS
 
 
 def _record_failed_attempt(username: str, ip: str = "") -> None:
-    now = time.monotonic()
-    _failed_attempts.setdefault(_limiter_key(username, ip), []).append(now)
-    _prune_expired(now)
-    _enforce_table_cap(now)
+    _failed_attempts.record(
+        _limiter_key(username, ip), _LOGIN_WINDOW_SECONDS, limit=_LOGIN_MAX_ATTEMPTS,
+    )
 
 
 @router.post("/login", response_model=schemas.TokenResponse)
@@ -131,7 +102,7 @@ def login(payload: schemas.LoginRequest, request: Request, db: Session = Depends
         _record_failed_attempt(payload.username, client_ip)
         log_action(db, None, "login_failed", resource=payload.username, result="FAILURE", ip=client_ip)
         raise HTTPException(status_code=401, detail="Incorrect Police ID or password")
-    _failed_attempts.pop(_limiter_key(payload.username, client_ip), None)
+    _failed_attempts.forget(_limiter_key(payload.username, client_ip))
     if not user.active:
         # Audited: correct credentials against a DISABLED account is exactly
         # the event worth seeing — a revoked operator still holding a working
