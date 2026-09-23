@@ -106,8 +106,15 @@ _TRANSITIONS: dict[str, set[str]] = {
     "PROCESSING": {"PROCESSING", "CONNECTED", "DEGRADED", "RECONNECTING"},
     "DEGRADED": {"DEGRADED", "CONNECTED", "PROCESSING", "RECONNECTING"},
     "RECONNECTING": {"RECONNECTING", "CONNECTED", "PROCESSING", "DEGRADED"},
-    # A stopped or failed camera comes back only by being started again.
-    "DISCONNECTED": {"DISCONNECTED", "DISCOVERING", "CONNECTING"},
+    # A stopped or failed camera comes back only by being started again --
+    # AND, real sequence caught live by this table's own instrumentation
+    # (not a hypothetical): a fresh worker's very first connect attempt can
+    # fail fast enough that `_open_with_timeout` marks DISCONNECTED before
+    # its caller's own fallback retries via `_reopen_with_backoff` in the
+    # SAME call, which marks RECONNECTING immediately after. That two-line
+    # fallback (`if not opened: opened = await _reopen_with_backoff(...)`)
+    # is intended behaviour, not a bug the table should be flagging.
+    "DISCONNECTED": {"DISCONNECTED", "DISCOVERING", "CONNECTING", "RECONNECTING"},
     "AUTH_ERROR": {"AUTH_ERROR", "DISCOVERING", "CONNECTING"},
     # ERROR is set by the loop's catch-all; the comment at that call site says
     # the next successful iteration flips it straight back, so it reaches the
@@ -149,6 +156,30 @@ def _set_grid_state(camera_id: str, state: str) -> None:
             camera_id, previous, state,
         )
     stats["grid_state"] = state
+
+
+#: Which DB `Camera.status` (the legacy 3-value online/offline/degraded
+#: column — see the comment on `grid_state` above) a grid_state write should
+#: also produce, wherever that write is one of the 8 sites in this file that
+#: sets `camera.status`. A grid_state absent here (CONNECTING, DISCOVERING,
+#: ERROR) means status is left untouched at that transition — matching, not
+#: changing, the historical behaviour at every one of those 8 sites (verified
+#: by reading each before this table existed; ERROR in particular is the
+#: generic per-iteration exception handler, a genuine hot path where forcing
+#: a DB write on every transient blip would be a real, unjustified cost).
+#:
+#: Used to derive `camera.status` from the SAME local variable a call site
+#: passes to `_set_grid_state`, so the two literals a prior version of this
+#: file wrote independently — "degraded" here, "DEGRADED" three lines away —
+#: cannot drift apart the way they could when each was its own string.
+_DB_STATUS_FOR_GRID_STATE: dict[str, str] = {
+    "CONNECTED": "online",
+    "PROCESSING": "online",
+    "DEGRADED": "degraded",
+    "RECONNECTING": "degraded",
+    "DISCONNECTED": "offline",
+    "AUTH_ERROR": "offline",
+}
 
 
 def _ema(prev: float | None, sample: float, alpha: float = 0.2) -> float:
@@ -267,10 +298,16 @@ async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db
         # object's mutated attributes back to their last-committed DB value
         # (verified empirically; see db_retry.py's module docstring).
         degraded_error_count = camera.error_count + 1  # type: ignore[operator]
-        camera.status = "degraded"  # type: ignore[assignment]
+        # grid_state is RECONNECTING for the whole retry loop (set once at
+        # this function's entry); this derives the paired status from the
+        # SAME table that says what RECONNECTING means, rather than the two
+        # being two independently-written literals a future edit could let
+        # drift apart.
+        camera.status = _DB_STATUS_FOR_GRID_STATE["RECONNECTING"]  # type: ignore[assignment]
         camera.error_count = degraded_error_count  # type: ignore[assignment]
+        _reconnecting_status = camera.status
         await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
-            setattr(camera, "status", "degraded"),
+            setattr(camera, "status", _reconnecting_status),
             setattr(camera, "error_count", degraded_error_count),
         ))
         delay = min(settings.reconnect_backoff_max, settings.reconnect_backoff_base * (2 ** (attempt - 1)))
@@ -282,14 +319,26 @@ async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db
             if ok:
                 online_fps = source.fps() or camera.fps or 15.0
                 online_resolution = source.resolution() or camera.resolution
-                camera.status = "online"  # type: ignore[assignment]
+                # grid_state was left at RECONNECTING (set at this function's
+                # entry) up to this point. Both of this function's callers
+                # correct it shortly after receiving True back — one via the
+                # main loop's own next-iteration desired_state check, the
+                # other explicitly a few lines below its own call site — but
+                # that left a real window (a diagnostics read, or the Camera
+                # Grid UI, between "reopened" and "caller got around to
+                # saying so") for no reason: the moment this function itself
+                # knows the stream is back is the natural place to say so.
+                new_state = "CONNECTED"
+                camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
                 camera.fps = online_fps  # type: ignore[assignment]
                 camera.resolution = online_resolution  # type: ignore[assignment]
+                _reopened_status = camera.status
                 await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
-                    setattr(camera, "status", "online"),
+                    setattr(camera, "status", _reopened_status),
                     setattr(camera, "fps", online_fps),
                     setattr(camera, "resolution", online_resolution),
                 ))
+                _set_grid_state(camera_id, new_state)
                 await self_heal.record_event(
                     component="camera", camera_id=camera_id, error_type=error_type,
                     severity="info", message=f"Camera {camera_code} stream reopened",
@@ -902,26 +951,35 @@ async def _camera_loop(camera_id: str) -> None:
             opened = await _reopen_with_backoff(source, camera, db, reason="initial_connect")
         if not opened:
             offline_error_count = camera.error_count + 1  # type: ignore[operator]
-            camera.status = "offline"  # type: ignore[assignment]  # legacy Column() declarative model — plain-value assignment is correct at runtime
+            new_state = "DISCONNECTED"
+            camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
             camera.error_count = offline_error_count  # type: ignore[assignment]
             await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
-                setattr(camera, "status", "offline"),
+                setattr(camera, "status", _DB_STATUS_FOR_GRID_STATE[new_state]),
                 setattr(camera, "error_count", offline_error_count),
             ))
+            # AUTH_ERROR is a more specific diagnosis than DISCONNECTED and
+            # must not be overwritten by it — orthogonal to the DB status
+            # question just above, since the 3-value contract has no
+            # separate "auth error" status; "offline" is correct either way.
             if _stats(camera_id)["grid_state"] not in ("AUTH_ERROR",):
-                _set_grid_state(camera_id, "DISCONNECTED")
+                _set_grid_state(camera_id, new_state)
             return
         initial_fps = source.fps() or 15.0
         initial_resolution = source.resolution()
-        camera.status = "online"  # type: ignore[assignment]
+        # grid_state was left at CONNECTING (direct path) or RECONNECTING
+        # (via _reopen_with_backoff above, which now also self-corrects on
+        # its own success — see its own "new_state = CONNECTED" site). The
+        # main loop's own desired_state check would correct this again on
+        # the next successful frame read regardless, but that is a window
+        # with no guarantee the first read succeeds; setting it here from the
+        # same variable that derives the status below removes the window
+        # instead of hoping the loop closes it quickly.
+        new_state = "CONNECTED"
+        camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
         camera.fps = initial_fps  # type: ignore[assignment]
         camera.resolution = initial_resolution  # type: ignore[assignment]
-        # grid_state was left at CONNECTING (direct path) or RECONNECTING
-        # (via _reopen_with_backoff above) — the main loop's own desired_state
-        # check corrects this on the next successful frame read, but that is
-        # a window with no guarantee the first read succeeds. Setting it here
-        # removes the window instead of hoping the loop closes it quickly.
-        _set_grid_state(camera_id, "CONNECTED")
+        _set_grid_state(camera_id, new_state)
         await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
             setattr(camera, "status", "online"),
             setattr(camera, "fps", initial_fps),
@@ -995,10 +1053,11 @@ async def _camera_loop(camera_id: str) -> None:
                     camera.error_count = read_fail_error_count  # type: ignore[assignment]
                     st["read_failures"] += 1
                     if consecutive_failures < settings.read_failures_before_reconnect:
-                        camera.status = "degraded"  # type: ignore[assignment]
-                        _set_grid_state(camera_id, "DEGRADED")
+                        new_state = "DEGRADED"
+                        camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
+                        _set_grid_state(camera_id, new_state)
                         await _safe_commit(db, camera_code_cached, reapply=lambda: (
-                            setattr(camera, "status", "degraded"),
+                            setattr(camera, "status", _DB_STATUS_FOR_GRID_STATE[new_state]),
                             setattr(camera, "error_count", read_fail_error_count),
                         ))
                         loop_sleep_s = 1.0
@@ -1008,10 +1067,13 @@ async def _camera_loop(camera_id: str) -> None:
                         # "degraded" forever.
                         reopened = await _reopen_with_backoff(source, camera, db)
                         if not reopened:
-                            camera.status = "offline"  # type: ignore[assignment]
+                            new_state = "DISCONNECTED"
+                            camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
+                            # Same AUTH_ERROR precedence rule as the
+                            # initial-connect-failure site above.
                             if _stats(camera_id)["grid_state"] not in ("AUTH_ERROR",):
-                                _set_grid_state(camera_id, "DISCONNECTED")
-                            await _safe_commit(db, camera_code_cached, reapply=lambda: setattr(camera, "status", "offline"))
+                                _set_grid_state(camera_id, new_state)
+                            await _safe_commit(db, camera_code_cached, reapply=lambda: setattr(camera, "status", _DB_STATUS_FOR_GRID_STATE[new_state]))
                             return  # stop this worker; operator can Restart the camera
                         consecutive_failures = 0
                         session_opened_at = datetime.now(timezone.utc)
@@ -1073,11 +1135,19 @@ async def _camera_loop(camera_id: str) -> None:
                     # succeeded above).
                     heartbeat_last_frame_at = datetime.now(timezone.utc)
                     camera.last_frame_at = heartbeat_last_frame_at  # type: ignore[assignment]
-                    camera.status = "online"  # type: ignore[assignment]
+                    # No _set_grid_state call here on purpose: this runs on
+                    # every successful frame, downstream in the SAME
+                    # iteration of the desired_state check above, which has
+                    # already set grid_state to CONNECTED or PROCESSING —
+                    # both map to "online", so this can never disagree with
+                    # whichever of the two is actually current, and a call
+                    # here would only repeat work already done this iteration.
+                    heartbeat_status = _DB_STATUS_FOR_GRID_STATE["CONNECTED"]
+                    camera.status = heartbeat_status  # type: ignore[assignment]
                     if now_mono - last_heartbeat_commit_at >= HEARTBEAT_MIN_INTERVAL_S:
                         await _safe_commit(db, camera_code_cached, reapply=lambda: (
                             setattr(camera, "last_frame_at", heartbeat_last_frame_at),
-                            setattr(camera, "status", "online"),
+                            setattr(camera, "status", heartbeat_status),
                         ))
                         last_heartbeat_commit_at = now_mono
                     loop_sleep_s = max(0.01, 1.0 / max(camera_fps_cached, 1.0))
@@ -1159,8 +1229,9 @@ async def _camera_loop_supervised(camera_id: str) -> None:
             db: Session = SessionLocal()
             try:
                 camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+                new_state = "DISCONNECTED"
                 if camera:
-                    camera.status = "offline"  # type: ignore[assignment]
+                    camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
                     camera.error_count += 1  # type: ignore[assignment]
                     db.commit()
                 # Real gap this closed: the worker task is dead once we are
@@ -1169,7 +1240,7 @@ async def _camera_loop_supervised(camera_id: str) -> None:
                 # would sit at whatever it last was (e.g. PROCESSING) forever,
                 # disagreeing with the DB's "offline" and with the actual
                 # (nonexistent) worker, until an operator restarts the camera.
-                _set_grid_state(camera_id, "DISCONNECTED")
+                _set_grid_state(camera_id, new_state)
             finally:
                 db.close()
         except Exception:

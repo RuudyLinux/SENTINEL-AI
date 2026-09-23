@@ -82,6 +82,19 @@ class TestARealBootLifecycle:
         worker._set_grid_state("cam1", "CONNECTED")
         assert worker.ILLEGAL_TRANSITIONS == {}
 
+    def test_a_fast_failing_initial_connect_falls_straight_into_a_retry(self):
+        """Caught live, not hypothesised: `start_worker`'s own fallback is
+        `opened = await _open_with_timeout(...); if not opened: opened =
+        await _reopen_with_backoff(...)` in one call. `_open_with_timeout`
+        marks DISCONNECTED on a synchronous failure; `_reopen_with_backoff`'s
+        own first line then marks RECONNECTING, immediately, same call stack.
+        Running this backend locally at 8000 produced exactly this sequence
+        for two real cameras before the table accounted for it."""
+        worker._set_grid_state("cam1", "CONNECTING")
+        worker._set_grid_state("cam1", "DISCONNECTED")
+        worker._set_grid_state("cam1", "RECONNECTING")
+        assert worker.ILLEGAL_TRANSITIONS == {}
+
 
 class TestIllegalTransitionsAreCaughtNotSilent:
     def test_jumping_straight_to_processing_from_disconnected_is_flagged(self):
