@@ -12,7 +12,46 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.fixture
+def real_cameras(db_session):
+    """SelfHealEvent.camera_id is a real FOREIGN KEY to cameras.id. These
+    tests used to invent ids ("cam_test_bad", "cam_dedup") that no camera row
+    ever had — which only worked while SQLite silently ignored foreign keys.
+    With `PRAGMA foreign_keys=ON` (app/db.py, matching what PostgreSQL has
+    always enforced) those inserts are rejected, and `record_event_sync` —
+    correctly, being best-effort and never-raising — swallowed the failure,
+    so the events simply vanished and the assertions saw an empty set.
+
+    Creating the cameras for real is what production actually does: a
+    self-heal event is always recorded against a camera that exists.
+    """
+    created = []
+    for camera_id in ("cam_test_ok", "cam_test_bad", "cam_flap", "cam_dedup"):
+        if db_session.query(models.Camera).filter(models.Camera.id == camera_id).first() is None:
+            camera = models.Camera(
+                id=camera_id, camera_code=f"SH-{camera_id}", name=camera_id,
+                source_type="video_file", source_uri="x.mp4",
+            )
+            db_session.add(camera)
+            created.append(camera)
+    db_session.commit()
+    yield
+    for camera in created:
+        db_session.query(models.SelfHealEvent).filter(
+            models.SelfHealEvent.camera_id == camera.id
+        ).delete(synchronize_session=False)
+        db_session.delete(camera)
+    db_session.commit()
+
+
 def test_record_event_sync_persists_a_real_row(db_session):
+    # `_recovered_claims` is module-global dedup state: a RECOVERED event for
+    # the same (component, camera_id, error_type) recorded recently by ANY
+    # earlier test suppresses this one, and record_event_sync then correctly
+    # returns None. The concurrency tests genuinely produce
+    # ("database", None, "SQLITE_LOCK") events, which is exactly this key.
+    # Caught by the --random-order gate; invisible under alphabetical order.
+    self_heal._recovered_claims.clear()
     row = self_heal.record_event_sync(
         component="database", error_type="SQLITE_LOCK", severity="warning",
         message="test lock event", recovery_action="ROLLBACK_RETRY",
@@ -26,7 +65,7 @@ def test_record_event_sync_persists_a_real_row(db_session):
     assert reloaded.status == "RECOVERED"
 
 
-def test_open_problems_excludes_recovered_but_includes_failed():
+def test_open_problems_excludes_recovered_but_includes_failed(real_cameras):
     self_heal._LATEST.clear()
     self_heal.record_event_sync(
         component="camera", camera_id="cam_test_ok", error_type="CAMERA_TIMEOUT",
@@ -42,7 +81,7 @@ def test_open_problems_excludes_recovered_but_includes_failed():
     assert "cam_test_ok" not in camera_ids
 
 
-def test_a_later_recovered_event_clears_the_open_problem():
+def test_a_later_recovered_event_clears_the_open_problem(real_cameras):
     self_heal._LATEST.clear()
     self_heal.record_event_sync(component="worker", camera_id="cam_flap", error_type="WORKER_EXCEPTION", message="crash", status="FAILED")
     assert any(p.camera_id == "cam_flap" for p in self_heal.open_problems())
@@ -86,14 +125,14 @@ def test_self_heal_event_detail_404_for_unknown_id(client, admin_token):
     assert resp.status_code == 404
 
 
-def test_repeated_recovered_events_for_the_same_condition_are_deduped():
+def test_repeated_recovered_events_for_the_same_condition_are_deduped(real_cameras):
     """Audit finding: sustained-but-transient contention on one camera can
     hit-and-recover a lock on nearly every heartbeat — logging every single
     one would drown the Error Log. A repeat RECOVERED for the identical
     (component, camera_id, error_type) within the dedup window is suppressed
     (returns None, no new row); a still-real FAILED for the same key is
     never suppressed."""
-    self_heal._last_recovered_at.clear()
+    self_heal._recovered_claims.clear()
     first = self_heal.record_event_sync(
         component="database", camera_id="cam_dedup", error_type="SQLITE_LOCK",
         message="lock 1", status="RECOVERED", severity="warning",

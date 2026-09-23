@@ -77,7 +77,7 @@ export default function AlertDetailPage() {
         <div className="bg-panel border border-border rounded-lg p-4 text-sm">
           <div className="text-xs text-slate-500 mb-1">Related Vehicle</div>
           <div className="font-mono">{vehicle.plate_text} {vehicle.watchlist_flag && <span className="text-critical">⚠ WATCHLIST</span>}</div>
-          <button onClick={() => router.push(`/vehicles/tracking?vehicle_id=${vehicle.id}`)} className="text-xs text-accent hover:underline mt-1">
+          <button onClick={() => router.push(`/vehicles/tracking?vehicle_id=${vehicle.id}`)} className="row-action text-xs text-accent hover:underline mt-1">
             VIEW TRAJECTORY →
           </button>
         </div>

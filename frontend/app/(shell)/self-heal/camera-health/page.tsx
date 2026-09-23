@@ -6,6 +6,7 @@ import ErrorState from "@/components/ErrorState";
 import DataTable, { type Column } from "@/components/DataTable";
 import StatusDot from "@/components/StatusDot";
 import { api, ApiError } from "@/lib/api";
+import { aiState } from "@/lib/cameraState";
 import { SelfHealStatusBadge } from "@/components/SelfHealBadges";
 
 type Camera = {
@@ -16,14 +17,6 @@ type Camera = {
 
 type Diagnostics = Record<string, unknown>;
 type SelfHealEvent = { id: string; timestamp: string; error_type: string; recovery_action: string; status: string };
-
-function aiState(c: Camera): string {
-  if (c.grid_state === "PROCESSING") return "AI RUNNING";
-  if (c.grid_state === "CONNECTED") return "AI STOPPED";
-  if (c.grid_state === "ERROR") return "AI ERROR";
-  if (c.grid_state === "RECONNECTING" || c.grid_state === "CONNECTING") return "AI STARTING";
-  return "—";
-}
 
 export default function CameraHealthPage() {
   const { data: cameras, error, reload } = useApiData<Camera[]>("/api/cameras", { pollMs: 5000 });

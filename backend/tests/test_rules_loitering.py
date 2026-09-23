@@ -41,7 +41,7 @@ def _make_person_detection(db_session, camera, ts, track_id="9"):
 
 
 def test_loitering_does_not_fire_before_dwell_threshold(monkeypatch, db_session):
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     t = [1000.0]
     monkeypatch.setattr(rules_engine.time, "monotonic", lambda: t[0])
@@ -63,7 +63,7 @@ def test_loitering_does_not_fire_before_dwell_threshold(monkeypatch, db_session)
 
 
 def test_loitering_fires_once_past_threshold_then_respects_cooldown(monkeypatch, db_session):
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     t = [2000.0]
     monkeypatch.setattr(rules_engine.time, "monotonic", lambda: t[0])
@@ -90,7 +90,7 @@ def test_loitering_fires_once_past_threshold_then_respects_cooldown(monkeypatch,
 
 
 def test_zone_and_loitering_alerts_suppressed_outside_schedule_window(monkeypatch, db_session):
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     t = [3000.0]
     monkeypatch.setattr(rules_engine.time, "monotonic", lambda: t[0])

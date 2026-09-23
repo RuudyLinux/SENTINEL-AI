@@ -1,8 +1,8 @@
 "use client";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { LoaderCircle, ShieldCheck } from "lucide-react";
-import { api, setToken, setStoredUser, ApiError } from "@/lib/api";
+import { LoaderCircle, ShieldCheck, PlugZap } from "lucide-react";
+import { API_BASE, api, setToken, setStoredUser, ApiError, checkBackendIdentity, type ApiPreflight } from "@/lib/api";
 import BrandLogo from "@/components/BrandLogo";
 
 export default function LoginPage() {
@@ -16,6 +16,22 @@ export default function LoginPage() {
   // the router.push itself still fires immediately; this only covers the
   // form's own visual state in the moment before the route changes.
   const [success, setSuccess] = useState(false);
+  // Which backend this dashboard is actually pointed at. Checked once, here,
+  // because login is the first request anyone makes — if NEXT_PUBLIC_API_BASE
+  // resolves to another application (port 8000 is contested on a dev machine)
+  // the operator otherwise sees only "Login failed" and has no way to tell a
+  // wrong password from a wrong server.
+  const [preflight, setPreflight] = useState<ApiPreflight | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    checkBackendIdentity().then((result) => {
+      if (!cancelled) setPreflight(result);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -36,9 +52,9 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-ink px-4">
       <div className="w-full max-w-sm">
-        {/* Smart Shield branding — logo falls back to the project's existing
-            shield mark (app/icon.svg) until the real file is placed at
-            public/branding/smart-shield-logo.png (see that folder's README).
+        {/* Smart Shield branding — shows the project's own shield mark
+            (app/icon.svg) unless NEXT_PUBLIC_BRAND_LOGO_URL points at a real
+            logo (see public/branding/README.md).
             object-contain: never stretched, aspect ratio always preserved. */}
         <div className="text-center mb-8 animate-scale-in">
           <BrandLogo size={64} className="mx-auto" />
@@ -54,9 +70,19 @@ export default function LoginPage() {
           className="bg-panel border border-border rounded-lg p-6 space-y-4 animate-slide-up"
           style={{ animationDelay: "80ms" }}
         >
+          {/* htmlFor/id: these labels were visually adjacent to their inputs but
+              not programmatically associated with them, so a screen reader
+              announced two unlabelled text boxes. autoComplete lets a password
+              manager fill them, which matters for an account an operator uses
+              at the start of every shift. */}
           <div>
-            <label className="text-xs text-slate-400">Police ID / Username</label>
+            <label htmlFor="login-username" className="text-xs text-slate-400">
+              Police ID / Username
+            </label>
             <input
+              id="login-username"
+              name="username"
+              autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="mt-1 w-full bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent transition-colors duration-150"
@@ -64,9 +90,14 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <label className="text-xs text-slate-400">Password</label>
+            <label htmlFor="login-password" className="text-xs text-slate-400">
+              Password
+            </label>
             <input
+              id="login-password"
+              name="password"
               type="password"
+              autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="mt-1 w-full bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent transition-colors duration-150"
@@ -87,6 +118,17 @@ export default function LoginPage() {
               <option>Rajkot</option>
             </select>
           </div>
+          {/* Shown above the credential error on purpose: when the API base is
+              wrong, "Login failed" is a true but useless message, and the
+              cause is here. Login is not disabled — the check could itself be
+              wrong (a proxy, a cold start), and blocking the form on a
+              diagnostic would be worse than the problem it reports. */}
+          {preflight && preflight.status !== "ok" && (
+            <div className="text-xs text-medium bg-medium/10 border border-medium/30 rounded px-3 py-2 animate-slide-up flex gap-2">
+              <PlugZap size={14} strokeWidth={2.25} className="shrink-0 mt-px" />
+              <span>{preflight.message}</span>
+            </div>
+          )}
           {error && (
             <div className="text-xs text-critical bg-red-500/10 border border-red-500/30 rounded px-3 py-2 animate-slide-up">
               {error}
@@ -103,6 +145,11 @@ export default function LoginPage() {
           <div className="text-center text-xs text-slate-500">
             Demo accounts: admin / operator1 / investigator1 / auditor1 — password: sentinel123
           </div>
+          {/* The port this build was compiled against. NEXT_PUBLIC_* values are
+              inlined at BUILD time, so when this is wrong a restart will not
+              fix it — only a rebuild will, and printing it is what makes that
+              diagnosable at all. */}
+          <div className="text-center text-[10px] text-slate-600 break-all">API: {API_BASE}</div>
         </form>
       </div>
     </div>

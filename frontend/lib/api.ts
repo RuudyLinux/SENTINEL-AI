@@ -133,9 +133,100 @@ export async function buildTokenedUrl(tokenPath: string, resourcePath: string): 
   return `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}`;
 }
 
+/** A resource token's expiry, in epoch ms, or null if it cannot be read.
+ *  Read for SCHEDULING only — the backend enforces the same `exp`; a client
+ *  that miscomputes this gets a dropped stream, never extra access. */
+function tokenExpiresAt(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const { exp } = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Like buildTokenedUrl, plus the deadline the caller must refresh by.
+ *  The backend now ends an MJPEG stream when its token expires (a stream
+ *  authorized once used to run indefinitely), so a viewer left open past the
+ *  token TTL needs a fresh URL or the picture simply stops updating. The
+ *  timestamp makes the URL differ, which is what forces <img> to reconnect
+ *  rather than sit on the closed stream. */
+export async function buildTokenedStream(
+  tokenPath: string,
+  resourcePath: string,
+): Promise<{ url: string; expiresAt: number | null }> {
+  const token = await fetchResourceToken(tokenPath);
+  const sep = resourcePath.includes("?") ? "&" : "?";
+  return {
+    url: `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}&reconnect=${Date.now()}`,
+    expiresAt: tokenExpiresAt(token),
+  };
+}
+
 export async function openTokenedResource(tokenPath: string, resourcePath: string): Promise<void> {
   const url = await buildTokenedUrl(tokenPath, resourcePath);
   window.open(url, "_blank");
+}
+
+
+// --- Backend identity preflight -------------------------------------------
+// The dashboard talks to whatever is listening on NEXT_PUBLIC_API_BASE, and
+// port 8000 is a common default that other local Python/dev servers also
+// claim. When an UNRELATED app held 8000, every call still "worked" at the
+// transport level and the dashboard failed with assorted 404/422 noise from a
+// stranger's API — the one thing it never said is the only thing that was
+// wrong: this is not the SENTINEL backend.
+//
+// `/api/health` already returns a service name, so identity is checkable. The
+// check is deliberately separate from `request()`: it takes no token, is not
+// retried (a wrong app answers instantly and consistently — retrying only
+// delays the message), and it never throws, because its whole job is to
+// TURN a failure into a readable string.
+export const BACKEND_SERVICE_NAME = "sentinel-vision-backend";
+
+export type ApiPreflight =
+  | { status: "ok" }
+  | { status: "unreachable"; message: string }
+  | { status: "wrong-service"; message: string };
+
+export async function checkBackendIdentity(
+  base: string = API_BASE,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ApiPreflight> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${base}/api/health`, { method: "GET" });
+  } catch {
+    return {
+      status: "unreachable",
+      message: `No API is answering at ${base}. Start the backend, or point NEXT_PUBLIC_API_BASE at the port it is really on.`,
+    };
+  }
+  if (!res.ok) {
+    return {
+      status: "wrong-service",
+      message: `${base} answered ${res.status} on /api/health. Something is listening there, but it is not the SENTINEL backend.`,
+    };
+  }
+  let body: any = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  // A different app that happens to serve JSON (or HTML) on this path is the
+  // exact case being caught, so the service name must MATCH, not merely be
+  // absent-and-assumed-fine.
+  if (!body || body.service !== BACKEND_SERVICE_NAME) {
+    const saw = body && typeof body.service === "string" ? `"${body.service}"` : "no service name";
+    return {
+      status: "wrong-service",
+      message: `${base} is answering, but it is not the SENTINEL backend (expected "${BACKEND_SERVICE_NAME}", got ${saw}). Another application is probably holding that port.`,
+    };
+  }
+  return { status: "ok" };
 }
 
 export { ApiError };

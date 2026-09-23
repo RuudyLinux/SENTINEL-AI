@@ -1,0 +1,17 @@
+# node_modules MUST be excluded. The builder stage does
+# `COPY --from=deps /app/node_modules ./node_modules` and then `COPY . .`, so a
+# host node_modules would overwrite the correctly-installed Linux dependencies
+# with the developer's Windows-native ones — the build would either fail or
+# produce a broken image.
+node_modules/
+.next/
+out/
+
+# Build/test output that must not leak into an image.
+tsconfig.tsbuildinfo
+playwright-report/
+test-results/
+*.log
+
+.env
+.env.local

@@ -92,7 +92,10 @@ class Detection(Base):
     cls = Column(String, nullable=False)  # person | car | truck | bus | motorbike
     confidence = Column(Float, nullable=False)
     bbox = Column(JSON, default=list)  # [x1,y1,x2,y2]
-    track_id = Column(String, nullable=True)
+    # ByteTrack id, camera-scoped (detector.py keeps one tracker per camera).
+    # Indexed in V2: cross-referencing a vehicle sighting back to every frame of
+    # its track is a core investigation query, and was previously a table scan.
+    track_id = Column(String, nullable=True, index=True)
     model_version = Column(String, default="")
     snapshot_path = Column(String, nullable=True)
     # Cross-camera PERSON correlation (Phase 5): a compact HSV color-histogram
@@ -104,40 +107,162 @@ class Detection(Base):
 
 
 class Track(Base):
+    """One tracked object's life on ONE camera (ByteTrack track id scoped by
+    camera — ultralytics track ids are only unique per model/predictor
+    instance, and detector.py keeps one instance per camera).
+
+    Declared since the first version of this schema but never written until V2:
+    nothing in the pipeline carried a track id past the Detection row, so the
+    vehicle-track <-> plate association this table was designed to hold did not
+    exist. It is now written by pipeline/worker.py for every tracked vehicle,
+    and `vehicle_id` is filled in once that track's plate is confidently read —
+    which is what makes "track 284 IS vehicle GJ05AB1234" a real, queryable
+    fact rather than an inference across three joins."""
     __tablename__ = "tracks"
     id = Column(String, primary_key=True, default=lambda: uid("trk"))
-    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False)
+    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
     cls = Column(String, nullable=False)
-    yolo_track_id = Column(Integer, nullable=True)
+    yolo_track_id = Column(Integer, nullable=True, index=True)
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
-    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True)
+    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
+    # Running totals for this track, so a sighting carries "how well did we
+    # actually observe this" without recomputing over every Detection row.
+    detection_count = Column(Integer, default=0)
+    plate_reads = Column(Integer, default=0)
 
 
 class Vehicle(Base):
     __tablename__ = "vehicles"
     id = Column(String, primary_key=True, default=lambda: uid("veh"))
-    plate_text = Column(String, index=True, nullable=True)
+    # BUG-1 fix (10/10 debugging pass, 2026-09-11): was `index=True` only, no
+    # uniqueness. Two camera workers — each holding its own DB session — that
+    # both saw "no vehicle for this plate yet" for the SAME brand-new plate
+    # within the same race window could each insert a Vehicle row, silently
+    # splitting one real vehicle's identity across two rows: get_route()
+    # builds a cross-camera journey FROM Plate.vehicle_id, so a split vehicle
+    # silently loses half its route/sighting-count/risk signal, with no error
+    # anywhere. `unique=True` makes the SECOND insert fail loudly
+    # (IntegrityError) instead of silently succeeding; see
+    # `pipeline/correlate.py::upsert_vehicle_for_plate` for the recovery path
+    # that catches it and folds the loser into the winner. SQL UNIQUE treats
+    # multiple NULLs as distinct, so vehicles with no plate at all (e.g.
+    # person-only sightings) are unaffected — see
+    # tests/test_vehicle_upsert_race.py.
+    #
+    # Known residual gap: SQLite's `ALTER TABLE ADD COLUMN` (see
+    # db.py::ensure_columns, used for an already-existing SQLite database)
+    # cannot retroactively add a UNIQUE constraint to an existing table — only
+    # a fresh `create_all()` (new deployments, the test suite) or the
+    # Alembic-managed PostgreSQL path actually gets the DB-level guarantee.
+    # An already-running SQLite deployment upgraded in place keeps only the
+    # narrowed race window, not the hard guarantee, until its DB file is
+    # recreated. Documented in docs/THREAT_MODEL.md rather than silently
+    # assumed away.
+    plate_text = Column(String, unique=True, index=True, nullable=True)
     plate_confidence = Column(Float, default=0.0)
+    # Whether this vehicle's plate has EVER been corroborated across frames
+    # (pipeline/plate_tracker.has_consensus). A separate signal from
+    # plate_confidence and never blended into it: measured on the labelled
+    # benchmark, OCR confidence does not separate correct reads from wrong ones
+    # — correct reads span 0.262-0.990, wrong plate-shaped reads span
+    # 0.260-0.956 — so corroboration is independent evidence rather than more of
+    # the same.
+    #
+    # Ratchets up only: a vehicle identified well at one camera is not
+    # downgraded by a glimpse at the next. NULL on rows written before this
+    # column existed, and read as NOT corroborated — unknown provenance must not
+    # buy CRITICAL alert severity (see pipeline/rules_engine.py).
+    plate_corroborated = Column(Boolean, default=False)
     vehicle_type = Column(String, default="")
     color = Column(String, default="")
     first_seen = Column(DateTime, default=datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.utcnow)
+    # Indexed: "most recently seen vehicles" is the default ordering of both the
+    # vehicles list API and the live control room.
+    last_seen = Column(DateTime, default=datetime.utcnow, index=True)
     watchlist_flag = Column(Boolean, default=False)
 
 
 class Plate(Base):
+    """A plate recognition — and, in V2, a vehicle SIGHTING: one row per
+    (camera, vehicle track), not one per OCR frame.
+
+    Pre-V2 this table got a new row every inference cycle a plate happened to
+    read, so a vehicle stopped at a signal produced dozens of identical rows.
+    That mattered beyond storage: `correlate.get_route()` reconstructs a
+    vehicle's cross-camera journey FROM these rows, so one real sighting became
+    dozens of duplicate route hops. V2 creates the row on first confident read
+    and UPDATES it (`confidence`, `reads_count`, `last_seen`) as the same
+    tracked vehicle stays in frame — see pipeline/plate_tracker.py."""
     __tablename__ = "plates"
     id = Column(String, primary_key=True, default=lambda: uid("plt"))
-    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True)
-    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False)
+    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
+    camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     plate_text_raw = Column(String, default="")
     plate_text_normalized = Column(String, default="", index=True)
     confidence = Column(Float, default=0.0)
-    timestamp = Column(DateTime, default=datetime.utcnow)  # PROCESSING time
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time — FIRST confident read
     source_timestamp = Column(DateTime, nullable=True)  # SOURCE time — see Detection.source_timestamp
     snapshot_path = Column(String, nullable=True)
+    # --- V2 sighting fields ---
+    # ByteTrack track id (camera-scoped, stored as text to match
+    # Detection.track_id). Null for a read that arrived with no track id, and
+    # for every row written before V2 — never backfilled with a guess.
+    track_id = Column(String, nullable=True, index=True)
+    # Last time this same tracked vehicle was still being observed at this
+    # camera. `timestamp` is first-seen; the pair gives real dwell time.
+    last_seen = Column(DateTime, nullable=True)
+    # How many gate-passing OCR reads agreed on this plate text. 1 for a
+    # single-frame read; higher means real temporal corroboration.
+    reads_count = Column(Integer, default=1)
+    # The vehicle's own YOLO class and detection confidence at the moment of
+    # the recognition — so a sighting answers "what kind of vehicle" without a
+    # join back through Detection.
+    vehicle_class = Column(String, default="")
+    detection_confidence = Column(Float, default=0.0)
+    # Both boxes in FULL-FRAME pixel coordinates. plate_bbox is null when the
+    # localizer found no plate region and OCR fell back to the whole vehicle
+    # crop — that null is meaningful (it says the read is less trustworthy),
+    # so it is never filled in with the vehicle box as a substitute.
+    vehicle_bbox = Column(JSON, nullable=True)
+    plate_bbox = Column(JSON, nullable=True)
+    # --- Human-in-the-loop ANPR review (10/10 roadmap P7) ---
+    # auto_accepted: cleared the confidence gate, no operator action needed.
+    # pending_review: recorded (per the "keep uncertain reads, never discard
+    # them" rule anpr.py already follows) but below plate_min_confidence, or
+    # below watchlist_high_confidence_floor while carrying a watchlist match —
+    # waiting on an operator. corrected: an operator supplied the true text.
+    # rejected: an operator determined the read is not usable intelligence.
+    review_status = Column(String, default="auto_accepted", index=True)
+    reviewed_by = Column(String, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    # The operator-supplied correct plate text, kept SEPARATE from both
+    # plate_text_raw (literal OCR output) and plate_text_normalized (grammar-
+    # repaired OCR output) — three distinct facts: what OCR said, what the
+    # parser resolved it to, and what a human confirmed it actually is.
+    corrected_text = Column(String, nullable=True)
+    # --- ANPR explainability ---
+    # Every field below is a SEPARATE evidence signal, stored unblended so a
+    # sighting can be audited on what actually supported it. `confidence` above
+    # remains the OCR engine's own number and is never adjusted by any of these.
+    #
+    # Which preprocessing variant produced the winning read ("clahe" by default;
+    # see pipeline/plate_preprocess.py). Null on rows written before this
+    # existed — never backfilled with a guess.
+    ocr_variant = Column(String, nullable=True)
+    # How many preprocessing variants agreed on the text. 1 whenever
+    # multi-variant reading is disabled, which is the default.
+    variants_agreeing = Column(Integer, nullable=True)
+    # Whether the temporal layer got enough agreeing observations across frames
+    # to treat this as settled (pipeline/plate_tracker.has_consensus). False
+    # means the sighting is a real observation but an UNCORROBORATED one, and it
+    # is flagged pending_review regardless of how confident the read was.
+    corroborated = Column(Boolean, nullable=True)
+    # The plate region OCR actually read, saved next to the full-frame snapshot
+    # so a reviewer can see the evidence rather than only the text. Null unless
+    # PLATE_DEBUG_CROPS is enabled.
+    plate_crop_path = Column(String, nullable=True)
 
 
 class Person(Base):
@@ -210,6 +335,39 @@ class Alert(Base):
     source_timestamp = Column(DateTime, nullable=True)  # SOURCE time of the triggering detection
     acknowledged_by = Column(String, ForeignKey("users.id"), nullable=True)
     snapshot_path = Column(String, nullable=True)
+    # Explainable 0-100 risk score and the per-factor breakdown that produced
+    # it (see pipeline/risk.py). `reasons` above stays exactly what it was — the
+    # rule-match narrative — while these carry the weighted assessment. Both are
+    # kept: the reasons say WHAT matched, the factors say how much each mattered.
+    risk_score = Column(Integer, default=0, index=True)
+    risk_factors = Column(JSON, default=list)
+    # --- Alert feedback / false-positive measurement (10/10 roadmap P6) ---
+    # Null until an operator actually reviews the alert — never defaulted to
+    # "confirmed", which would fabricate a review that never happened.
+    feedback = Column(String, nullable=True, index=True)  # confirmed | false_positive | needs_review
+    feedback_reason = Column(String, nullable=True)
+    feedback_by = Column(String, ForeignKey("users.id"), nullable=True)
+    feedback_at = Column(DateTime, nullable=True)
+
+
+class IncidentAlert(Base):
+    """Many alerts -> one correlated incident.
+
+    `Incident.alert_id` is a single FK and remains the incident's originating
+    alert (existing callers depend on it). Real policing events are not
+    one-alert-shaped though: a watchlisted vehicle entering a restricted zone
+    and then being picked up by three more cameras is ONE event that generated
+    five alerts. Without this table each of those became its own incident, which
+    is precisely the operator-flooding the platform's own design principles
+    argue against."""
+    __tablename__ = "incident_alerts"
+    id = Column(String, primary_key=True, default=lambda: uid("ia"))
+    incident_id = Column(String, ForeignKey("incidents.id"), nullable=False, index=True)
+    alert_id = Column(String, ForeignKey("alerts.id"), nullable=False, index=True)
+    # Why this alert was judged part of that incident — the correlation is an
+    # inference and must be able to justify itself, not just assert a link.
+    correlation_reason = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Incident(Base):
@@ -254,6 +412,14 @@ class Evidence(Base):
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     event_type = Column(String, default="")  # e.g. watchlist_match | zone_entry
     source_timestamp = Column(DateTime, nullable=True)
+    # --- Evidence provenance completion (10/10 roadmap P8) ---
+    # The model/rule versions ACTIVE at capture time — stamped once, never
+    # updated later, so the record answers "what produced this" even after
+    # settings.model_version / an AlertRule.version subsequently changes.
+    # Null for evidence captured before this field existed (honest gap, not
+    # backfilled with today's version as if it always applied).
+    model_version = Column(String, nullable=True)
+    rule_version = Column(String, nullable=True)
 
 
 class AuditLog(Base):
@@ -266,6 +432,18 @@ class AuditLog(Base):
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
+    # --- Tamper-evident audit chain (10/10 roadmap P9) ---
+    # `id` is a random uid, not insertion-ordered, so the chain needs its own
+    # monotonic position. Assigned in app/audit.py (max(chain_seq)+1), unique
+    # so a concurrent-write race raises instead of silently mis-ordering the
+    # chain — see audit.py's retry loop for how that race is handled.
+    chain_seq = Column(Integer, nullable=True, unique=True, index=True)
+    # sha256 of the PREVIOUS row's entry_hash ("0"*64 for the first row) and
+    # entry_hash = sha256(prev_hash + this row's own canonical fields).
+    # Deleting or editing any row breaks every entry_hash after it — that
+    # break, not any single row's hash alone, is what verify-chain detects.
+    prev_hash = Column(String, nullable=True)
+    entry_hash = Column(String, nullable=True)
 
 
 class SelfHealEvent(Base):

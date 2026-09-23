@@ -2,7 +2,7 @@
 per the doc's AI-honesty rule, nothing here is a hard-coded demo number.
 """
 from datetime import datetime, timedelta
-from sqlalchemy import func
+from sqlalchemy import extract, func
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -36,15 +36,40 @@ def overview(db: Session = Depends(get_db), user: models.User = Depends(get_curr
 
 @router.get("/events-by-hour")
 def events_by_hour(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Detections per hour over the last 24 hours.
+
+    Grouped with `extract`, not `strftime`. SQLAlchemy passes an unknown
+    function name straight through to the database, and `strftime` is SQLite's
+    — PostgreSQL, this platform's documented production datastore, has no such
+    function. Verified against a real PostgreSQL server before the fix:
+
+        (psycopg.errors.UndefinedFunction) function strftime(unknown,
+        timestamp without time zone) does not exist
+
+    so the dashboard's 24-hour chart returned 500 in production while passing
+    every test on SQLite — the same dev/prod divergence class as the
+    unenforced SQLite foreign keys. `extract` is translated per dialect by
+    SQLAlchemy, so one query works on both; the label is then formatted in
+    Python rather than in SQL.
+    """
     since = datetime.utcnow() - timedelta(hours=24)
+    parts = (
+        extract("year", models.Detection.timestamp).label("y"),
+        extract("month", models.Detection.timestamp).label("m"),
+        extract("day", models.Detection.timestamp).label("d"),
+        extract("hour", models.Detection.timestamp).label("h"),
+    )
     rows = (
-        db.query(func.strftime("%Y-%m-%d %H:00", models.Detection.timestamp).label("hour"), func.count().label("count"))
+        db.query(*parts, func.count().label("count"))
         .filter(models.Detection.timestamp >= since)
-        .group_by("hour")
-        .order_by("hour")
+        .group_by(*parts)
+        .order_by(*parts)
         .all()
     )
-    return [{"hour": r.hour, "count": r.count} for r in rows]
+    return [
+        {"hour": f"{int(r.y):04d}-{int(r.m):02d}-{int(r.d):02d} {int(r.h):02d}:00", "count": r.count}
+        for r in rows
+    ]
 
 
 @router.get("/alerts-by-type")
@@ -80,3 +105,52 @@ def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(ge
         "non_empty_plate_reads": plausible_plate_reads,
         "note": "Precision/recall/exact-match rate require a labeled test set; not computed here. See README.",
     }
+
+
+# Below this many operator-reviewed alerts, a computed rate is noise wearing
+# the costume of a statistic — a single dismissed alert would print "100%
+# false-positive rate". Configurable rather than hardcoded so an operator can
+# raise it for a higher-confidence figure once real usage accumulates.
+MIN_FEEDBACK_SAMPLE_SIZE = 20
+
+
+@router.get("/alert-precision")
+def alert_precision(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Real alert-quality metrics from operator feedback (10/10 roadmap P6).
+
+    Computed ONLY from `Alert.feedback` — the explicit operator judgement
+    (see routers/alerts.py::submit_feedback) — never inferred from `status`,
+    which tracks workflow, not accuracy. Below MIN_FEEDBACK_SAMPLE_SIZE this
+    reports `insufficient_sample` rather than a rate that would misrepresent
+    a handful of reviews as a validated precision figure.
+    """
+    total_alerts = db.query(models.Alert).count()
+    confirmed = db.query(models.Alert).filter(models.Alert.feedback == "confirmed").count()
+    false_positive = db.query(models.Alert).filter(models.Alert.feedback == "false_positive").count()
+    needs_review = db.query(models.Alert).filter(models.Alert.feedback == "needs_review").count()
+    reviewed = confirmed + false_positive + needs_review
+    dismissed = db.query(models.Alert).filter(models.Alert.status == "dismissed").count()
+
+    result = {
+        "total_alerts": total_alerts,
+        "reviewed_alerts": reviewed,
+        "confirmed": confirmed,
+        "false_positive": false_positive,
+        "needs_review": needs_review,
+        "dismissed_status": dismissed,
+        "min_sample_size": MIN_FEEDBACK_SAMPLE_SIZE,
+        "sample_sufficient": reviewed >= MIN_FEEDBACK_SAMPLE_SIZE,
+    }
+    if reviewed < MIN_FEEDBACK_SAMPLE_SIZE:
+        result["precision"] = None
+        result["false_positive_rate"] = None
+        result["note"] = (
+            f"insufficient_sample: only {reviewed} alert(s) have operator feedback "
+            f"(need {MIN_FEEDBACK_SAMPLE_SIZE}) — no rate is reported to avoid a "
+            "misleading figure from a handful of reviews."
+        )
+    else:
+        result["precision"] = round(confirmed / reviewed, 4)
+        result["false_positive_rate"] = round(false_positive / reviewed, 4)
+        result["note"] = f"Computed from {reviewed} operator-reviewed alert(s)."
+    return result

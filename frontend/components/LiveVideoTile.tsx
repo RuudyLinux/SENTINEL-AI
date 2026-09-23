@@ -2,7 +2,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Play, Eye } from "lucide-react";
-import { buildTokenedUrl } from "@/lib/api";
+import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "./ConnectionBadge";
 
 export default function LiveVideoTile({ camera }: { camera: any }) {
@@ -13,16 +13,20 @@ export default function LiveVideoTile({ camera }: { camera: any }) {
   // moment this page loads. Preview is opt-in per tile; the single-camera
   // page (VIEW) is the actual "operator selected this camera" path.
   const [previewing, setPreviewing] = useState(false);
-  const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const connectionState = deriveConnectionState(camera);
   const isLive = connectionState === "CONNECTED" || connectionState === "PROCESSING";
+  // Re-authorized on a schedule for as long as the preview is open: the
+  // backend now ends a stream when its token expires, so a tile left running
+  // past the TTL would otherwise freeze on its last frame.
+  const streamUrl = useStreamUrl(
+    `/api/streams/${camera.id}/stream-token`,
+    `/api/streams/${camera.id}/mjpeg`,
+    previewing && isLive,
+  );
 
   function startPreview() {
     if (!isLive) return;
     setPreviewing(true);
-    buildTokenedUrl(`/api/streams/${camera.id}/stream-token`, `/api/streams/${camera.id}/mjpeg`)
-      .then((url) => setStreamUrl(url))
-      .catch(() => setStreamUrl(null));
   }
 
   return (

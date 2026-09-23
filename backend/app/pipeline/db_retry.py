@@ -37,13 +37,128 @@ value captured before the first attempt*, never from re-reading the object.
 """
 import asyncio
 import logging
+import threading
 import time
 from typing import Awaitable, Callable
+from weakref import WeakKeyDictionary
 
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from .. import metrics
+from ..db import SQLITE_BUSY_TIMEOUT_SECONDS
+
 logger = logging.getLogger("sentinel.worker")
+
+# --- Session serialization -------------------------------------------------
+# Every DB call below is offloaded with `asyncio.to_thread`, which means the
+# work continues on a worker thread even if the awaiting task is CANCELLED —
+# `to_thread` cannot interrupt a running thread, it only abandons the await.
+#
+# Real bug this fixes (reproduced under the 12-worker concurrency stress test,
+# roughly 2 runs in 5): cancelling a camera worker mid-commit unwinds the await
+# immediately, so `_camera_loop`'s `finally: db.close()` ran on the event-loop
+# thread while the worker thread was still inside `commit()`:
+#
+#   sqlalchemy.exc.IllegalStateChangeError: Method 'close()' can't be called
+#   here; method '_prepare_impl()' is already in progress
+#
+# A Session is explicitly NOT thread-safe, and that raise escaped the `finally`
+# to `_camera_loop_supervised`, which marked a perfectly healthy camera
+# OFFLINE. Every stop_worker/shutdown could hit it.
+#
+# One lock per Session, held for the duration of each threaded DB call, gives
+# the Session the single-writer discipline it requires. `close_session` below
+# takes the same lock, so teardown waits for an in-flight commit instead of
+# racing it. Keyed weakly so a closed session's lock is collected with it.
+_SESSION_LOCKS: "WeakKeyDictionary[Session, threading.Lock]" = WeakKeyDictionary()
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(db: Session) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(db)
+        if lock is None:
+            lock = threading.Lock()
+            _SESSION_LOCKS[db] = lock
+        return lock
+
+
+def _locked(db: Session, op: "Callable[[], None]") -> None:
+    """Run one Session operation with exclusive access to that Session."""
+    with _lock_for(db):
+        op()
+
+
+# How long teardown waits, on the CALLING thread, for an in-flight DB call.
+#
+# This must not be a small round number. A contended commit legitimately blocks
+# for SQLite's whole busy-wait budget, so anything shorter is guaranteed to fire
+# under exactly the load this code exists to survive — measured: a 10s bound hit
+# every full test run, because a 12-worker commit was still inside its 30s
+# busy_timeout. Derived from that budget so the two can never drift apart again.
+_CLOSE_LOCK_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_SECONDS + 5.0
+
+# ...and how long the fallback thread keeps trying afterwards. Generous, because
+# the alternative to closing is leaving a write transaction open (see below).
+_CLOSE_BACKGROUND_TIMEOUT_SECONDS = 300.0
+
+
+def _close_when_free(db: Session, lock: threading.Lock) -> None:
+    """Wait out a genuinely stuck operation, then close, off the caller's thread."""
+    if not lock.acquire(timeout=_CLOSE_BACKGROUND_TIMEOUT_SECONDS):
+        logger.error(
+            "session still busy after %.0fs — abandoning the close; its transaction "
+            "may hold a write lock until the process exits",
+            _CLOSE_BACKGROUND_TIMEOUT_SECONDS,
+        )
+        return
+    try:
+        db.close()
+        logger.info("session closed by the deferred teardown path")
+    except Exception:
+        logger.exception("deferred session close failed")
+    finally:
+        lock.release()
+
+
+def close_session(db: Session) -> None:
+    """Close a Session that a background thread may still be using.
+
+    Callers tearing a camera worker down must use this instead of `db.close()`:
+    a plain close racing an in-flight threaded commit raises
+    IllegalStateChangeError (see above), and doing so from a `finally` turns a
+    routine cancellation into a worker crash.
+
+    On timeout the close is HANDED OFF, never skipped. An earlier version simply
+    returned, on the reasoning that "the connection goes back to the pool when
+    the Session is collected" — that reasoning was wrong and the test suite
+    caught it: the Session is still referenced, so it is not collected, and on
+    SQLite its open write transaction keeps the database locked for every other
+    writer in the process. The observed symptom was every subsequent test dying
+    on `database is locked`. Waiting on a daemon thread keeps the caller (often
+    an event loop mid-shutdown) responsive while still releasing the lock.
+    """
+    lock = _lock_for(db)
+    if not lock.acquire(timeout=_CLOSE_LOCK_TIMEOUT_SECONDS):
+        logger.warning(
+            "session still busy after %.0fs — deferring its close to a background "
+            "thread rather than blocking teardown or leaking its transaction",
+            _CLOSE_LOCK_TIMEOUT_SECONDS,
+        )
+        threading.Thread(
+            target=_close_when_free, args=(db, lock), name="sentinel-session-close", daemon=True,
+        ).start()
+        return
+    try:
+        db.close()
+    except Exception:
+        # Teardown must never raise: this runs from a `finally` on a
+        # cancellation path, where an exception replaces the cancellation and
+        # is what made a healthy camera get marked offline.
+        logger.exception("closing the session failed")
+    finally:
+        lock.release()
 
 # SQLite's own message for this transient condition; matched loosely (not
 # with a code) since sqlite3 doesn't expose one for it. Deliberately narrow —
@@ -87,10 +202,34 @@ async def _safe_write(
     """
     started = time.monotonic()
     attempts = max_attempts if reapply is not None else 1
+    try:
+        return await _attempt_loop(db, op_name, op, label, reapply, attempts, on_result, started)
+    finally:
+        # Observed once per logical write, on every exit path, including the
+        # failure ones — a metric that only records successes would hide
+        # exactly the contention it exists to reveal.
+        metrics.DB_WRITE_SECONDS.labels(operation=op_name).observe(time.monotonic() - started)
+
+
+async def _attempt_loop(
+    db: Session,
+    op_name: str,
+    op: Callable[[], None],
+    label: str,
+    reapply: Callable[[], None] | None,
+    attempts: int,
+    on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None",
+    started: float,
+) -> bool:
+    """The retry loop itself, split out only so `_safe_write` can time every
+    exit path in one `finally` rather than repeating it at six return sites."""
     ever_lock = False
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.to_thread(op)
+            # Under the Session's lock: `to_thread` keeps running after a
+            # cancellation, so teardown must be able to wait for it (see
+            # close_session).
+            await asyncio.to_thread(_locked, db, op)
             if on_result is not None:
                 await on_result(attempt, attempts, True, ever_lock, time.monotonic() - started)
             return True
@@ -98,6 +237,7 @@ async def _safe_write(
             is_lock = _is_lock_error(exc)
             ever_lock = ever_lock or is_lock
             if is_lock:
+                metrics.DB_LOCK_RETRIES.inc()
                 logger.warning(
                     "%s: %s hit a locked database (attempt %d/%d)%s",
                     label, op_name, attempt, attempts, "" if attempt < attempts else " — giving up",
@@ -109,7 +249,7 @@ async def _safe_write(
             is_lock = False
 
         try:
-            await asyncio.to_thread(db.rollback)
+            await asyncio.to_thread(_locked, db, db.rollback)
         except Exception:
             logger.exception("%s: rollback after failed %s also failed", label, op_name)
             if on_result is not None:
@@ -130,6 +270,50 @@ async def _safe_write(
             await on_result(attempt, attempts, False, ever_lock, time.monotonic() - started)
         return False
     return False
+
+
+async def locked_flush(db: Session) -> None:
+    """One `db.flush()`, under this Session's lock, with NO retry and NO
+    exception swallowing — the thread-safety half of safe_flush's contract
+    (see `_lock_for`/`_locked` above and the module docstring on why a raw
+    unlocked `to_thread(db.flush)` can race `close_session` into
+    `IllegalStateChangeError`), without its lock-only-retries-transient-
+    errors behavior.
+
+    Exists for callers that need to tell a genuine constraint violation
+    (`sqlalchemy.exc.IntegrityError` — e.g. a UNIQUE index catching a
+    real concurrent-insert race, see `correlate.upsert_vehicle_for_plate`)
+    apart from a transient lock (`OperationalError`, which `safe_flush`
+    already retries). `safe_flush`'s retry loop catches BOTH under one
+    generic `except Exception` and never re-raises either — exactly right
+    for "retry until it works or give up quietly", exactly wrong for "this
+    specific exception type means switch strategy", which is what a
+    caller recovering from a real conflict needs to do.
+    """
+    await asyncio.to_thread(_locked, db, db.flush)
+
+
+async def locked_commit(db: Session) -> None:
+    """`db.commit()` under this Session's lock, no retry, no swallowing —
+    same contract as `locked_flush`. Exists for the same reason: a caller
+    that needs a SPECIFIC exception type (or needs the write to actually
+    become visible to OTHER sessions right away, rather than sitting in an
+    open transaction — see `correlate.upsert_vehicle_for_plate`'s early-
+    commit-on-create, which exists so a competing session's conflicting
+    insert resolves to a fast IntegrityError instead of blocking for the
+    full SQLite busy_timeout waiting on a transaction nothing is going to
+    commit until much later) needs a plain, thread-safe commit.
+    """
+    await asyncio.to_thread(_locked, db, db.commit)
+
+
+async def locked_rollback(db: Session) -> None:
+    """`db.rollback()` under this Session's lock — same thread-safety
+    reasoning as `locked_flush` above. A caller recovering from an exception
+    `locked_flush` raised (which already released the lock on its own exit)
+    must still take the lock again for the rollback itself, not call
+    `db.rollback()` bare."""
+    await asyncio.to_thread(_locked, db, db.rollback)
 
 
 async def safe_commit(

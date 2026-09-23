@@ -16,13 +16,14 @@ and the SELF-HEAL UI), it never re-implements or overrides them.
 """
 import asyncio
 import logging
-import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from .. import models
+from .. import models, metrics
 from ..db import SessionLocal
-from ..ws import manager
+from .. import runtime_state
+from ..config import settings
+from ..ws import manager, EventType
 
 logger = logging.getLogger("sentinel.self_heal")
 
@@ -53,7 +54,17 @@ _RESOLVED_STATUSES = {"RECOVERED"}
 # is never hidden by this. The DB row for the first occurrence in a burst
 # always persists; only the immediate repeats are skipped.
 _DEDUP_WINDOW_S = 10.0
-_last_recovered_at: dict[tuple[str, str, str], float] = {}
+# Shared-state seam (app/runtime_state.py): this was a `time.monotonic()` dict,
+# which a second process cannot read and a restart resets. The effect of either
+# is the same — the burst of repeats this exists to swallow gets written anyway.
+#
+# This call site stays sync and is never awaited: `record_event_sync` (below)
+# is either run directly (a synchronous caller already off the event loop) or
+# reached through `record_event`'s `await asyncio.to_thread(record_event_sync,
+# ...)`, so a blocking Redis call inside it is already off the loop either way
+# — no async wrapper needed here the way rules_engine's cooldown check needed
+# one.
+_recovered_claims = runtime_state.build_claims_store("self_heal_dedup", settings)
 
 
 def _key(component: str, camera_id: str | None) -> tuple[str, str]:
@@ -64,12 +75,7 @@ def _is_noisy_duplicate(component: str, camera_id: str | None, error_type: str, 
     if status != "RECOVERED" or severity == "critical":
         return False
     dedup_key = (component, camera_id or _GLOBAL, error_type)
-    now = time.monotonic()
-    last = _last_recovered_at.get(dedup_key, 0.0)
-    if now - last < _DEDUP_WINDOW_S:
-        return True
-    _last_recovered_at[dedup_key] = now
-    return False
+    return not _recovered_claims.claim(dedup_key, _DEDUP_WINDOW_S)
 
 
 def record_event_sync(
@@ -126,7 +132,13 @@ async def record_event(**kwargs) -> "models.SelfHealEvent | None":
     row = await asyncio.to_thread(record_event_sync, **kwargs)
     if row is not None:
         try:
-            await manager.broadcast("self_heal_event", serialize(row))
+            # publish, not broadcast: emits the canonical `self_heal.recovery`
+            # name and the legacy `self_heal_event` alias alongside it, so the
+            # existing Recovery Activity / Problems pages keep working unchanged.
+            metrics.SELF_HEAL_EVENTS.labels(
+                component=str(row.component or "unknown"), status=str(row.status or "unknown"),
+            ).inc()
+            await manager.publish(EventType.SELF_HEAL_RECOVERY, serialize(row))
         except Exception:
             logger.exception("self-heal: broadcast failed, continuing")
     return row

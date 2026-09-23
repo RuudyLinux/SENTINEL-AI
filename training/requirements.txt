@@ -1,0 +1,14 @@
+# Training-tooling dependencies.
+#
+# The tooling itself (schema, split, QC, metrics) is deliberately STDLIB-ONLY,
+# so dataset work is never gated on the inference stack (torch, OpenCV,
+# ultralytics) and the backend image never carries the training code. Only the
+# test runner is listed here.
+#
+# Model training (M3+) will add torch and friends in a SEPARATE requirements
+# file, so this tooling stays runnable on an annotation workstation that has
+# none of it.
+pytest
+# Inter-test coupling gate, mirroring the backend suite: split assignment must
+# not depend on collection order any more than it depends on record order.
+pytest-random-order

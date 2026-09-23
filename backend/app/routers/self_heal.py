@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..db import get_db
+from ..db import LIKE_ESCAPE, get_db, like_pattern
 from ..security import get_current_user
 from ..self_heal import engine as self_heal
 from ..ws import manager
@@ -82,9 +82,23 @@ def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(
         "subsystems": {
             "api": "HEALTHY",
             "database": "DEGRADED" if (not db_ok or recent_db_failure) else "HEALTHY",
-            "websocket": "CONNECTED" if len(manager.active) >= 0 else "DISCONNECTED",  # accepting connections proves this
+            # Final-review audit finding: this used to be a tautological
+            # `len(...) >= 0` (always true) — there is no real "the WS
+            # manager is broken" signal to check (it's an in-process list,
+            # not a connection this process could lose), so honestly this
+            # line is a live check the SAME way "api": "HEALTHY" above is —
+            # this response returning at all proves the process (and
+            # therefore the WS manager module) is up. Not a fake hardcode
+            # dressed as a conditional.
+            "websocket": "CONNECTED",
             "websocket_clients": len(manager.active),
-            "ai_engine": "RUNNING" if ai_running else ("IDLE" if total_cameras else "IDLE"),
+            # Final-review audit finding: this used to be a dead ternary
+            # (`"IDLE" if total_cameras else "IDLE"` — both branches
+            # identical, total_cameras never actually consulted). There is
+            # no genuine third state to distinguish here yet (a camera-less
+            # deployment and one with cameras but AI off both really are
+            # just "not running"), so simplified to say only what's true.
+            "ai_engine": "RUNNING" if ai_running else "IDLE",
             "self_heal": "ACTIVE",
         },
         "cameras": {"online": online_cameras, "degraded": degraded_cameras, "offline": offline_cameras, "total": total_cameras},
@@ -128,7 +142,11 @@ def self_heal_events(
     status: str | None = None,
     severity: str | None = None,
     q: str | None = None,
-    limit: int = Query(default=100, le=500),
+    # `ge=1` is not decoration: SQLite reads `LIMIT -1` as NO LIMIT, so an
+    # upper bound alone let `?limit=-1` return the whole self-heal event table
+    # to any authenticated user. Same reasoning, and the same fix, as
+    # detections and review/queue already carry (tests/test_list_limits.py).
+    limit: int = Query(default=100, ge=1, le=500),
     offset: int = 0,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
@@ -145,8 +163,7 @@ def self_heal_events(
     if severity:
         query = query.filter(models.SelfHealEvent.severity == severity)
     if q:
-        like = f"%{q}%"
-        query = query.filter(models.SelfHealEvent.message.ilike(like))
+        query = query.filter(models.SelfHealEvent.message.ilike(like_pattern(q), escape=LIKE_ESCAPE))
     total = query.count()
     rows = query.order_by(models.SelfHealEvent.timestamp.desc()).offset(offset).limit(limit).all()
     camera_codes = _camera_code_map(db, {r.camera_id for r in rows if r.camera_id})

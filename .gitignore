@@ -1,5 +1,18 @@
+# Secrets. The root .env holds the compose POSTGRES_PASSWORD/JWT_SECRET that
+# .env.example tells you to create — it must never be committed. .env.example
+# itself is the committed template and carries no real values.
+/.env
+.env.local
+
 # Backend
 backend/.env
+# Any hand-made copy of it too. A real one (backend/.env.bak.031455, holding
+# the live Sentinel Grid password) sat untracked and unignored, one `git add
+# -A` away from being published. The pattern matters more than that one file:
+# the habit of copying .env before editing it is a good one, and it must not
+# be the thing that leaks the secret.
+backend/.env.*
+!backend/.env.example
 backend/.venv/
 backend/__pycache__/
 backend/**/__pycache__/
@@ -9,6 +22,20 @@ backend/install.log
 backend/uploads/
 backend/evidence_store/
 backend/*.pt
+
+# Real license-plate photos for tools/anpr_bench.py — never version-controlled
+# (privacy/copyright, same reasoning as uploads/ and evidence_store/ above).
+# The README explaining what goes here IS tracked.
+backend/tools/anpr_corpus/*
+!backend/tools/anpr_corpus/README.md
+
+# tools/camera_bench.py output — a real measurement, but specific to the
+# machine and moment it was run; not a portable claim to keep in version
+# control (see the "10/10 roadmap gap-closure" README section for one
+# concrete real run's numbers instead).
+backend/camera_bench_report.md
+backend/camera_bench_results.json
+backend/bench_scratch.db*
 *.pyc
 
 # Frontend
@@ -19,6 +46,9 @@ frontend/next-env.d.ts
 frontend/AGENTS.md
 frontend/CLAUDE.md
 
+# Root-level virtualenv (the backend one is covered above)
+/.venv/
+
 # OS / editor
 .DS_Store
 Thumbs.db
@@ -26,3 +56,13 @@ frontend/tsconfig.tsbuildinfo
 
 # Tooling output (Playwright MCP browser-QA logs/snapshots — not project source)
 .playwright-mcp/
+# Playwright run artifacts (traces/screenshots on failure) — regenerated per run.
+frontend/test-results/
+frontend/playwright-report/
+
+# Coverage artifacts. `.coverage` is a binary SQLite database rewritten by
+# every `pytest --cov` run, so tracking it made an unrelated working-tree
+# change appear after each test run.
+.coverage
+.coverage.*
+htmlcov/

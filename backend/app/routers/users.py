@@ -44,10 +44,47 @@ def create_user(payload: schemas.UserCreate, db: Session = Depends(get_db), user
 
 @router.post("/users/{user_id}/disable")
 def disable_user(user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Disable an account. Refuses self-disable, which was a one-click lockout.
+
+    Disabling takes effect immediately for the caller too: `auth.py` rejects a
+    login from an inactive user and `get_current_user` rejects their existing
+    token, so an administrator who disabled their own account got 200 and then
+    401 on their very next request. With no enable endpoint (there was none),
+    that was unrecoverable through the API — Administrator gates user
+    management, camera registration, rule deletion and the governance purge,
+    so recovery meant editing the database by hand.
+
+    Self-disable is the ONLY route to zero administrators: this endpoint is
+    Administrator-gated, so any other caller disabling an administrator is an
+    active administrator who remains. Refusing it therefore keeps at least one
+    administrator without a separate "last admin" count.
+    """
     target = db.query(models.User).filter(models.User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    if target.id == user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="An administrator cannot disable their own account — ask another administrator to do it.",
+        )
     target.active = False
     db.commit()
     log_action(db, user, "disable_user", resource=user_id)
+    return {"ok": True}
+
+
+@router.post("/users/{user_id}/enable")
+def enable_user(user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Restore a disabled account.
+
+    The counterpart to disable, which previously had none: nothing in the API
+    ever set `active` back to True, so every disable was permanent and a
+    mistaken click cost an account. Audited like every other account change.
+    """
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.active = True
+    db.commit()
+    log_action(db, user, "enable_user", resource=user_id)
     return {"ok": True}

@@ -37,9 +37,11 @@ from .. import models
 from ..db import get_db, SessionLocal
 from ..security import require_roles
 from ..audit import log_action
+from ..pipeline.db_retry import close_session
 from ..ws import manager
 from ..pipeline.worker import start_worker, stop_worker
 from ..pipeline import supervisor
+from ..pipeline.db_retry import safe_commit
 
 router = APIRouter(prefix="/api/cameras/bulk", tags=["camera-control"])
 
@@ -65,11 +67,24 @@ class BulkRequest(BaseModel):
     camera_ids: list[str] | None = None  # None/omitted = every registered camera
 
 
-def _set_ai(db: Session, camera: models.Camera, enabled: bool) -> None:
+async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code: str) -> bool:
+    """Final-review audit finding: this used to be a plain `db.commit()`,
+    bypassing this same PR's own SQLite-lock retry — inconsistent with
+    every other write path in the app under exactly the sustained
+    multi-camera contention this PR exists to survive, and worse, a bulk
+    call runs up to MAX_CONCURRENT of these concurrently (more simultaneous
+    writers than a single API request normally creates). Now goes through
+    db_retry.safe_commit like worker.py's writes."""
     camera.ai_person = enabled  # type: ignore[assignment]
     camera.ai_vehicle = enabled  # type: ignore[assignment]
     camera.ai_anpr = enabled  # type: ignore[assignment]
-    db.commit()
+
+    def reapply():
+        camera.ai_person = enabled  # type: ignore[assignment]
+        camera.ai_vehicle = enabled  # type: ignore[assignment]
+        camera.ai_anpr = enabled  # type: ignore[assignment]
+
+    return await safe_commit(db, f"bulk camera {camera_code}", reapply=reapply)
 
 
 async def _apply_one(action: BulkAction, camera_id: str) -> dict:
@@ -96,14 +111,20 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
                 supervisor.connect(camera_id)
             else:
                 start_worker(camera_id)
-            _set_ai(db, camera, True)
+            if not await _set_ai(db, camera, True, code):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Connected, but AI-enable write did not persist (database busy) — retry"}
             detail = "AI started"
         elif action == "stop":
-            _set_ai(db, camera, False)
+            if not await _set_ai(db, camera, False, code):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "AI-disable write did not persist (database busy) — retry"}
             detail = "AI stopped"
         elif action == "restart":
-            stop_worker(camera_id)
-            start_worker(camera_id)
+            # Audit finding: raw stop_worker+start_worker bypassed
+            # supervisor.py's AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping
+            # for a sentinel_grid camera. supervisor.restart is the single
+            # shared implementation also used by the single-camera restart
+            # endpoint (routers/cameras.py) — reused, not duplicated.
+            await supervisor.restart(camera_id, str(camera.source_type))
             detail = "Restarted"
         elif action == "disconnect":
             if camera.source_type == "sentinel_grid":
@@ -111,7 +132,12 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
             else:
                 stop_worker(camera_id)
             camera.status = "offline"  # type: ignore[assignment]
-            db.commit()
+
+            def _reapply_offline():
+                camera.status = "offline"  # type: ignore[assignment]
+
+            if not await safe_commit(db, f"bulk camera {code}", reapply=_reapply_offline):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Worker stopped, but status write did not persist (database busy) — retry"}
             detail = "Disconnected"
         else:
             return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": f"Unknown action {action}"}
@@ -120,7 +146,12 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
     except Exception as exc:
         return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": f"{type(exc).__name__}: {exc}"}
     finally:
-        db.close()
+        # close_session, not db.close(): this session is used by safe_commit,
+        # which hands the actual commit to a worker thread. If this coroutine is
+        # cancelled while that thread is mid-commit, a plain close() races it and
+        # raises IllegalStateChangeError — the same defect fixed in worker.py's
+        # camera loop. See db_retry.close_session.
+        close_session(db)
 
 
 @router.post("")

@@ -83,19 +83,46 @@ def test_upsert_creates_then_updates_without_duplicating(db_session):
     assert cams2[0].location == "North Gate (renamed)"
 
 
-def test_upsert_new_camera_defaults_ai_off(db_session):
-    """24/7 auto-connect task: a freshly-discovered real grid camera must
-    default ai_person/ai_vehicle/ai_anpr to False. Camera.model's own column
-    default is True — without this explicit override, the 24/7 supervisor
-    connecting a newly-registered camera would also silently start real
-    YOLO/ByteTrack/OCR on it, since 'registered' and 'AI processing' must
-    stay independent by design."""
+def test_upsert_new_camera_defaults_ai_on(db_session):
+    """Operator directive: every registered camera stays connected and under
+    AI processing as the standard posture, not an opt-in — so a freshly
+    discovered real grid camera now defaults ai_person/ai_vehicle/ai_anpr to
+    True, matching Camera.model's own column default and every other
+    camera-creation path (POST /api/cameras' schema default is also True).
+    This was a deliberate False-on-discovery EXCEPTION before; the exception
+    is gone, not the field independence it existed to protect — the
+    supervisor (pipeline/supervisor.py) still never writes these three
+    flags itself, it only connects whatever a camera's current flags say,
+    and an operator can still turn AI off per camera via
+    PATCH /api/cameras/{id}."""
     records = [{"id": "cam-ai-default-test", "name": "AI Default Test", "location": "X"}]
     upsert_grid_cameras(db_session, records)
     cam = db_session.query(models.Camera).filter(
         models.Camera.external_catalog_id == "grid:cam-ai-default-test"
     ).first()
     assert cam is not None
+    assert cam.ai_person is True
+    assert cam.ai_vehicle is True
+    assert cam.ai_anpr is True
+
+
+def test_a_re_synced_camera_keeps_its_operator_set_ai_flags(db_session):
+    """The default flipping to True must not mean a re-sync silently
+    RE-enables AI on a camera an operator deliberately turned off — the
+    upsert's update branch has never touched ai_person/ai_vehicle/ai_anpr
+    (only the create branch sets them), and that must still hold."""
+    records = [{"id": "cam-ai-keep-test", "name": "Keep Test", "location": "X"}]
+    upsert_grid_cameras(db_session, records)
+    cam = db_session.query(models.Camera).filter(
+        models.Camera.external_catalog_id == "grid:cam-ai-keep-test"
+    ).first()
+    cam.ai_person = False
+    cam.ai_vehicle = False
+    cam.ai_anpr = False
+    db_session.commit()
+
+    upsert_grid_cameras(db_session, records)  # re-sync, same camera
+    db_session.refresh(cam)
     assert cam.ai_person is False
     assert cam.ai_vehicle is False
     assert cam.ai_anpr is False
@@ -128,10 +155,39 @@ def _scaletest_cameras(db_session):
     )
 
 
+def _clear_scaletest_cameras(db_session) -> None:
+    """Remove this module's scaletest cameras AND their dependents.
+
+    Three tests in this module sync the same 30 catalogue records, so
+    whichever runs FIRST creates them — which made the idempotency test's
+    `created == 30` assertion depend on test ordering. Invisible under
+    alphabetical collection, caught immediately by the --random-order gate.
+    Dependents must go first: test_upsert_marks_removed_camera_stale...
+    deliberately attaches a real Detection to scaletest15, and foreign keys
+    are now enforced (app/db.py), so deleting the cameras alone fails.
+    """
+    camera_ids = [
+        c.id for c in db_session.query(models.Camera).filter(
+            models.Camera.external_catalog_id.like("grid:scaletest%")
+        ).all()
+    ]
+    if not camera_ids:
+        return
+    db_session.query(models.Detection).filter(
+        models.Detection.camera_id.in_(camera_ids)
+    ).delete(synchronize_session=False)
+    db_session.query(models.Camera).filter(
+        models.Camera.id.in_(camera_ids)
+    ).delete(synchronize_session=False)
+    db_session.commit()
+
+
 def test_upsert_handles_full_30_camera_catalogue_idempotently(db_session):
     """The actual scale this task cares about: 30 catalogue cameras -> 30 database
     cameras, and re-running discovery never duplicates or drops any of them."""
     records = _thirty_catalogue_records()
+    # Precondition established, not assumed — see _clear_scaletest_cameras.
+    _clear_scaletest_cameras(db_session)
 
     summary1 = upsert_grid_cameras(db_session, records)
     assert summary1["created"] == 30

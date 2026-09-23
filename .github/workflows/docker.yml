@@ -1,0 +1,187 @@
+# Docker build verification.
+#
+# The images cannot be built on the Windows development machine (Docker is not
+# installed there), so this is the only place the Dockerfiles are actually
+# exercised rather than merely reviewed. It builds both images, brings the full
+# stack up against a real PostgreSQL, and checks that the backend reached a
+# serving state with its schema migrated.
+name: Docker
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-context:
+    # Guards the specific regression that motivated the .dockerignore files: a
+    # developer's Windows .venv (1.4 GB) and node_modules (603 MB) were inside
+    # the build contexts. Beyond the size, those are Linux-incompatible binaries,
+    # and in the frontend the host node_modules would have overwritten the
+    # correctly-installed Linux ones after COPY --from=deps.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build contexts must stay small and free of host artifacts
+        run: |
+          set -euo pipefail
+          for ctx in backend frontend; do
+            # Approximates what Docker would send: tar the context with the
+            # ignore rules applied. A CI checkout has no .venv/node_modules, so
+            # this cannot catch a leak by size alone — the explicit path check
+            # below is what actually guards the regression.
+            bytes=$(tar --exclude-from="$ctx/.dockerignore" -cf - "$ctx" 2>/dev/null | wc -c)
+            mb=$(( bytes / 1000000 ))
+            echo "$ctx build context: ${mb} MB"
+            if [ "$mb" -gt 50 ]; then
+              echo "::error::$ctx build context is ${mb} MB - check $ctx/.dockerignore"
+              exit 1
+            fi
+          done
+          # The real guard: these paths must be ignored regardless of whether
+          # they happen to exist on this runner.
+          grep -qx '.venv/' backend/.dockerignore || { echo '::error::backend/.dockerignore no longer excludes .venv/'; exit 1; }
+          grep -qx 'node_modules/' frontend/.dockerignore || { echo '::error::frontend/.dockerignore no longer excludes node_modules/'; exit 1; }
+          grep -qx '.next/' frontend/.dockerignore || { echo '::error::frontend/.dockerignore no longer excludes .next/'; exit 1; }
+          echo "host-artifact exclusions present in both contexts"
+
+  build-and-run:
+    runs-on: ubuntu-latest
+    # Job-level, not per-step: `docker compose` re-parses and interpolates the
+    # ENTIRE compose file for every subcommand — exec, logs, down, not just up
+    # — so any step that calls `docker compose` at all needs these, or compose
+    # fails at config-load time on the mandatory `${VAR:?...}` fields in
+    # docker-compose.yml before the subcommand ever runs. Job-level env means a
+    # future added step inherits this automatically instead of silently
+    # missing it (which is exactly what happened here: three new steps and the
+    # pre-existing teardown step were written without it during this pass).
+    # Fake, obviously-fake values — never real secrets, and this workflow does
+    # not read from GitHub Secrets, so it runs identically on a fork/PR with no
+    # repository configuration required.
+    env:
+      POSTGRES_PASSWORD: ci-postgres-password
+      JWT_SECRET: ci-jwt-secret-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: sentinel-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: sentinel-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate compose configuration
+        run: docker compose config >/dev/null
+
+      - name: Compose refuses to start without its required secrets
+        env:
+          # Overrides the job-level values for THIS STEP ONLY. Empty string,
+          # not omitted: compose's `${VAR:?err}` (colon form) treats an empty
+          # value the same as unset, so this reproduces "the operator never
+          # set it" without needing a separate job with no env block at all.
+          POSTGRES_PASSWORD: ""
+          JWT_SECRET: ""
+        run: |
+          # A police datastore must never come up on a defaulted credential.
+          if docker compose config >/dev/null 2>&1; then
+            echo "::error::compose accepted an empty POSTGRES_PASSWORD/JWT_SECRET"
+            exit 1
+          fi
+          echo "compose correctly refused to start without POSTGRES_PASSWORD/JWT_SECRET"
+
+      - name: Bring the stack up
+        run: |
+          docker compose up -d --wait --wait-timeout 300 db backend || {
+            echo "::group::backend logs"; docker compose logs backend; echo "::endgroup::"
+            echo "::group::db logs"; docker compose logs db; echo "::endgroup::"
+            exit 1
+          }
+
+      - name: Backend is serving, on PostgreSQL, with the schema migrated
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:8000/api/health | tee /dev/stderr | grep -q '"ok":true'
+          # Alembic must have run: the V2 tables exist in PostgreSQL, which also
+          # proves the SQLite-only ensure_columns helpers were correctly skipped.
+          docker compose exec -T db psql -U sentinel -d sentinel -c '\dt' | tee /dev/stderr > /tmp/tables.txt
+          # \bplates\b, not a literal-space match: psql right-pads every name
+          # column to the width of the longest table name in the listing, so
+          # a fixed single-space pattern would silently stop matching the
+          # moment a longer table name shifted the column width.
+          grep -qE '\bincident_alerts\b' /tmp/tables.txt
+          grep -qE '\bplates\b' /tmp/tables.txt
+          grep -qE '\btracks\b' /tmp/tables.txt
+          # -tAc (tuples-only, unaligned): the plain `-c` form used before this
+          # printed psql's own row-count footer, e.g. "(1 row)" — which
+          # CONTAINS THE LITERAL CHARACTER "1" regardless of what the query
+          # actually returned, so `grep -q 1` passed even for a count of 0.
+          # That made this check pass unconditionally; it never verified
+          # anything. -tAc returns just the bare number for an exact compare.
+          row_count=$(docker compose exec -T db psql -U sentinel -d sentinel -tAc "select count(*) from alembic_version")
+          echo "alembic_version rows: '$row_count'"
+          [ "$row_count" = "1" ] || { echo "::error::alembic_version has $row_count rows, expected exactly 1 (schema not stamped)"; exit 1; }
+          # DEMO_MODE defaults to false in compose, so the production JWT-secret
+          # validator ran and accepted the supplied secret.
+          echo "backend healthy on PostgreSQL with migrations applied"
+
+      - name: Migrations are at head with no drift
+        run: |
+          set -euo pipefail
+          # Runs inside the backend container against the SAME running
+          # PostgreSQL the app is actually using — the SQLite-only drift check
+          # in python-package.yml never exercises this dialect, and the
+          # SQLite-only ensure_columns/ensure_indexes helpers (app/db.py) are
+          # a no-op there, so Alembic is the only thing that could have drifted.
+          docker compose exec -T backend alembic check
+
+      - name: Bring the frontend up
+        run: |
+          docker compose up -d --wait --wait-timeout 120 frontend || {
+            echo "::group::frontend logs"; docker compose logs frontend; echo "::endgroup::"
+            exit 1
+          }
+
+      - name: Frontend serves the built application
+        run: |
+          set -euo pipefail
+          # A bounded poll, not a sleep: the frontend's own HEALTHCHECK (which
+          # --wait above already gated on) proves readiness FROM INSIDE the
+          # container; this proves the host->container port mapping a real
+          # browser would use actually works, so both layers are checked.
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          echo "frontend /login returned HTTP $code"
+          [ "$code" = "200" ] || { docker compose logs frontend; exit 1; }
+
+      - name: Containers run as non-root users
+        run: |
+          set -euo pipefail
+          for service in backend frontend; do
+            uid=$(docker compose exec -T "$service" id -u)
+            echo "$service uid: $uid"
+            [ "$uid" != "0" ] || { echo "::error::$service is running as root"; exit 1; }
+          done
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

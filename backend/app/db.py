@@ -1,17 +1,88 @@
+import logging
+
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from .config import settings
 
-engine = create_engine(
-    f"sqlite:///{settings.db_path}",
-    # `timeout` is sqlite3's own busy-wait budget before raising "database is
-    # locked" — Python's 5s default was too short once 2+ concurrent camera
-    # workers commit every frame (confirmed in Phase 4: a "database is
-    # locked" mid-flush killed a worker task even with retry logic, because
-    # SQLite gave up waiting for the lock before the retry ever ran).
-    connect_args={"check_same_thread": False, "timeout": 30},
-)
+logger = logging.getLogger("sentinel.db")
+
+
+def database_url() -> str:
+    """The datastore this process talks to.
+
+    `DATABASE_URL` wins when set (production: PostgreSQL). With it unset the URL
+    is derived from `DB_PATH` exactly as before, so an existing developer
+    checkout, and the whole test suite, keep running on SQLite with no config
+    change at all. Development on SQLite and production on PostgreSQL is the
+    supported split; nothing here forces one on the other.
+    """
+    return (settings.database_url or "").strip() or f"sqlite:///{settings.db_path}"
+
+
+DATABASE_URL = database_url()
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+
+
+# SQLite's busy-wait budget before it raises "database is locked". Defined once
+# here because two other things must agree with it: the DBAPI `timeout` and the
+# PRAGMA below, and — critically — db_retry.close_session, which waits for an
+# in-flight commit and must therefore allow at least this long, since a
+# contended commit can legitimately block for the whole budget.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
+
+def _engine_kwargs() -> dict:
+    if IS_SQLITE:
+        return {
+            # `timeout` is sqlite3's own busy-wait budget before raising
+            # "database is locked" — Python's 5s default was too short once 2+
+            # concurrent camera workers commit every frame (confirmed in Phase
+            # 4: a "database is locked" mid-flush killed a worker task even with
+            # retry logic, because SQLite gave up waiting for the lock before
+            # the retry ever ran).
+            "connect_args": {"check_same_thread": False, "timeout": SQLITE_BUSY_TIMEOUT_SECONDS},
+            # Real bug this fixes: every running camera worker holds ONE
+            # SQLAlchemy Session — one pooled connection — for the ENTIRE
+            # lifetime of its stream (see pipeline/worker.py's
+            # `db = SessionLocal()` at the top of `_camera_loop`), not just for
+            # the length of one query. Left unset here, SQLAlchemy silently
+            # applied its QueuePool DEFAULT (size=5, max_overflow=10 -> 15
+            # total) — this codebase's own architecture guarantees that limit
+            # gets exhausted the moment more than ~15 cameras are running
+            # concurrently (confirmed live: bulk-starting cameras via
+            # POST /api/cameras/bulk crashed multiple camera workers with
+            # `sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow
+            # 10 reached`). The PostgreSQL branch below already reasoned about
+            # this exact requirement ("must comfortably exceed the camera
+            # concurrency cap") and sized its pool accordingly; SQLite — the
+            # DEFAULT backend for local/dev/demo use — had nothing. Reuses the
+            # same db_pool_size/db_max_overflow settings so one pair of knobs
+            # covers both backends, rather than inventing SQLite-specific ones.
+            # A held SQLite connection is cheap (a local file handle, not a
+            # server-side resource), so there is no real cost to sizing this
+            # generously.
+            "pool_size": settings.db_pool_size,
+            "max_overflow": settings.db_max_overflow,
+        }
+    # PostgreSQL. The workload is N long-lived camera-worker sessions plus
+    # request-scoped ones, so the pool must comfortably exceed the camera
+    # concurrency cap or a worker will block waiting for a connection.
+    return {
+        "pool_size": settings.db_pool_size,
+        "max_overflow": settings.db_max_overflow,
+        # A camera worker's session is held open for the life of the stream, so
+        # it WILL outlive an idle-connection timeout on the server or a NAT
+        # rebalance. pre_ping turns that into one transparent reconnect instead
+        # of a dead connection surfacing as a worker crash. Not applied to
+        # SQLite above: there is no server-side idle timeout or network to drop
+        # for a local file connection, so the check would be pure overhead.
+        "pool_pre_ping": True,
+        "pool_recycle": settings.db_pool_recycle_seconds,
+    }
+
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs())
 
 
 @event.listens_for(engine, "connect")
@@ -22,10 +93,37 @@ def _set_sqlite_pragmas(dbapi_connection, _record):
     connections" in one SQLite file, which is exactly this project's
     per-frame-commit, one-task-per-camera pattern. `busy_timeout` is the
     same budget as `connect_args["timeout"]` above, set at the SQLite level
-    too so it applies uniformly regardless of driver default."""
+    too so it applies uniformly regardless of driver default.
+
+    Guarded by dialect: these are SQLite PRAGMAs and are a syntax error on
+    PostgreSQL, so on any other backend this listener does nothing. Neither
+    setting has a PostgreSQL equivalent that needs applying — MVCC gives
+    non-blocking readers natively, which is the property WAL is bought for here.
+    """
+    if not IS_SQLITE:
+        return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
+    # BUG-C fix, second half (final deep-debug pass): SQLite ignores every
+    # FOREIGN KEY in this schema unless this is switched on PER CONNECTION —
+    # it defaults to OFF — while the Alembic-managed PostgreSQL schema has
+    # always enforced them. Without this line a referential violation
+    # silently succeeded in dev/demo and raised a ForeignKeyViolation in
+    # production: a divergence no test running on SQLite could ever surface.
+    #
+    # Measured before the fix: deleting a camera left 1 detection, 1 alert,
+    # 1 incident, 1 evidence row (with its capture-time digest), 1 plate and
+    # 1 zone dangling at a camera_id that no longer existed, and the API
+    # returned 200.
+    #
+    # Enabling it required fixing the test harness first (tests/conftest.py's
+    # `client` fixture bulk-deleted Camera rows without clearing the rows
+    # referencing them — 143 errors + 5 failures from that one fixture).
+    # Sequence deliberately taken in that order: fix the fixture, prove the
+    # suite green with FKs still off, THEN flip this on and prove it green
+    # again — so a failure at either step is unambiguous about its cause.
+    cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
 
@@ -50,6 +148,36 @@ SessionLocal = sessionmaker(
     bind=engine,
 )
 Base = declarative_base()
+
+
+# --- LIKE/ILIKE search patterns -------------------------------------------
+#
+# LIKE treats `%` and `_` as wildcards, so free text pasted straight into a
+# pattern is read by the database as SYNTAX rather than as the characters the
+# operator typed. Measured against the running system: `GET /api/search?q=%`
+# returned every camera in the database — 30 rows matching nothing the
+# operator asked for — and `GJ_5` matched `GJ05`.
+#
+# For an investigative platform a search that silently widens itself is worse
+# than one that finds nothing, because the extra rows look like findings. Four
+# endpoints built patterns this way (global search, audit actor/action, the
+# self-heal message search), so the helper lives here, with the rest of the
+# query plumbing, instead of being copied into each router.
+#
+# The escape character is declared to the database via `escape=LIKE_ESCAPE` at
+# each call site; SQLite and PostgreSQL both honour that, so both backends
+# agree — the same reason `ensure_columns` and the PRAGMA handling above exist.
+LIKE_ESCAPE = "\\"
+
+
+def like_pattern(text: str) -> str:
+    """A contains-match pattern in which `text` is matched LITERALLY."""
+    escaped = (
+        text.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+    return f"%{escaped}%"
 
 
 def get_db():
@@ -86,6 +214,14 @@ def ensure_columns(table: str, columns: dict[str, str], backfill_defaults: dict[
     (a lookup-before-insert), not the database, on databases that already
     existed before this column was added.
     """
+    if not IS_SQLITE:
+        # These helpers emit SQLite DDL (`DATETIME` is not a PostgreSQL type,
+        # and the whole approach predates having a migration tool). On any other
+        # backend Alembic owns the schema — see backend/alembic/. Skipping is
+        # correct, not a degradation: running `alembic upgrade head` is the
+        # documented deployment step there.
+        logger.debug("ensure_columns(%s) skipped — Alembic owns the schema on %s", table, engine.dialect.name)
+        return []
     added: list[str] = []
     inspector = inspect(engine)
     if table not in inspector.get_table_names():
@@ -120,6 +256,9 @@ def ensure_indexes(table: str, index_columns: list[str]) -> list[str]:
     already-existing DB needs these created explicitly. One single-column index
     per name, `ix_{table}_{column}`, `CREATE INDEX IF NOT EXISTS` so it's safe to
     call every startup."""
+    if not IS_SQLITE:
+        logger.debug("ensure_indexes(%s) skipped — Alembic owns the schema on %s", table, engine.dialect.name)
+        return []
     created: list[str] = []
     inspector = inspect(engine)
     if table not in inspector.get_table_names():

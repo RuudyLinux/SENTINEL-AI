@@ -12,6 +12,57 @@ mocked data.
 
 ## Run order
 
+### Docker (reproducible full stack: PostgreSQL + backend + dashboard)
+
+```
+cp .env.example .env      # then fill in POSTGRES_PASSWORD and JWT_SECRET
+docker compose up --build
+```
+
+No secret is baked into any image or compose file. Compose refuses to start
+without a real `POSTGRES_PASSWORD`/`JWT_SECRET` rather than defaulting a police
+datastore to a guessable credential. The backend runs `alembic upgrade head`
+before serving, so the schema is always at head.
+
+**Verification status: `docker compose up --build` has now actually been run,
+on 2026-09-23, and it works.** Both images build, all three containers report
+`healthy`, the backend serves `/api/health` on port 8000, the dashboard serves
+on port 3000, `alembic upgrade head` ran against real PostgreSQL and produced
+all 17 expected tables, and the API is reachable end to end through it.
+
+That run also found and fixed a real defect: the backend image's
+`pip install` pulled the DEFAULT PyPI build of torch, which bundles the full
+CUDA runtime as separate wheels — one of them alone is 214MB — for an image
+that has no GPU runtime (`python:3.11-slim` base, no CUDA toolkit installed,
+no GPU requested anywhere in compose). On a real network that download
+occasionally timed out outright (`pip`'s `ReadTimeoutError` mid-download),
+which is how this was found rather than merely inferred. Fixed by pointing
+pip at PyTorch's CPU-only wheel index for the build — `torch-2.14.0+cpu` at
+196MB versus a multi-gigabyte CUDA install for a container that could never
+have used it. See the Dockerfile's own comment at that line for the reasoning
+in full.
+
+Login with the documented `admin`/`sentinel123` correctly FAILS against this
+compose deployment — that is `DEMO_MODE=false` (the compose default, meaning
+production mode) doing exactly what its own comment says: no seeded demo
+accounts, ever, on a real deployment. Zero rows in `users` after a fresh
+`docker compose up` is the correct starting state, not a bug; provisioning
+the first real administrator is a separate, deliberate step this README does
+not yet document — flagged here rather than worked around.
+
+`backend/tests/test_deployment_contract.py` (16 tests in the normal suite)
+covers the contract between these files and the application without needing
+a real build: every file the images COPY exists, every build context exists,
+the evidence and uploads volumes are mounted where
+`settings.evidence_dir`/`uploads_dir` actually write (a mismatch would
+silently discard captured evidence on the next rebuild), every environment
+key compose sets is one the settings object really reads, both healthchecks
+poll routes that exist, the schema is migrated before uvicorn starts, and the
+secrets have no guessable defaults. That drift protection is what keeps this
+claim from going stale between real runs — it is not a substitute for one.
+
+### Local development (SQLite, no Docker)
+
 1. **Backend**:
    ```
    cd backend
@@ -22,22 +73,193 @@ mocked data.
    cd frontend
    npm run dev
    ```
+
 3. Open http://localhost:3000 → log in (`admin` / `sentinel123`) → **Cameras → Add Camera**
    → upload a short video (or use a webcam) → **Live Cameras** to watch real detections stream
    in, or add a **Restricted Zone** / **Watchlist** entry under Map / Watchlists to see the
    real rules engine fire an alert and auto-create an incident, then **Investigate** →
    **Generate Evidence Package**.
 
+**If port 8000 is taken.** It is a popular default, and an unrelated local
+service holding it is not a hypothetical — it happened here, and the dashboard
+reported only "Login failed" while talking to a stranger's API. Run both
+processes on a free port instead:
+
+```
+cd backend && .venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8008
+cd frontend && NEXT_PUBLIC_API_BASE=http://localhost:8008 NEXT_PUBLIC_WS_BASE=ws://localhost:8008 npm run dev
+```
+
+On PowerShell set them first (`$env:NEXT_PUBLIC_API_BASE="http://localhost:8008"`),
+and note these are read at BUILD time — for `next build` output, change them
+and rebuild; a restart alone will not pick them up.
+
+The login screen now refuses to be silent about this: it calls `/api/health`
+before you type anything and checks the returned service name, so a wrong or
+missing backend is named on the form, and the API base the build was compiled
+against is printed underneath it.
+
+
+## V2: live plate tracking, vehicle journeys, risk and correlation
+
+V2 turns the ANPR path from "OCR every vehicle crop, every frame" into a real
+vehicle-intelligence pipeline. Everything below is live in the running system.
+
+**Plate pipeline** (`pipeline/plate_detector.py`, `pipeline/plate_preprocess.py`,
+`pipeline/plate_tracker.py`; `pipeline/plate_detect.py` remains as the
+compatibility facade older callers import):
+
+- **Plate localization.** OCR previously received the whole vehicle bounding box
+  — a car, complete with bumper stickers and dealer badges — and returned
+  whichever text fragment won. A plate region is now found inside the crop
+  first, via an optional dedicated plate model (`PLATE_MODEL_NAME`, not bundled)
+  or a classical edge/morphology localizer that needs no extra asset. A
+  localization miss falls back to whole-crop OCR, i.e. exactly the old
+  behavior — a miss degrades the read, it never drops it. Measured on the
+  benchmark harness: **~3x faster per image** than whole-crop OCR, because
+  OCR is working on a plate rather than a vehicle.
+
+  **Correction (2026-09-11), and it matters:** this section previously also
+  described localization as the single largest ACCURACY lever available,
+  larger than swapping the OCR engine. That was a reasoned hypothesis that had
+  never been measured. It has now been measured against 25 real labelled
+  Indian plates, and **the opposite is true on that data** — localization
+  roughly *tripled* the character error rate and dropped exact-match to near
+  zero, while keeping the ~3x speed win. See `docs/ANPR_ACCURACY.md` for the
+  numbers, the caveats (n=25, phone photos not CCTV) and what to do about it.
+  The speed claim survived measurement; the accuracy claim did not.
+- **Track ↔ plate association.** Every tracked vehicle now writes a real
+  `Track` row (a table declared in the original schema but never written by
+  anything until V2), and its `vehicle_id` is filled in once the plate
+  identifies it. "Track 284 IS GJ05AB1234" is a stored fact, not an inference.
+- **Confidence voting.** Reads accumulate per `(camera, track)` and vote by
+  summed confidence; the reported confidence is the peak actually observed. Four
+  reads at 0.72 / 0.91 / 0.94 / 0.89 resolve to `GJ05AB1234 @ 0.94`, and one bad
+  frame can no longer overwrite a well-corroborated plate.
+- **One sighting per vehicle per camera, not per frame.** Previously a new
+  `Plate` row was inserted on every OCR frame — and since a vehicle's journey is
+  reconstructed *from* those rows, a car stopped at a signal became dozens of
+  duplicate route hops. The row is now created once and updated in place.
+- **OCR is throttled by track state.** A settled plate is re-verified on an
+  interval instead of every inference cycle — the single largest CPU saving in
+  the pipeline.
+- **Grammar-based character repair** (`anpr.disambiguate_plate`). Measured with
+  `tools/anpr_bench.py`: the dominant real failure was not a wrong plate but a
+  character-class confusion in an otherwise perfect read (`GJ05AB1234` →
+  `GJO5AB1234`), which then failed the format gate and was silently discarded.
+  Indian registrations have a known grammar, so the expected character class at
+  each position is known; a substitution is applied only where the grammar
+  demands it, only if the result then parses, and **at most twice** — without
+  that budget the mapping is strong enough to manufacture `QQ00QQ0000` out of
+  noise. A read that already parses is never touched, and confidence is never
+  inflated by a repair.
+- **State/UT code validation.** The format regex alone accepts any two letters,
+  so `QQ00QQ0000` and `XX12AB1234` were "valid plates" — OCR noise in the right
+  shape cleared the quality gate and became a real `Vehicle` row. The prefix must
+  now be a code an Indian state or union territory actually issues (legacy codes
+  like `OR`/`TS`/`UA` included, because those vehicles are still on the road),
+  and the Bharat series (`23BH1234AA`) is matched by its own grammar. Measured
+  effect on the labelled corpus: plate-shaped-but-wrong reads fell from 0.64 to
+  0.52 of images, with exact match unchanged at 0.24 — fewer false identities at
+  no cost to correct reads.
+- **Preprocessing variants** (`pipeline/plate_preprocess.py`) — perspective
+  correction for off-axis plates, plus grayscale/CLAHE/denoise/sharpen/threshold
+  renderings of the same crop. **Off by default**: each variant is a full extra
+  OCR pass, and the measured exact-match difference is one sample out of 25.
+  `PLATE_PREPROCESS_VARIANTS` opts in.
+- **Selection by agreement, never by maximum confidence.** When several variants
+  are read, the winner is the text most of them produced, not the one with the
+  highest score. Max-of-N is a biased estimator — it is systematically larger
+  than any single read — so reporting it would inflate every recorded confidence
+  and silently loosen the gates. Reported confidence stays the mean over the
+  agreeing reads; corroboration is reported separately as `variants_agreeing`.
+  Measured: agreement separates correct from wrong reads far more cleanly than
+  confidence does (≤2 of 7 variants agreeing: 0 of 13 correct; ≥5 of 7: 4 of 4).
+- **Multi-variant reading can only TIGHTEN the gate, never loosen it.** A read
+  with high confidence but only one variant agreeing is not corroborated and is
+  refused.
+- **Temporal consensus gates persistence.** A plate becomes trusted intelligence
+  only once `PLATE_MIN_OBSERVATIONS` frames agree on it. Previously the first
+  gate-passing read created a `Vehicle` outright. An uncorroborated read is still
+  recorded — a vehicle crossing frame in one inference cycle is real — but is
+  flagged `pending_review` regardless of its confidence rather than presented as
+  settled.
+
+**Vehicle intelligence**: `GET /api/vehicles/by-plate/{plate}` (normalizes input
+the same way the pipeline does), `/api/vehicles/{id}/summary` (current/last
+camera, journey size, linked alerts and incidents, risk), `/api/vehicles/{id}/route`
+(cross-camera journey, consecutive same-camera hops collapsed with real dwell
+time), `/api/vehicles/{id}/sightings` (the raw, uncollapsed evidence).
+
+**Explainable risk score** (`pipeline/risk.py`) — 0-100, deliberately *not*
+machine-learned. There is no trained risk model behind this system, and an
+opaque number would be an unfalsifiable claim. It is a transparent weighted sum
+where every point is attributable to a named factor with its real evidence, and
+the tests assert that the total always equals the sum of its stated reasons. The
+rule-derived severity is a **floor**: the score can escalate an alert, never
+quietly downgrade one an explicit rule classified as CRITICAL.
+
+**Event correlation** (`models.IncidentAlert`) — a watchlisted vehicle entering a
+restricted zone and then crossing three more cameras is one event that produced
+five alerts. Previously that became five incidents. A qualifying alert is now
+attached to the open incident it belongs to, and the incident's title,
+description and priority grow to describe the whole event. Correlation is
+conservative on purpose: it merges only on a hard identity (same recognized
+plate) or same-camera-with-no-vehicle, within a bounded window, and never on
+visual similarity or proximity. A closed incident is never reopened.
+
+**Live control room** (`/vision`) — replaces a 5-second poll with the real
+WebSocket stream. Detections are coalesced into one batch frame per 250ms
+(N cameras at their inference rate would otherwise be that many React state
+updates per second in every open dashboard); alerts, incidents and plate
+identifications are never batched. Events carry canonical `domain.action` names
+(`detection.created`, `vehicle.sighting`, `alert.created`, …) and the pre-V2
+names are still emitted alongside the low-frequency ones, so no existing
+consumer broke.
+
+**Journey replay + investigation** (`/vehicles/{id}`) — vehicle summary, risk
+breakdown, journey timeline with play/pause/step, a route map that highlights
+the current hop, and the raw sighting evidence. A new sighting for that vehicle
+arriving over the WebSocket extends the journey without a reload. The route is
+labelled on-screen as a **reconstructed camera-to-camera path** — the system
+knows where cameras saw the vehicle and when, and nothing in between; it is
+never presented as a GPS track. `is_live` is asserted only from a genuinely
+recent sighting, otherwise the UI says "last known".
+
+**Observability** — `/api/metrics` in Prometheus format: detections, OCR
+attempts vs accepted vs localized (the gap is the honest fallback rate),
+sightings, alerts, incidents split by opened/correlated, inference/OCR/DB-write
+latency histograms, lock retries, camera states, WebSocket clients, CPU/memory.
+Authenticated by scrape token or Administrator JWT — there is no unauthenticated
+mode. GPU memory is *absent* rather than zero on a CPU-only host, so a missing
+GPU is never reported as an idle one.
+
+**PostgreSQL** — `DATABASE_URL` selects the datastore; unset keeps the exact
+SQLite behavior, so an existing checkout and the whole test suite are unchanged.
+Alembic owns the schema on any non-SQLite backend (the additive helpers in
+`db.py` emit SQLite DDL and are skipped there). CI verifies that migrations
+apply *and* roll back, and that the models have not drifted from them.
+
 ## Real Sentinel Camera Grid (live-verified)
 
 Beyond the official Gujarat catalogue, this build also integrates a second real, live camera
 source — 30 real traffic cameras — with genuine end-to-end verification: discovery, RTSP
 connection, real frames, real YOLOv8+ByteTrack detections, real alerts, incidents, and evidence
-snapshots. Setup/troubleshooting: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in
-`backend/.env` (see `backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register
-(never auto-starts AI), then **Start**/**Connect** per camera or from the **Camera Control
-Center** (see below) — the 24/7 auto-connect supervisor (`app/pipeline/supervisor.py`) keeps
-eligible ones reconnected afterward, up to `SENTINEL_GRID_MAX_AUTOCONNECT`.
+snapshots. Setup: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in `backend/.env` (see
+`backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register. The 24/7 auto-connect
+supervisor (`app/pipeline/supervisor.py`) then keeps every registered camera connected on its own
+— up to `SENTINEL_GRID_MAX_AUTOCONNECT` (default 100, covering the whole catalog), one connection
+at a time with a real delay between each (`SENTINEL_GRID_STAGGER_SECONDS`) so a restart or a fresh
+sync never opens dozens of simultaneous RTSP handshakes against the external grid at once — that
+burst, not local CPU/RAM, is what the external grid's own connection tolerance actually limits.
+
+**Default operating posture: always connected, AI always on.** A freshly discovered grid camera
+now starts with `ai_person`/`ai_vehicle`/`ai_anpr` all `True` (matching every other camera-creation
+path in this app), so the supervisor connecting it also means it is under real detection from the
+moment it comes up — no separate "Start AI" step. "Connected" and "AI processing" remain two
+independent fields under the hood (the supervisor itself never writes the AI flags, only the
+*default value* a new camera gets them changed), so an operator can still turn AI off for any one
+camera via **Cameras → Edit** or `PATCH /api/cameras/{id}` without affecting the rest of the fleet.
 
 Credentials go in `backend/.env` only (gitignored — see `backend/.env.example`), **never** in
 source, docs, or committed anywhere. They never reach the frontend.
@@ -54,7 +276,15 @@ for the full list of what's real vs. explicitly out of scope.
 ## Layout
 
 - `backend/` — FastAPI app, detection pipeline (`app/pipeline/`), Self-Heal recovery engine
-  (`app/self_heal/`), SQLite datastore.
+  (`app/self_heal/`), Prometheus metrics (`app/metrics.py`), Alembic migrations
+  (`alembic/`), SQLite (dev) or PostgreSQL (production) datastore.
+- `backend/tools/anpr_bench.py` — ANPR benchmark harness. Compares whole-crop vs localized
+  OCR, and EasyOCR vs a candidate engine, on a directory of labelled real plate images.
+  It reports numbers and deliberately draws no conclusion: a 3% accuracy gain that costs 4x
+  the CPU is a different decision on a 30-camera box than on a workstation. No sample
+  corpus is bundled — real Gujarat plate footage is not something this repository can ship,
+  and a synthetic set would produce a figure that looks like evidence while measuring
+  nothing.
 - `frontend/` — Next.js 16 (App Router) + TypeScript + Tailwind dashboard, all ~26 screens
   from the doc's site map plus the Camera Control Center and Self-Heal section, wired to the
   live backend API + WebSocket.
@@ -65,6 +295,15 @@ SQLite (`backend/sentinel.db`), WAL journal mode, `busy_timeout=30000` (`app/db.
 write-heavy call site (camera workers, API routes) goes through the same connection pool, so a
 transient lock is absorbed by SQLite's own busy-wait before ever reaching Python, and any lock
 that does surface is retried with bounded backoff (see Self-Heal below) rather than crashing.
+
+**V2 update**: the datastore is now selected by `DATABASE_URL`. Leaving it unset
+keeps everything below exactly as it was (SQLite, WAL, the same busy-timeout and
+retry behavior). Setting a PostgreSQL URL takes the path this section described
+as the eventual requirement — the ORM ported without a rewrite, as predicted;
+what changed is the connection string, dialect-guarding the SQLite PRAGMAs, and
+handing schema ownership to Alembic (`backend/alembic/`), since the additive
+`ensure_columns`/`ensure_indexes` helpers emit SQLite DDL and are now skipped on
+any other backend. The paragraphs below still describe the SQLite deployment.
 
 **Verified acceptable for this deployment shape** — a single backend process, a bounded number
 of concurrent camera workers (real-camera testing: staged up to the documented safe concurrency
@@ -109,6 +348,95 @@ guard, one audit-log entry per bulk call, and live per-camera progress over the 
 `connect`/`start` are honest aliases — this codebase has no real distinction between them.
 RBAC is enforced server-side (`require_roles("Administrator", "Control Room Operator")`) —
 a disabled frontend button is a convenience, not the security boundary.
+
+## 10/10 roadmap gap-closure (2026-09-10)
+
+A competition-readiness pass focused on measurable engineering quality over
+architecture changes — see `docs/THREAT_MODEL.md` and
+`docs/PRIVACY_GOVERNANCE.md` for the two new standalone docs this produced.
+
+- **Confidence-aware watchlist alerts**: a watchlist match on a plate read
+  below `WATCHLIST_HIGH_CONFIDENCE_FLOOR` (default 0.60) is capped at HIGH
+  instead of auto-CRITICAL and says so in the alert reason — it still fires
+  (never silenced), it just no longer claims the same certainty as a
+  confidently-read match (`pipeline/rules_engine.py`, `config.py`).
+- **Human-in-the-loop ANPR review**: a Plate sighting below
+  `PLATE_REVIEW_CONFIDENCE_FLOOR` is flagged `pending_review`; operators
+  accept/correct/reject it via `GET/POST /api/review/...`
+  (`pipeline/anpr.py::review_status_for`, `routers/review.py`). Raw OCR,
+  grammar-normalized text, and a human correction are kept as three separate,
+  always-preserved fields — never overwritten into each other.
+- **Alert feedback + precision metrics**: `POST /api/alerts/{id}/feedback`
+  (confirmed/false_positive/needs_review) and
+  `GET /api/analytics/alert-precision`, which reports `insufficient_sample`
+  below a configurable minimum (20) rather than a misleading rate from a
+  handful of reviews (`routers/alerts.py`, `routers/analytics.py`).
+- **Tamper-evident audit chain**: every `AuditLog` row now carries
+  `chain_seq`/`prev_hash`/`entry_hash` — a real (non-blockchain) hash chain,
+  verified end-to-end via `GET /api/audit/verify-chain`
+  (`app/audit.py`). Detects both a modified row and a deleted row.
+- **Evidence provenance completion**: `Evidence.model_version`/`rule_version`
+  stamped at capture time; the evidence/incident UI now shows an exact
+  `VERIFIED`/`TAMPERED`/`UNVERIFIABLE`/`NO CAPTURE-TIME BASELINE`/`NOT YET
+  VERIFIED` badge (`components/EvidenceIntegrityBadge.tsx`) instead of a raw
+  status string.
+- **Incident Investigator Summary**: `GET /api/incidents/{id}/summary`
+  answers what/why/where/evidence/confidence in one call — risk factor
+  breakdown, plate + confidence + observation count, watchlist match detail,
+  cross-camera route, evidence integrity, related alerts — surfaced as a new
+  panel on the incident Overview tab (`routers/incidents.py`,
+  `incidents/[incidentId]/page.tsx`).
+- **Camera capacity benchmark** (`tools/camera_bench.py`): drives real camera
+  workers through the full pipeline (YOLOv8 + ByteTrack + plate localization +
+  EasyOCR) at several camera counts and reports measured FPS, inference
+  latency, CPU and RSS — never a number read off a config value.
+
+  **Which clip you drive it with changes the answer completely**, so `--video`
+  is now explicit. The bundled demo clip is 320x240, 4 seconds, and contains no
+  vehicles at all (raw YOLO sees only a "tv" in it), so it measures
+  decode-and-inference overhead on an empty frame — a floor, not a workload.
+  Measured on one machine (16 cores / 16.9 GB, 25s per stage) against that clip
+  and against a 1080p clip built from real vehicle photographs:
+
+  | cameras | bundled 320x240, no vehicles | 1080p, real vehicles + plates |
+  |---|---|---|
+  | 1 | 8.27 fps, 148 ms inference, 416 MB | **5.64 fps**, 436 ms (p95 1250 ms), 1197 MB |
+  | 3 | 8.34 fps, 40 ms, 590 MB | **2.15 fps** (p95-low 0.59), 1534 MB |
+  | 5 | 7.85 fps, 65 ms, 771 MB | **2.28 fps** (p95-low 0.44), 2012 MB |
+
+  On realistic content this machine sustains roughly **2 fps per camera at
+  three to five cameras**, with the slowest 5% of intervals exceeding two
+  seconds between processed frames, ~870-890% CPU (about 9 of 16 cores) and
+  2 GB RSS at five cameras. No camera went silent at any stage.
+
+  Read as "what this hardware does on this content", NOT as a capacity
+  envelope. A real envelope needs real
+- **Disaster recovery test** (`tests/test_disaster_recovery.py`): seeds a
+  real incident/evidence/audit-chain, backs up the SQLite file via SQLite's
+  own online-backup API, destroys the working copy, restores, and proves
+  incidents, evidence hashes, and the audit chain all survive intact.
+  PostgreSQL restore uses the same alembic-managed schema but was not
+  exercised (no PostgreSQL instance available here) — stated explicitly, not
+  implied.
+- **Privacy/governance controls**: configurable `EVIDENCE_RETENTION_DAYS`
+  (`None` by default — no automatic expiry until explicitly set) and an
+  audited, dry-run-by-default, double-confirmed purge workflow
+  (`POST /api/governance/purge-expired`) — see `docs/PRIVACY_GOVERNANCE.md`
+  for what this is (mechanism) and explicitly is not (a legal-compliance
+  claim).
+- **ANPR benchmark framework and real Indian-plate temporal fusion/parsing**
+  (`tools/anpr_bench.py`, `pipeline/plate_tracker.py`,
+  `pipeline/anpr.py::disambiguate_plate`) already existed from an earlier
+  pass and were audited, not rebuilt — see those files' own docstrings.
+  **ANPR accuracy is MEASURED but only on a small public still-image corpus**
+  (n=25 labelled plates; see `docs/ANPR_ACCURACY.md` for the numbers and the
+  caveats). The current figure is **exact match 0.24, character error rate
+  0.39** — reproducible, and unchanged by the 2026-09-12 architecture pass,
+  which improved the false-positive rate (0.28 → 0.24) rather than accuracy.
+  It is **not** validated on this deployment's cameras: no labelled corpus is
+  shipped in this repository (`tools/anpr_corpus/README.md` explains why), and
+  the still-image corpus cannot exercise temporal fusion at all. The benchmark
+  is ready the moment real, labelled footage is added there.
 
 ## Known-fixed issues (kept here so they don't get re-introduced)
 
@@ -196,3 +524,90 @@ a disabled frontend button is a convenience, not the security boundary.
   408/429/500/502/503/504 or a network failure, bounded to 3 attempts.
 - **Camera Control's per-row action menu stayed open until another item was clicked**: fixed
   with a real click-outside listener (`RowActionsMenu` in `cameras/control/page.tsx`).
+- **Backend CI never ran the test suite**: `python-package.yml` ran `pytest` from the
+  repository ROOT across Python 3.9/3.10/3.11. The suite lives in `backend/tests` and
+  imports `app.*`, so from the root pytest collected nothing and the job passed green
+  without executing a single test; the 3.9/3.10 legs could never have worked either, since
+  the code requires 3.11. Fixed (pinned 3.11, correct working directory, real system
+  libraries) and joined by a frontend workflow — typecheck, production build, and a
+  Playwright smoke test against a real backend — where previously there was none at all.
+- **Global search could never return an alert**: `routers/search.py` filtered
+  `Alert.camera_id.ilike(query)` — matching an opaque internal id column against the
+  operator's free text — so that section of a global search was permanently empty. Alerts
+  are now found the way an operator looks for them: by the camera they fired on and by the
+  vehicle plate involved.
+- **Login fields had no accessible labels**: the labels were visually adjacent but not
+  associated via `htmlFor`/`id`, so a screen reader announced two unlabelled text boxes.
+  Fixed, with `autoComplete` so a password manager can fill an account an operator uses at
+  the start of every shift.
+- **Batched live events could be lost at shutdown**: the WebSocket batcher's final flush
+  lived in the flush task's own `except CancelledError`. A task cancelled before the event
+  loop ever scheduled it never enters its body, so its cancellation handler never ran and
+  events buffered immediately before shutdown were dropped. The final flush is now done by
+  the caller, which covers that case and every other one.
+- **The root `.env` was not gitignored**: only `backend/.env` was. Since `.env.example`
+  instructs you to create a root `.env` holding `POSTGRES_PASSWORD` and `JWT_SECRET`, that
+  was a direct path to committing production secrets.
+
+### Coverage-driven pass (2026-09-12)
+
+Measuring per-module coverage pointed at the least-tested routers; every one of
+them was hiding a real defect. Each was reproduced before it was fixed, and the
+measurement is quoted with the fix.
+
+- **Search displayed filters it never applied**: `after_hour`, `before_hour` and `entity`
+  were parsed, returned in `parsed_filters`, and rendered to the operator ("Parsed filters:
+  ..."), while every query ignored them — a time-scoped search that is not scoped is worse
+  than one that is absent, because the screen asserts the filter was understood. `after 12am`
+  also parsed to hour 12 (noon), and the raw query was used verbatim as the LIKE pattern, so
+  text and a filter could never match together.
+- **Taking a plate off the watchlist did not take it off**: the alert rule gated on
+  `Vehicle.watchlist_flag`, and nothing recomputed that flag when an entry was deactivated. A
+  cleared plate kept producing CRITICAL alerts — whose own reason text claimed a match to "an
+  active watchlist entry" that no longer existed — and kept having snapshot evidence captured
+  of it. Separately, `valid_until` was stored by the API and never compared to the clock
+  anywhere, so an entry with an end date matched forever.
+- **A live stream outlived the token that authorized it**: `/api/streams/{id}/mjpeg` validated
+  its token once, at connect, then held the response open indefinitely, so
+  `stream_token_ttl_seconds` bounded nothing and disabling an account did not cut its feed.
+  The first version of the fix failed OPEN — `jwt.decode` verifies `exp`, so an expired token
+  cannot be decoded at all and the expiry helper returned `None`, which the generator treated
+  as "no deadline". An unreadable token now falls back to the configured TTL.
+- **Every stream viewer pinned a database connection**: FastAPI holds a `Depends(get_db)`
+  dependency until the response completes, and an MJPEG response is designed not to complete,
+  so each open tile consumed one connection from a pool of 15 while doing nothing but reading
+  JPEG bytes from a dict.
+- **List limits had no ceiling**: measured on a 120-row database, `GET /api/detections`
+  returned 100 by default, all 120 for `limit=-1` (SQLite reads `LIMIT -1` as no limit), and
+  all 120 for `limit=100000000` — the whole detections table in one response for any
+  authenticated user. Incident notes were unbounded too: a 2,000,000-character note returned
+  200.
+- **An administrator could lock out every administrator in one click**: self-disable returned
+  200 and the caller's next request returned 401, and no enable route existed anywhere in the
+  API, so recovery meant editing the database by hand. Correct credentials against a disabled
+  account were also refused silently — the one login event most worth auditing.
+- **Zones and rules accepted configurations that could never fire**: an unknown camera or zone
+  id raised an unhandled `IntegrityError` (a 500 with a raw "FOREIGN KEY constraint failed"),
+  an inverted zone box was stored and listed while matching nothing, `rule_type` was a free
+  string, and deleted zones stayed in the rules page's zone picker — where a rule attached to
+  one silently never fires.
+- **Incident creation, assignment and timeline 500'd on ordinary input**: unknown
+  camera/alert/vehicle ids and unknown assignees hit the same unhandled `IntegrityError`, a
+  disabled account could be assigned work, and `', '.join(alert.reasons)` on a nullable column
+  raised `TypeError: can only join an iterable` — while the summary endpoint in the same file
+  already guarded that exact column.
+- **One malformed row blanked the whole Alert Center**: a single alert with NULL `reasons`
+  made `GET /api/alerts` fail response validation entirely, so the page went empty for every
+  camera rather than for that one line. The per-camera view was also filtered in the browser
+  over rows the server had already truncated to 200, so a camera whose alerts were older than
+  the newest 200 system-wide looked like a camera with no alerts.
+- **The dashboard's hourly chart was SQLite-only**: `/api/analytics/events-by-hour` grouped by
+  `func.strftime(...)`, which SQLAlchemy passes through verbatim. Reproduced against a real
+  PostgreSQL server: `function strftime(unknown, timestamp without time zone) does not exist`
+  — a 500 on the production datastore that every SQLite test passed. Now grouped with
+  `extract`, verified live by `tools/postgres_verify.py` (13/13) and guarded by a test that
+  fails if any app module calls a SQLite-only SQL function again.
+
+Backend coverage moved 81% → 85% across this pass and the CI floor was raised 80 → 84. The
+percentage is the least interesting part: it was useful only as a map of which code had never
+been executed by a test.

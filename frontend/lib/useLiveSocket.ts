@@ -11,6 +11,14 @@ export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
   const [connected, setConnected] = useState(false);
   const [lastEvent, setLastEvent] = useState<LiveEvent | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // The connect effect below runs once (deps `[]`, deliberately — reconnecting
+  // the socket whenever a caller re-renders would be far worse). That means the
+  // handler it closes over is the one from the FIRST render, so a caller whose
+  // callback depends on changing state would silently keep receiving events on
+  // a stale closure. Routing through a ref that every render refreshes keeps
+  // the single long-lived socket while always invoking the current handler.
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
 
   useEffect(() => {
     let cancelled = false;
@@ -59,7 +67,7 @@ export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
         try {
           const parsed: LiveEvent = JSON.parse(msg.data);
           setLastEvent(parsed);
-          onEvent?.(parsed);
+          onEventRef.current?.(parsed);
         } catch {}
       };
     }

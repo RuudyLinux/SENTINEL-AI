@@ -65,16 +65,26 @@ def run_seed(db: Session) -> None:
 
 
 # --- Demo camera fixtures (Phase 6) --------------------------------------
-# The two cameras the primary judge-demo scenario runs against. Both point
-# at the same real uploaded test clip (the only real footage available) —
-# genuine YOLO/ByteTrack/EasyOCR processing runs on both; only the specific
-# ANPR "read" of the demo watchlist plate is injected deterministically (see
+# The two cameras the primary judge-demo scenario runs against. Both point at
+# a small tracked-in-git demo clip (app/demo_assets/car-detection.mp4) — real
+# YOLO/ByteTrack/EasyOCR processing runs on both; only the specific ANPR
+# "read" of the demo watchlist plate is injected deterministically (see
 # pipeline/demo_scenario.py), never the detection/tracking itself.
+#
+# Real bug this fixes: this used to point at "uploads/car-detection.mp4" — a
+# file that only ever existed on one developer's machine. `backend/uploads/`
+# is gitignored (real operator-uploaded evidence never belongs in version
+# control), so a fresh checkout, a Docker build, or any CI runner had NO such
+# file: the documented judge-demo flow (README's "Cameras -> Add Camera...
+# or Investigate -> Generate Evidence Package") silently could not produce a
+# real decoded frame anywhere except that one machine. Caught by this
+# project's own CI actually running for the first time. The demo clip now
+# lives under app/, which IS tracked, specifically so it ships with the code.
 DEMO_CAMERAS = [
     {"camera_code": "C-014", "name": "Ahmedabad Ring Road", "location": "Ahmedabad",
-     "lat": 23.03, "lng": 72.58, "source_type": "video_file", "source_uri": "uploads/car-detection.mp4"},
+     "lat": 23.03, "lng": 72.58, "source_type": "video_file", "source_uri": "app/demo_assets/car-detection.mp4"},
     {"camera_code": "C-019", "name": "Naroda Junction", "location": "Naroda",
-     "lat": 23.07, "lng": 72.65, "source_type": "video_file", "source_uri": "uploads/car-detection.mp4"},
+     "lat": 23.07, "lng": 72.65, "source_type": "video_file", "source_uri": "app/demo_assets/car-detection.mp4"},
 ]
 DEMO_PLATE = "GJ05AB1234"
 
@@ -92,7 +102,20 @@ def reset_demo_data(db: Session) -> dict:
     if not settings.demo_mode:
         raise RuntimeError("reset_demo_data called outside DEMO_MODE — refusing")
 
-    for model in (models.Evidence, models.IncidentNote, models.Incident, models.Alert,
+    # BUG-D fix (final deep-debug pass, 2026-09-11): `models.IncidentAlert` was
+    # MISSING from this list, and it holds foreign keys to BOTH incidents and
+    # alerts — so `DELETE FROM incidents` here violated referential integrity.
+    # That silently "worked" only because SQLite ignores foreign keys unless
+    # `PRAGMA foreign_keys=ON` (now set — see app/db.py); on PostgreSQL, which
+    # has always enforced them, this raised a ForeignKeyViolation, meaning
+    # `POST /api/system/demo/reset` — the flagship judge-demo reset path — was
+    # broken on the production datastore and no SQLite-run test could see it.
+    #
+    # Order matters and is children-first: IncidentAlert before Incident/Alert,
+    # Alert before Detection (Alert.detection_id), everything referencing a
+    # vehicle before Vehicle itself.
+    for model in (models.Evidence, models.IncidentNote, models.IncidentAlert,
+                  models.Incident, models.Alert,
                   models.Plate, models.Track, models.Detection, models.Vehicle):
         db.query(model).delete()
 

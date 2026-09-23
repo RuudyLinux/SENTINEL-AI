@@ -13,16 +13,26 @@ export default function WatchlistsPage() {
   const entries = entriesData || [];
   const [form, setForm] = useState({ identifier: "", reason: "", priority: "HIGH" });
   const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
+  // Rapid double-clicks used to fire the POST once per click. Measured against
+  // the running backend: three clicks on SAVE created three identical in-force
+  // watchlist entries for one plate. The backend now refuses the duplicate
+  // (409, see routers/watchlists.py) — this is the other half: the button
+  // reports that a submit is in flight instead of silently accepting more.
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setActionError(null);
+    setBusy(true);
     try {
       await api.post("/api/watchlists", { ...form, entity_type: tab });
       setForm({ identifier: "", reason: "", priority: "HIGH" });
       reload();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not save watchlist entry");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -62,7 +72,7 @@ export default function WatchlistsPage() {
             <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
           </select>
         </div>
-        <button className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 h-fit">SAVE</button>
+        <button type="submit" disabled={busy} className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 h-fit disabled:opacity-50">{busy ? "Saving..." : "SAVE"}</button>
       </form>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
 

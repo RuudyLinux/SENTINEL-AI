@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { Wifi, Play, BrainCircuit, RotateCcw, Square, ArrowRight } from "lucide-react";
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket } from "@/lib/useLiveSocket";
+import { EVENT } from "@/lib/useLiveFeed";
 import { api } from "@/lib/api";
 import KpiCard from "@/components/KpiCard";
 import SeverityBadge from "@/components/SeverityBadge";
@@ -42,7 +43,7 @@ function CameraControlWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">Camera Control</h3>
-        <button onClick={() => router.push("/cameras/control")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/cameras/control")} className="row-action gap-1 text-xs text-accent hover:underline">
           Open Camera Control Center <ArrowRight size={12} />
         </button>
       </div>
@@ -70,7 +71,7 @@ function SystemHealthWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-2">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">System Health</h3>
-        <button onClick={() => router.push("/self-heal/health")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/self-heal/health")} className="row-action gap-1 text-xs text-accent hover:underline">
           Details <ArrowRight size={12} />
         </button>
       </div>
@@ -94,12 +95,21 @@ export default function DashboardPage() {
   const { data: overview, error, reload } = useApiData<any>("/api/analytics/overview", { pollMs: 10000 });
 
   useLiveSocket((e) => {
-    if (e.type === "alert") {
+    if (e.type === EVENT.ALERT_CREATED) {
       setLiveFeed((prev) => [{ ...e.data, kind: "alert" }, ...prev].slice(0, 20));
       reload();
     }
-    if (e.type === "detection") {
-      setLiveFeed((prev) => [{ ...e.data, kind: "detection" }, ...prev].slice(0, 20));
+    // Detections now arrive coalesced into one batch frame per interval rather
+    // than one frame each (backend ws.py) — N cameras at their inference rate
+    // would otherwise be that many React state updates per second here.
+    if (e.type === EVENT.DETECTION_BATCH) {
+      const batched = (e.data?.events ?? []).map((d: any) => ({ ...d, kind: "detection" }));
+      if (batched.length) setLiveFeed((prev) => [...batched.reverse(), ...prev].slice(0, 20));
+    }
+    // A recognized plate is an identification, not one more anonymous
+    // detection, so it gets its own row in the command-centre feed.
+    if (e.type === EVENT.VEHICLE_SIGHTING) {
+      setLiveFeed((prev) => [{ ...e.data, kind: "sighting" }, ...prev].slice(0, 20));
     }
   });
 
@@ -163,11 +173,21 @@ export default function DashboardPage() {
                 <div className="flex items-center gap-3">
                   {item.kind === "alert" ? (
                     <SeverityBadge severity={item.severity} />
+                  ) : item.kind === "sighting" ? (
+                    <span className="badge bg-accent/15 text-accent border border-accent/30 font-mono">
+                      {item.plate_text}
+                    </span>
                   ) : (
                     <span className="badge bg-slate-500/15 text-slate-300 border border-slate-500/30">{item.cls}</span>
                   )}
                   <span className="text-slate-300">{item.camera_code}</span>
                   {item.kind === "alert" && <span className="text-slate-400 text-xs">{item.reasons?.join("; ")}</span>}
+                  {item.kind === "sighting" && (
+                    <span className="text-slate-400 text-xs">
+                      {Math.round((item.plate_confidence ?? 0) * 100)}% plate confidence
+                      {item.watchlist_flag ? " · WATCHLIST" : ""}
+                    </span>
+                  )}
                 </div>
                 <span className="text-xs text-slate-500">{new Date(item.timestamp).toLocaleTimeString()}</span>
               </div>

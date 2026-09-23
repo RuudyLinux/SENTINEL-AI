@@ -12,16 +12,24 @@ export default function AiRulesPage() {
   const zones = zonesData || [];
   const [form, setForm] = useState({ name: "", rule_type: "watchlist_plate", zone_id: "", priority: "CRITICAL" });
   const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
+  // Same double-submit guard as the watchlist and camera forms: without it a
+  // rapid second click fires a second POST, and this endpoint has no natural
+  // key to collide on, so the duplicate lands as a second identical rule.
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setActionError(null);
+    setBusy(true);
     try {
       await api.post("/api/rules", { ...form, zone_id: form.zone_id || null });
       setForm({ name: "", rule_type: "watchlist_plate", zone_id: "", priority: "CRITICAL" });
       reloadRules();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not create rule");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -86,7 +94,7 @@ export default function AiRulesPage() {
             <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
           </select>
         </div>
-        <button className="text-xs bg-accent text-ink font-medium rounded px-4 py-2">CREATE RULE</button>
+        <button type="submit" disabled={busy} className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 disabled:opacity-50">{busy ? "Creating..." : "CREATE RULE"}</button>
       </form>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
 

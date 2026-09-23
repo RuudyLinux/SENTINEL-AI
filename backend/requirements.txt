@@ -1,4 +1,9 @@
 fastapi
+# V2: distributed runtime state (app/runtime_state.py) — alert cooldown,
+# self-heal dedup, login rate limiting — shared across processes when
+# REDIS_URL is set. Unused (falls back to in-process) when it is unset, so it
+# costs nothing on a single-node dev checkout.
+redis
 uvicorn[standard]
 sqlalchemy
 pydantic-settings
@@ -16,3 +21,18 @@ reportlab
 httpx
 pytest
 psutil
+# V2: Prometheus exposition for /api/metrics (app/metrics.py).
+prometheus-client
+# V2: schema migrations. SQLite development still uses the additive helpers in
+# app/db.py; on any other backend Alembic owns the schema outright.
+alembic
+# V2: PostgreSQL driver for the production datastore. Unused when DATABASE_URL
+# is unset (SQLite development), so it costs nothing on a dev checkout.
+psycopg[binary]
+# Inter-test coupling gate: runs the suite in a randomized order so a test that
+# depends on shared DB state or a module-global cache fails loudly instead of
+# passing on collection-order luck. Test-only; imports nothing at app runtime.
+# See the "randomized order" step in .github/workflows/python-package.yml.
+pytest-random-order
+# Coverage measurement with a CI floor (see python-package.yml). Test-only.
+pytest-cov

@@ -1,8 +1,9 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { api, buildTokenedUrl, ApiError } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
+import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge } from "@/components/ConnectionBadge";
 import ErrorState from "@/components/ErrorState";
 
@@ -12,16 +13,14 @@ export default function SingleCameraPage() {
   const { data: camera, loading: cameraLoading, error: cameraError, reload: reloadCamera } = useApiData<any>(
     `/api/cameras/${cameraId}`, { pollMs: 4000 }
   );
-  const [streamUrl, setStreamUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (camera?.status !== "online") return;
-    let cancelled = false;
-    buildTokenedUrl(`/api/streams/${cameraId}/stream-token`, `/api/streams/${cameraId}/mjpeg`)
-      .then((url) => { if (!cancelled) setStreamUrl(url); })
-      .catch(() => { if (!cancelled) setStreamUrl(null); });
-    return () => { cancelled = true; };
-  }, [camera?.status, cameraId]);
+  // Re-authorized on a schedule: the backend ends a stream when the token
+  // that opened it expires, and this view is the one most likely to be left
+  // open for a full shift.
+  const streamUrl = useStreamUrl(
+    `/api/streams/${cameraId}/stream-token`,
+    `/api/streams/${cameraId}/mjpeg`,
+    camera?.status === "online",
+  );
   const { data: detections, error: detectionsError, reload: reloadDetections } = useApiData<any[]>(
     `/api/detections?camera_id=${cameraId}&limit=50`, { pollMs: 4000 }
   );
