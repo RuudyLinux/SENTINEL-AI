@@ -916,6 +916,12 @@ async def _camera_loop(camera_id: str) -> None:
         camera.status = "online"  # type: ignore[assignment]
         camera.fps = initial_fps  # type: ignore[assignment]
         camera.resolution = initial_resolution  # type: ignore[assignment]
+        # grid_state was left at CONNECTING (direct path) or RECONNECTING
+        # (via _reopen_with_backoff above) — the main loop's own desired_state
+        # check corrects this on the next successful frame read, but that is
+        # a window with no guarantee the first read succeeds. Setting it here
+        # removes the window instead of hoping the loop closes it quickly.
+        _set_grid_state(camera_id, "CONNECTED")
         await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
             setattr(camera, "status", "online"),
             setattr(camera, "fps", initial_fps),
@@ -1157,6 +1163,13 @@ async def _camera_loop_supervised(camera_id: str) -> None:
                     camera.status = "offline"  # type: ignore[assignment]
                     camera.error_count += 1  # type: ignore[assignment]
                     db.commit()
+                # Real gap this closed: the worker task is dead once we are
+                # here, so unlike every other status write in this file, there
+                # is no next loop iteration to self-correct grid_state — it
+                # would sit at whatever it last was (e.g. PROCESSING) forever,
+                # disagreeing with the DB's "offline" and with the actual
+                # (nonexistent) worker, until an operator restarts the camera.
+                _set_grid_state(camera_id, "DISCONNECTED")
             finally:
                 db.close()
         except Exception:
