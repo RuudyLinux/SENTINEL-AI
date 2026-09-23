@@ -299,10 +299,13 @@ function RowActionsMenu({
 
   return (
     <div ref={containerRef} className="relative inline-block">
+      {/* p-1 around a 15px icon is a 23px target — one pixel under the WCAG
+          2.5.8 minimum, and this is the ONLY way to reach every per-camera
+          action on this screen. p-1.5 makes it 27px. */}
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={!canControl || busy}
-        className="p-1 rounded hover:bg-panel2 disabled:opacity-40"
+        className="p-1.5 rounded hover:bg-panel2 disabled:opacity-40"
         aria-label={`Actions for ${camera.camera_code}`}
       >
         {busy ? <Loader2 size={15} className="animate-spin" /> : <MoreVertical size={15} />}

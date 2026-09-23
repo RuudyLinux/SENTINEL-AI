@@ -4,11 +4,26 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 
 // default marker icons reference bundled assets Next.js won't resolve; use divIcon instead
+//
+// The DOT stays 14px and the TARGET is 28px. A measured pass at 375px width
+// found 33 camera markers failing WCAG 2.5.8 (Target Size, Minimum, 24x24):
+// the icon was 14x14 and markers in the same district overlap, so the spacing
+// exception did not rescue them either — on a phone, picking one camera out
+// of a cluster was a matter of luck. Growing the painted dot instead would
+// have made a dense district unreadable, which is the wrong trade: the
+// requirement is about the region that responds to a tap, not the glyph. So
+// the dot is centred inside a transparent 28x28 box, and the map looks
+// exactly as it did before.
+const ICON_BOX = 28; // >= the 24px WCAG minimum, with a little margin
+const DOT = 14;
+
 const cameraIcon = (color: string) =>
   L.divIcon({
     className: "",
-    html: `<div style="width:14px;height:14px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6)"></div>`,
-    iconSize: [14, 14],
+    html: `<div style="width:${ICON_BOX}px;height:${ICON_BOX}px;display:flex;align-items:center;justify-content:center"><div style="width:${DOT}px;height:${DOT}px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6)"></div></div>`,
+    // Leaflet centres a divIcon on its iconSize when no iconAnchor is given,
+    // so the dot still sits exactly on the camera's coordinate.
+    iconSize: [ICON_BOX, ICON_BOX],
   });
 
 export default function CameraMap({

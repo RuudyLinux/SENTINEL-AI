@@ -43,7 +43,7 @@ function CameraControlWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">Camera Control</h3>
-        <button onClick={() => router.push("/cameras/control")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/cameras/control")} className="row-action gap-1 text-xs text-accent hover:underline">
           Open Camera Control Center <ArrowRight size={12} />
         </button>
       </div>
@@ -71,7 +71,7 @@ function SystemHealthWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-2">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">System Health</h3>
-        <button onClick={() => router.push("/self-heal/health")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/self-heal/health")} className="row-action gap-1 text-xs text-accent hover:underline">
           Details <ArrowRight size={12} />
         </button>
       </div>

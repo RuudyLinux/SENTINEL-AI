@@ -250,20 +250,20 @@ export default function CamerasPage() {
         return (
           <div className="flex flex-wrap gap-2">
             {connected ? (
-              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "stop", e)} className="text-xs text-critical hover:underline disabled:opacity-50">Disconnect</button>
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "stop", e)} className="row-action text-xs text-critical hover:underline disabled:opacity-50">Disconnect</button>
             ) : (
-              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "start", e)} className="text-xs text-accent hover:underline disabled:opacity-50">Connect</button>
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "start", e)} className="row-action text-xs text-accent hover:underline disabled:opacity-50">Connect</button>
             )}
             {/* Start/Stop AI only makes sense once a stream exists to process. */}
             {connected && (
               aiOn ? (
-                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, false, e)} className="text-xs text-high hover:underline disabled:opacity-50">Stop AI</button>
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, false, e)} className="row-action text-xs text-high hover:underline disabled:opacity-50">Stop AI</button>
               ) : (
-                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, true, e)} className="text-xs text-accent hover:underline disabled:opacity-50">Start AI</button>
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, true, e)} className="row-action text-xs text-accent hover:underline disabled:opacity-50">Start AI</button>
               )
             )}
-            <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="text-xs text-accent hover:underline">Edit</button>
-            <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="text-xs text-accent hover:underline">Restart</button>
+            <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="row-action text-xs text-accent hover:underline">Edit</button>
+            <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="row-action text-xs text-accent hover:underline">Restart</button>
           </div>
         );
       },

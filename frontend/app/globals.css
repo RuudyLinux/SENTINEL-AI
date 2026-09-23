@@ -64,3 +64,35 @@ html, body {
     scroll-behavior: auto !important;
   }
 }
+
+/* --- Touch targets (WCAG 2.5.8, Target Size Minimum, 24x24 CSS px) --------
+   Measured at 375px width across all 28 routes. Two shapes came up short:
+   map markers (fixed in CameraMap.tsx, where the dot stays 14px and only the
+   hit area grows) and the text-style row actions below.
+
+   A row action was 16px tall — a bare `text-xs` button with no padding at
+   all. At that height it passed AA only by the spacing exception, i.e. purely
+   because nothing else happened to sit within 24px of it. That is a pass that
+   any future layout change silently revokes, and on a phone a 16px-tall
+   "Disconnect" is a genuinely awkward tap. `min-height` rather than padding
+   keeps the text baseline where the table already places it, and nothing here
+   touches the button's WIDTH, so the table-width work this row sits in is
+   unaffected. */
+.row-action {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Row-selection checkboxes render at the UA default 13x13. These sit one per
+   table row, so vertical spacing keeps them AA-compliant, but 13px is small
+   for a thumb and the box is the only affordance for bulk actions. 18px is
+   the largest size that does not visibly unbalance the row. Going the whole
+   way to 24x24 needs a padded <label> wrapper, and on /cameras that wrapper
+   would double-fire the shift-click range-select handler — deliberately not
+   done here. */
+table input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
