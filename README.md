@@ -245,11 +245,21 @@ apply *and* roll back, and that the models have not drifted from them.
 Beyond the official Gujarat catalogue, this build also integrates a second real, live camera
 source — 30 real traffic cameras — with genuine end-to-end verification: discovery, RTSP
 connection, real frames, real YOLOv8+ByteTrack detections, real alerts, incidents, and evidence
-snapshots. Setup/troubleshooting: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in
-`backend/.env` (see `backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register
-(never auto-starts AI), then **Start**/**Connect** per camera or from the **Camera Control
-Center** (see below) — the 24/7 auto-connect supervisor (`app/pipeline/supervisor.py`) keeps
-eligible ones reconnected afterward, up to `SENTINEL_GRID_MAX_AUTOCONNECT`.
+snapshots. Setup: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in `backend/.env` (see
+`backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register. The 24/7 auto-connect
+supervisor (`app/pipeline/supervisor.py`) then keeps every registered camera connected on its own
+— up to `SENTINEL_GRID_MAX_AUTOCONNECT` (default 100, covering the whole catalog), one connection
+at a time with a real delay between each (`SENTINEL_GRID_STAGGER_SECONDS`) so a restart or a fresh
+sync never opens dozens of simultaneous RTSP handshakes against the external grid at once — that
+burst, not local CPU/RAM, is what the external grid's own connection tolerance actually limits.
+
+**Default operating posture: always connected, AI always on.** A freshly discovered grid camera
+now starts with `ai_person`/`ai_vehicle`/`ai_anpr` all `True` (matching every other camera-creation
+path in this app), so the supervisor connecting it also means it is under real detection from the
+moment it comes up — no separate "Start AI" step. "Connected" and "AI processing" remain two
+independent fields under the hood (the supervisor itself never writes the AI flags, only the
+*default value* a new camera gets them changed), so an operator can still turn AI off for any one
+camera via **Cameras → Edit** or `PATCH /api/cameras/{id}` without affecting the rest of the fleet.
 
 Credentials go in `backend/.env` only (gitignored — see `backend/.env.example`), **never** in
 source, docs, or committed anywhere. They never reach the frontend.

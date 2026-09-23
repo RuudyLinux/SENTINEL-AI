@@ -173,17 +173,21 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
                 external_catalog_id=marker,
                 camera_group="Sentinel Grid",
                 status="offline",  # registered only — not connected
-                # AI OFF by default on discovery — the model's column default
-                # is True, which would make Camera.model's own default enable
-                # full YOLO/ByteTrack/ANPR the moment the 24/7 auto-connect
-                # supervisor (pipeline/supervisor.py) starts this camera's
-                # RTSP connection. "Registered/connected" and "AI processing"
-                # must stay independent by design; AI is explicit opt-in per
-                # camera via PATCH /api/cameras/{id}, never a side effect of
-                # being discovered or auto-connected.
-                ai_person=False,
-                ai_vehicle=False,
-                ai_anpr=False,
+                # AI ON by default on discovery (operator directive: every
+                # camera stays connected and under AI processing as the
+                # standard operating posture, not an opt-in). This matches
+                # Camera.model's own column default (True) and every other
+                # camera-creation path (POST /api/cameras' schema default is
+                # also True) — a freshly discovered grid camera is no longer
+                # a deliberate exception to that. "Registered/connected" and
+                # "AI processing" remain two SEPARATE fields (the supervisor
+                # still never writes ai_person/ai_vehicle/ai_anpr itself,
+                # here or anywhere else — see supervisor.py's own docstring),
+                # only the starting VALUE of one changed; an operator can
+                # still turn AI off per camera via PATCH /api/cameras/{id}.
+                ai_person=True,
+                ai_vehicle=True,
+                ai_anpr=True,
             )
             db.add(camera)
             created += 1

@@ -1,14 +1,23 @@
 """24/7 real Sentinel Camera Grid connection supervisor.
 
 Keeps eligible REAL Sentinel Grid cameras' RTSP connection alive automatically
-— discovers the catalogue at startup, connects eligible cameras up to a
-resource-safety cap, and reconnects any that drop, on a periodic sweep. It
-never enables AI: "connected/LIVE" and "AI processing" are and remain two
-independent concerns (see worker.py._process_frame's ai_enabled gate) — a
-camera this supervisor connects stays exactly whatever `ai_person`/
-`ai_vehicle`/`ai_anpr` it already has (False by default for a freshly
-discovered camera, see sentinel_grid.upsert_grid_cameras); AI is always an
-explicit, separate operator action (`PATCH /api/cameras/{id}`).
+— discovers the catalogue at startup, connects eligible cameras up to
+settings.sentinel_grid_max_autoconnect (now sized to cover the whole
+catalog — every registered camera stays connected, all the time, as the
+standard operating posture), and reconnects any that drop, on a periodic
+sweep.
+
+This module still never writes ai_person/ai_vehicle/ai_anpr: "connected/
+LIVE" and "AI processing" remain two SEPARATE fields (see
+worker.py._process_frame's ai_enabled gate) — a camera this supervisor
+connects runs with whatever those three flags already say. What changed is
+the STARTING VALUE a freshly discovered camera gets them set to
+(sentinel_grid.upsert_grid_cameras: True by default now, matching
+Camera.model's own column default and every other camera-creation path,
+rather than the prior deliberate False-on-discovery exception) — so in
+practice every camera this supervisor connects now also runs AI, without
+this module's own connect-only behavior needing to change at all. An
+operator can still turn AI off per camera via PATCH /api/cameras/{id}.
 
 Concurrency optimization finding (staged real-camera testing): starting N
 eligible cameras' workers back-to-back in one sweep opens N simultaneous new

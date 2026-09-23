@@ -296,16 +296,25 @@ class Settings(BaseSettings):
     # on immediate retry (real network jitter to the grid, not a code bug).
     sentinel_grid_timeout_seconds: float = 20.0
 
-    # 24/7 auto-connect supervisor (real camera connectivity task). Separate
-    # from AI: this only keeps eligible real Sentinel Grid cameras' RTSP
-    # connection alive — it never enables ai_person/ai_vehicle/ai_anpr on a
-    # camera. Cap is a conservative starting point, NOT yet validated against
-    # this machine's actual CPU/RAM/network cost of N concurrent real RTSP
-    # decodes — do not raise it, or claim any concurrency figure, before
-    # running the staged 1/3/5/10/30 connection test and recording the
-    # measured safe number here.
+    # 24/7 auto-connect supervisor (real camera connectivity task). This only
+    # keeps eligible real Sentinel Grid cameras' RTSP connection alive — see
+    # sentinel_grid.py's upsert for where ai_person/ai_vehicle/ai_anpr are
+    # actually set; the supervisor itself still never writes them, it just
+    # connects whatever a camera's current flags already say.
+    #
+    # Operator directive: every registered camera stays connected, all the
+    # time, as the standard operating posture — this cap now covers the
+    # whole catalog rather than a conservative batch. What actually protects
+    # the external grid from a connection burst is sentinel_grid_stagger_
+    # seconds below (one connect at a time, a real delay between each), which
+    # this cap does not change or bypass — measured this same investigation:
+    # the limiting factor at scale was the external grid's tolerance for a
+    # SIMULTANEOUS burst, not local CPU/RAM once the shared thread pool was
+    # sized to the camera count (see worker.py's worker_thread_pool_* / the
+    # commit that fixed it). Raise past 100 only after re-measuring against
+    # the grid's actual size at that point.
     sentinel_grid_autoconnect: bool = True
-    sentinel_grid_max_autoconnect: int = 5
+    sentinel_grid_max_autoconnect: int = 100
     sentinel_grid_supervisor_sweep_seconds: float = 30.0
     # After a real AUTH_ERROR (credentials rejected by the grid, not just
     # "unconfigured"), the supervisor stops retrying for this long — a
