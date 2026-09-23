@@ -2,6 +2,30 @@
 real ANPR -> persist -> evaluate rules -> broadcast. This is the whole
 pipeline described in doc §54, running against a webcam or an uploaded
 video file rather than a real CCTV/VMS source (see source.py header).
+
+This file used to own the camera state machine, the connection/reconnect
+logic and the frame/snapshot helpers directly -- 1287 lines doing five
+things at once. Four of those are now separate modules this file imports
+and re-exports (every existing `from .pipeline.worker import X` still
+works unchanged -- see each import block below for exactly which names):
+
+- camera_state.py    -- CAMERA_STATS, grid_state, the transition table
+- db_helpers.py       -- self-heal-aware _safe_commit/_safe_flush
+- camera_connection.py -- _open_with_timeout, _reopen_with_backoff
+- frame_utils.py      -- _draw_boxes, _save_snapshot, row capture/restore
+
+What stays here, deliberately: _process_frame (detection -> ANPR -> rules
+dispatch) and _camera_loop (the actual per-frame asyncio loop, its
+heartbeat, and its error handling) are the true orchestration core -- one
+continuous control flow, not five services with their own transaction
+boundaries. Splitting THOSE apart is real surgery in the highest-traffic
+path this application has, with no live-hardware test harness to verify
+it against beyond what this repo's test suite and a real running camera
+already cover; it was traced and deliberately left for its own pass
+rather than rushed into this one. The ANPR internals
+(_read_plate_for_track/_run_anpr/_rejection_reason) stayed for the same
+reason -- they are reached only from _process_frame and share its request
+lifecycle.
 """
 import asyncio
 import logging
@@ -34,342 +58,27 @@ from .db_retry import safe_commit, safe_flush, close_session
 from ..evidence_hash import sha256_file
 from ..self_heal import engine as self_heal
 from . import clips
+from .camera_state import (
+    # Re-exported unchanged: every router (cameras.py, camera_control.py,
+    # self_heal.py, system.py) and a good fraction of the test suite import
+    # these AS `app.pipeline.worker.<name>` today. Moving the implementation
+    # to its own module must not be a breaking change for any of them --
+    # this import is what keeps `from .pipeline.worker import CAMERA_STATS`
+    # (etc.) working exactly as before.
+    CAMERA_STATS, GRID_STATES, ILLEGAL_TRANSITIONS, _DB_STATUS_FOR_GRID_STATE,
+    _TRANSITIONS, _ema, _set_grid_state, _stats,
+)
+from .db_helpers import (
+    # Same re-export contract as camera_state above -- test_worker_resilience.py
+    # imports _safe_commit/_stats directly from `app.pipeline.worker`.
+    _db_self_heal_on_result, _safe_commit, _safe_flush, _self_heal_camera_id,
+)
+from .camera_connection import _open_with_timeout, _reopen_with_backoff
+from .frame_utils import _draw_boxes, _restore_row, _save_snapshot, _snapshot_attrs
 
 LATEST_FRAMES: dict[str, bytes] = {}
 RUNNING: dict[str, "asyncio.Task[None]"] = {}
 
-# Phase 4 diagnostics — per-camera runtime counters for the concurrency
-# investigation (frame/inference latency, drops, reconnects, last error).
-# In-memory, process-local, intentionally lightweight (a temporary
-# diagnostic surface per the Phase 4 brief, not a metrics system).
-CAMERA_STATS: dict[str, dict[str, Any]] = {}
-
-
-def _stats(camera_id: str) -> dict[str, Any]:
-    return CAMERA_STATS.setdefault(camera_id, {
-        "started_at": None,
-        "frames_read": 0,
-        "frames_processed": 0,
-        "read_failures": 0,
-        "reconnects": 0,
-        "recovered_errors": 0,
-        "last_loop_at": None,
-        "last_read_ms": None,
-        "read_ms_ema": None,
-        "last_inference_ms": None,
-        "inference_ms_ema": None,
-        "loop_gap_ms_ema": None,  # wall-clock time between consecutive loop iterations
-        "last_error": None,
-        # Richer connection-lifecycle state (final integration task), surfaced
-        # via GET /api/cameras/{id}/diagnostics. Deliberately kept separate from
-        # Camera.status (DB column, only ever online/offline/degraded — many
-        # other call sites already depend on that 3-value contract) rather than
-        # migrating it, per "reuse existing, don't redesign."
-        #
-        # None, not "CONNECTING": this dict is created by `setdefault` the
-        # first time ANYTHING asks about a camera, which is not the same
-        # moment a worker starts one. A prior version primed this to
-        # "CONNECTING", which meant a camera's first REAL transition was
-        # checked as if it were "CONNECTING -> whatever" once transition
-        # legality started being checked — every fresh camera looked like an
-        # illegal transition on its very first move. None means "no lifecycle
-        # observed yet", and _set_grid_state treats a None previous state as
-        # unconditionally legal, which is the only correct rule for a state
-        # that was never really entered.
-        "grid_state": None,
-    })
-
-
-# Valid values for CAMERA_STATS[...]["grid_state"].
-GRID_STATES = {
-    "DISCOVERING", "CONNECTING", "CONNECTED", "PROCESSING", "DEGRADED",
-    "RECONNECTING", "DISCONNECTED", "AUTH_ERROR", "ERROR",
-}
-
-# Which transitions this lifecycle actually makes. The previous guard checked
-# that the NEW state was a known name, which is the weaker half of the
-# question — "PROCESSING" is a valid name and a nonsense destination from
-# DISCONNECTED, and nothing said so. It was also an `assert`, and asserts are
-# stripped under `python -O`, so the one check there was could vanish in an
-# optimised run.
-#
-# Self-transitions are listed because the loop re-asserts its state on most
-# iterations; leaving them out would make the common case the noisy one.
-# Every state can reach DISCONNECTED (an operator can stop a camera at any
-# point) and the two failure states (a source can fail at any point), so those
-# are added to every row rather than repeated by hand.
-_ALWAYS_REACHABLE = {"DISCONNECTED", "AUTH_ERROR", "ERROR"}
-_TRANSITIONS: dict[str, set[str]] = {
-    "DISCOVERING": {"DISCOVERING", "CONNECTING"},
-    "CONNECTING": {"CONNECTING", "CONNECTED", "PROCESSING", "RECONNECTING"},
-    "CONNECTED": {"CONNECTED", "PROCESSING", "DEGRADED", "RECONNECTING"},
-    "PROCESSING": {"PROCESSING", "CONNECTED", "DEGRADED", "RECONNECTING"},
-    "DEGRADED": {"DEGRADED", "CONNECTED", "PROCESSING", "RECONNECTING"},
-    "RECONNECTING": {"RECONNECTING", "CONNECTED", "PROCESSING", "DEGRADED"},
-    # A stopped or failed camera comes back only by being started again --
-    # AND, real sequence caught live by this table's own instrumentation
-    # (not a hypothetical): a fresh worker's very first connect attempt can
-    # fail fast enough that `_open_with_timeout` marks DISCONNECTED before
-    # its caller's own fallback retries via `_reopen_with_backoff` in the
-    # SAME call, which marks RECONNECTING immediately after. That two-line
-    # fallback (`if not opened: opened = await _reopen_with_backoff(...)`)
-    # is intended behaviour, not a bug the table should be flagging.
-    "DISCONNECTED": {"DISCONNECTED", "DISCOVERING", "CONNECTING", "RECONNECTING"},
-    "AUTH_ERROR": {"AUTH_ERROR", "DISCOVERING", "CONNECTING"},
-    # ERROR is set by the loop's catch-all; the comment at that call site says
-    # the next successful iteration flips it straight back, so it reaches the
-    # running states directly rather than via CONNECTING.
-    "ERROR": {"ERROR", "DISCOVERING", "CONNECTING", "RECONNECTING",
-              "CONNECTED", "PROCESSING", "DEGRADED"},
-}
-for _from, _to in _TRANSITIONS.items():
-    _to |= _ALWAYS_REACHABLE
-
-#: Illegal transitions observed at runtime, keyed by (from, to). Read by the
-#: diagnostics endpoint and by tests. A count here is a bug report about this
-#: table or about the lifecycle, and it is deliberately a COUNT rather than an
-#: exception — see _set_grid_state.
-ILLEGAL_TRANSITIONS: dict[tuple[str, str], int] = {}
-
-
-def _set_grid_state(camera_id: str, state: str) -> None:
-    """Move a camera to `state`, recording the move if it is not a legal one.
-
-    An illegal transition is applied, not refused. Refusing would leave
-    CAMERA_STATS asserting something the camera is no longer doing, which is
-    the exact class of bug this lifecycle exists to remove — and raising here
-    would kill a live camera worker over a gap in the table above. So the
-    transition happens, the violation is counted where a test and the
-    diagnostics endpoint can both see it, and the log line names the pair so
-    it can be fixed. `test_camera_state_machine.py` asserts the counter is
-    empty after driving the real lifecycle, which is what turns this from a
-    log nobody reads into a failing build.
-    """
-    if state not in GRID_STATES:
-        raise ValueError(f"unknown grid_state: {state}")
-    stats = _stats(camera_id)
-    previous = stats.get("grid_state")
-    if previous is not None and state not in _TRANSITIONS.get(previous, set()):
-        ILLEGAL_TRANSITIONS[(previous, state)] = ILLEGAL_TRANSITIONS.get((previous, state), 0) + 1
-        logger.warning(
-            "camera %s: illegal state transition %s -> %s (applied anyway)",
-            camera_id, previous, state,
-        )
-    stats["grid_state"] = state
-
-
-#: Which DB `Camera.status` (the legacy 3-value online/offline/degraded
-#: column — see the comment on `grid_state` above) a grid_state write should
-#: also produce, wherever that write is one of the 8 sites in this file that
-#: sets `camera.status`. A grid_state absent here (CONNECTING, DISCOVERING,
-#: ERROR) means status is left untouched at that transition — matching, not
-#: changing, the historical behaviour at every one of those 8 sites (verified
-#: by reading each before this table existed; ERROR in particular is the
-#: generic per-iteration exception handler, a genuine hot path where forcing
-#: a DB write on every transient blip would be a real, unjustified cost).
-#:
-#: Used to derive `camera.status` from the SAME local variable a call site
-#: passes to `_set_grid_state`, so the two literals a prior version of this
-#: file wrote independently — "degraded" here, "DEGRADED" three lines away —
-#: cannot drift apart the way they could when each was its own string.
-_DB_STATUS_FOR_GRID_STATE: dict[str, str] = {
-    "CONNECTED": "online",
-    "PROCESSING": "online",
-    "DEGRADED": "degraded",
-    "RECONNECTING": "degraded",
-    "DISCONNECTED": "offline",
-    "AUTH_ERROR": "offline",
-}
-
-
-def _ema(prev: float | None, sample: float, alpha: float = 0.2) -> float:
-    return sample if prev is None else (alpha * sample + (1 - alpha) * prev)
-
-
-def _self_heal_camera_id(camera_code: str) -> str | None:
-    # CAMERA_STATS is keyed by camera.id (not camera_code) — cheap reverse
-    # lookup only used for the self-heal event's camera_id field, purely
-    # informational (never on any hot path: only called when a lock was
-    # actually hit, i.e. already the rare/slow path).
-    for cid, stats in CAMERA_STATS.items():
-        if stats.get("camera_code") == camera_code:
-            return cid
-    return None
-
-
-def _db_self_heal_on_result(camera_code: str, op_name: str):
-    """Builds the `on_result` hook passed to safe_commit/safe_flush —
-    records a Self-Heal event ONLY when a lock actually happened (the
-    overwhelming common case is a clean first-try write, which would be
-    pure noise to log every time). See self_heal/engine.py's module
-    docstring for why this observes rather than re-implements db_retry.py's
-    real retry logic.
-
-    Final-review audit finding: this used to be declared `async def` purely
-    to build and return a plain closure (it performs no `await` itself),
-    forcing an unnecessary coroutine creation + await on EVERY commit/flush
-    across every running camera — a real hot path this same PR's own
-    concurrency work targets. Now a plain sync function; the returned
-    closure itself is still `async def` (it genuinely awaits
-    self_heal.record_event) and is `await`ed normally by db_retry.py."""
-    async def _on_result(attempt: int, max_attempts: int, success: bool, was_lock: bool, duration_s: float):
-        if not was_lock:
-            return
-        await self_heal.record_event(
-            component="database", camera_id=_self_heal_camera_id(camera_code),
-            error_type="SQLITE_LOCK", severity="warning" if success else "critical",
-            message=f"{op_name} hit a locked database for camera {camera_code}",
-            recovery_action="ROLLBACK_RETRY", attempt=attempt, max_attempts=max_attempts,
-            status="RECOVERED" if success else "FAILED", duration_seconds=duration_s,
-        )
-    return _on_result
-
-
-async def _safe_commit(db: Session, camera_code: str, reapply=None) -> bool:
-    """Thin camera-labeled wrapper around db_retry.safe_commit — see that
-    module for the full rationale (retry-with-reapply on a transient SQLite
-    lock, verified empirically; no retry without `reapply`, to avoid a
-    retry-with-nothing-pending silently reporting success on a lost write)."""
-    return await safe_commit(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "commit"))
-
-
-async def _safe_flush(db: Session, camera_code: str, reapply=None) -> bool:
-    """Same as _safe_commit above, for db.flush() — see db_retry.safe_flush."""
-    return await safe_flush(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "flush"))
-
-
-async def _open_with_timeout(source: "CameraSource", camera_id: str | None = None) -> bool:
-    """`source.open()` blocks synchronously (a raw cv2.VideoCapture connect)
-    and is offloaded to a worker thread via asyncio.to_thread — but
-    CAP_PROP_OPEN_TIMEOUT_MSEC (source.py) is not reliably honored by every
-    OpenCV/FFmpeg build (confirmed on this build: an unreachable RTSP
-    endpoint hung ~30s despite a configured 5s). This enforces our own
-    timeout at the asyncio level so a dead source can't tie up a reconnect
-    attempt indefinitely — the abandoned thread still runs until cv2's own
-    internal timeout eventually fires, but the camera loop itself moves on
-    and can keep retrying with backoff instead of blocking on it."""
-    try:
-        ok = await asyncio.wait_for(asyncio.to_thread(source.open), timeout=settings.source_open_timeout_seconds)
-        if camera_id:
-            _set_grid_state(camera_id, "CONNECTED" if ok else "DISCONNECTED")
-        return ok
-    except asyncio.TimeoutError:
-        if camera_id:
-            _set_grid_state(camera_id, "DISCONNECTED")
-        return False
-    except Exception as exc:
-        # An adapter can now fail loudly by design (e.g. the ONVIF stub, or
-        # SentinelGridAdapter when credentials aren't configured — see
-        # pipeline/adapters.py) instead of silently returning False. That must
-        # still fail this camera safely (offline, logged) rather than crash the
-        # worker/task with an unguarded exception.
-        logger.exception("camera source failed to open")
-        if camera_id:
-            _set_grid_state(camera_id, "AUTH_ERROR" if "credentials not configured" in str(exc) else "ERROR")
-        return False
-
-
-async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db: Session, reason: str = "stream_read_failure") -> bool:
-    """Attempts to release+reopen a dropped source with exponential backoff.
-    Returns True once reopened, False after exhausting the retry budget
-    (caller marks the camera offline and stops the worker).
-
-    `reason` is honesty-only labeling for the Self-Heal event this records —
-    "initial_connect" (never opened this session) vs "stream_read_failure"
-    (was flowing, then N consecutive bad reads — which folds in whatever a
-    real dead RTSP/H264 stream looks like to cv2/FFmpeg: cv2 exposes no
-    structured decode-error signal, only read() returning False, so this is
-    never labeled as a fake "H264 decoder" diagnosis)."""
-    camera_id = str(camera.id)
-    camera_code = str(camera.camera_code)
-    error_type = "CAMERA_CONNECT_FAILURE" if reason == "initial_connect" else "STREAM_READ_FAILURE"
-    _set_grid_state(camera_id, "RECONNECTING")
-    reconnect_started = time.monotonic()
-    max_attempts = settings.reconnect_max_attempts
-    for attempt in range(1, max_attempts + 1):
-        # These are legacy Column()-style declarative model attributes
-        # (models.py) — Pylance sees them as Column[T], not T, so a plain
-        # T assignment shows as a false-positive type error; at runtime an
-        # ORM instance attribute is always the plain value, matching every
-        # other read/write of `camera.*` throughout this module.
-        # Target values captured into locals BEFORE assignment/commit —
-        # `reapply` below must reassign FROM these, never from re-reading
-        # `camera.*` after a rollback, since rollback expires a persistent
-        # object's mutated attributes back to their last-committed DB value
-        # (verified empirically; see db_retry.py's module docstring).
-        degraded_error_count = camera.error_count + 1  # type: ignore[operator]
-        # grid_state is RECONNECTING for the whole retry loop (set once at
-        # this function's entry); this derives the paired status from the
-        # SAME table that says what RECONNECTING means, rather than the two
-        # being two independently-written literals a future edit could let
-        # drift apart.
-        camera.status = _DB_STATUS_FOR_GRID_STATE["RECONNECTING"]  # type: ignore[assignment]
-        camera.error_count = degraded_error_count  # type: ignore[assignment]
-        _reconnecting_status = camera.status
-        await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
-            setattr(camera, "status", _reconnecting_status),
-            setattr(camera, "error_count", degraded_error_count),
-        ))
-        delay = min(settings.reconnect_backoff_max, settings.reconnect_backoff_base * (2 ** (attempt - 1)))
-        await asyncio.sleep(delay)
-        await asyncio.to_thread(source.release)
-        opened = await _open_with_timeout(source, str(camera.id))
-        if opened:
-            ok, _ = await asyncio.to_thread(source.read)
-            if ok:
-                online_fps = source.fps() or camera.fps or 15.0
-                online_resolution = source.resolution() or camera.resolution
-                # grid_state was left at RECONNECTING (set at this function's
-                # entry) up to this point. Both of this function's callers
-                # correct it shortly after receiving True back — one via the
-                # main loop's own next-iteration desired_state check, the
-                # other explicitly a few lines below its own call site — but
-                # that left a real window (a diagnostics read, or the Camera
-                # Grid UI, between "reopened" and "caller got around to
-                # saying so") for no reason: the moment this function itself
-                # knows the stream is back is the natural place to say so.
-                new_state = "CONNECTED"
-                camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
-                camera.fps = online_fps  # type: ignore[assignment]
-                camera.resolution = online_resolution  # type: ignore[assignment]
-                _reopened_status = camera.status
-                await _safe_commit(db, str(camera.camera_code), reapply=lambda: (
-                    setattr(camera, "status", _reopened_status),
-                    setattr(camera, "fps", online_fps),
-                    setattr(camera, "resolution", online_resolution),
-                ))
-                _set_grid_state(camera_id, new_state)
-                await self_heal.record_event(
-                    component="camera", camera_id=camera_id, error_type=error_type,
-                    severity="info", message=f"Camera {camera_code} stream reopened",
-                    recovery_action="RECONNECT", attempt=attempt, max_attempts=max_attempts,
-                    status="RECOVERED", duration_seconds=time.monotonic() - reconnect_started,
-                )
-                return True
-    await self_heal.record_event(
-        component="camera", camera_id=camera_id, error_type=error_type,
-        severity="critical", message=f"Camera {camera_code} stream unavailable after {max_attempts} reconnect attempts",
-        recovery_action="RECONNECT", attempt=max_attempts, max_attempts=max_attempts,
-        status="FAILED", duration_seconds=time.monotonic() - reconnect_started,
-    )
-    return False
-
-
-def _draw_boxes(frame: np.ndarray, detections: list[dict[str, Any]]) -> np.ndarray:
-    for d in detections:
-        x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
-        color = (0, 255, 0) if d["cls"] == "person" else (0, 165, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f'{d["cls"]} {d["confidence"]:.2f}'
-        cv2.putText(frame, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-    return frame
-
-
-def _save_snapshot(frame: np.ndarray, prefix: str) -> str:
-    fname = f"{prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}.jpg"
-    path = settings.evidence_dir / fname
-    cv2.imwrite(str(path), frame)
-    return str(path)
 
 
 VEHICLE_CLASSES = ("car", "truck", "bus", "motorbike")
@@ -390,23 +99,6 @@ _PLATE_REAPPLY_FIELDS = (
     "ocr_variant", "variants_agreeing", "corroborated", "plate_crop_path",
 )
 _TRACK_REAPPLY_FIELDS = ("last_seen", "detection_count", "vehicle_id", "plate_reads")
-
-
-def _snapshot_attrs(row: Any, fields: "tuple[str, ...]") -> "dict[str, Any] | None":
-    """Capture a row's current values for the fields a retry must restore."""
-    if row is None:
-        return None
-    return {name: getattr(row, name) for name in fields}
-
-
-def _restore_row(db: Session, row: Any, values: "dict[str, Any] | None") -> None:
-    """Re-attach a row and reassign the captured values. `db.add` is a no-op for
-    a row that is still attached, and re-attaches one a rollback detached."""
-    if row is None:
-        return
-    db.add(row)
-    for name, value in (values or {}).items():
-        setattr(row, name, value)
 
 
 def _rejection_reason(read) -> str:
