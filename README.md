@@ -24,20 +24,42 @@ without a real `POSTGRES_PASSWORD`/`JWT_SECRET` rather than defaulting a police
 datastore to a guessable credential. The backend runs `alembic upgrade head`
 before serving, so the schema is always at head.
 
-**Verification status, stated plainly: the images have NOT been built or run
-in this environment.** Docker Desktop's installer requires an elevation prompt
-that could not be completed here, so nothing below is a claim that
-`docker compose up --build` succeeds — only a real run proves that.
+**Verification status: `docker compose up --build` has now actually been run,
+on 2026-09-23, and it works.** Both images build, all three containers report
+`healthy`, the backend serves `/api/health` on port 8000, the dashboard serves
+on port 3000, `alembic upgrade head` ran against real PostgreSQL and produced
+all 17 expected tables, and the API is reachable end to end through it.
 
-What IS verified, by `backend/tests/test_deployment_contract.py` (16 tests in
-the normal suite), is the contract between these files and the application:
-every file the images COPY exists, every build context exists, the evidence
-and uploads volumes are mounted where `settings.evidence_dir`/`uploads_dir`
-actually write (a mismatch would silently discard captured evidence on the
-next rebuild), every environment key compose sets is one the settings object
-really reads, both healthchecks poll routes that exist, the schema is migrated
-before uvicorn starts, and the secrets have no guessable defaults. That is
-drift protection, not a build.
+That run also found and fixed a real defect: the backend image's
+`pip install` pulled the DEFAULT PyPI build of torch, which bundles the full
+CUDA runtime as separate wheels — one of them alone is 214MB — for an image
+that has no GPU runtime (`python:3.11-slim` base, no CUDA toolkit installed,
+no GPU requested anywhere in compose). On a real network that download
+occasionally timed out outright (`pip`'s `ReadTimeoutError` mid-download),
+which is how this was found rather than merely inferred. Fixed by pointing
+pip at PyTorch's CPU-only wheel index for the build — `torch-2.14.0+cpu` at
+196MB versus a multi-gigabyte CUDA install for a container that could never
+have used it. See the Dockerfile's own comment at that line for the reasoning
+in full.
+
+Login with the documented `admin`/`sentinel123` correctly FAILS against this
+compose deployment — that is `DEMO_MODE=false` (the compose default, meaning
+production mode) doing exactly what its own comment says: no seeded demo
+accounts, ever, on a real deployment. Zero rows in `users` after a fresh
+`docker compose up` is the correct starting state, not a bug; provisioning
+the first real administrator is a separate, deliberate step this README does
+not yet document — flagged here rather than worked around.
+
+`backend/tests/test_deployment_contract.py` (16 tests in the normal suite)
+covers the contract between these files and the application without needing
+a real build: every file the images COPY exists, every build context exists,
+the evidence and uploads volumes are mounted where
+`settings.evidence_dir`/`uploads_dir` actually write (a mismatch would
+silently discard captured evidence on the next rebuild), every environment
+key compose sets is one the settings object really reads, both healthchecks
+poll routes that exist, the schema is migrated before uvicorn starts, and the
+secrets have no guessable defaults. That drift protection is what keeps this
+claim from going stale between real runs — it is not a substitute for one.
 
 ### Local development (SQLite, no Docker)
 

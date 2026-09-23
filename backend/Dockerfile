@@ -25,7 +25,21 @@ WORKDIR /app
 # Dependencies first, as their own layer: application code changes far more
 # often than requirements.txt, and torch alone is a multi-minute install.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --extra-index-url points pip at PyTorch's own CPU-only wheel index for any
+# package it hosts there (torch, and torchvision if ever added); everything
+# else in requirements.txt still resolves from PyPI as normal.
+#
+# Without this, `pip install ultralytics` pulls the default PyPI torch build,
+# which bundles the full CUDA runtime as separate nvidia_* wheels — one of
+# them (nvidia_cufft) alone is 214MB. This image has no GPU runtime: the base
+# is plain python:3.11-slim, no CUDA toolkit is installed above, and nothing
+# in docker-compose.yml requests a GPU device. Those wheels can never be used
+# here, on ANY host this image runs on, so downloading them is pure waste —
+# and on a real build it is not merely wasteful, it is where the build broke:
+# `pip._vendor.urllib3.exceptions.ReadTimeoutError` mid-download of that exact
+# file. The CPU-only build is the correct artifact for this Dockerfile, not a
+# workaround for one slow connection.
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 COPY . .
 
