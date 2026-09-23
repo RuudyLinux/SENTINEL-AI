@@ -8,7 +8,7 @@ from sqlalchemy import extract
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..db import get_db
+from ..db import LIKE_ESCAPE, get_db, like_pattern
 from ..security import get_current_user
 from ..pipeline.anpr import normalize_plate
 
@@ -90,13 +90,15 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     # 6pm"); that must not become "%%", which matches every row — it means
     # "no text constraint", and the hour filters below carry the query.
     text = filters.get("text") or ""
-    like = f"%{text}%" if text else None
+    like = like_pattern(text) if text else None
 
     if like:
         results["cameras"] = [
             {"id": c.id, "camera_code": c.camera_code, "name": c.name}
             for c in db.query(models.Camera).filter(
-                (models.Camera.camera_code.ilike(like)) | (models.Camera.name.ilike(like)) | (models.Camera.location.ilike(like))
+                (models.Camera.camera_code.ilike(like, escape=LIKE_ESCAPE))
+                | (models.Camera.name.ilike(like, escape=LIKE_ESCAPE))
+                | (models.Camera.location.ilike(like, escape=LIKE_ESCAPE))
             ).limit(20)
         ]
     # With no text there is nothing to match a camera on: a camera has no
@@ -139,9 +141,11 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
         if plate_filter or like or vehicle_hours:
             vehicles_q = db.query(models.Vehicle)
             if plate_filter:
-                vehicles_q = vehicles_q.filter(models.Vehicle.plate_text.ilike(f"%{plate_filter}%"))
+                vehicles_q = vehicles_q.filter(
+                    models.Vehicle.plate_text.ilike(like_pattern(plate_filter), escape=LIKE_ESCAPE)
+                )
             elif like:
-                vehicles_q = vehicles_q.filter(models.Vehicle.plate_text.ilike(like))
+                vehicles_q = vehicles_q.filter(models.Vehicle.plate_text.ilike(like, escape=LIKE_ESCAPE))
             for condition in vehicle_hours:
                 vehicles_q = vehicles_q.filter(condition)
             results["vehicles"] = [
@@ -153,7 +157,7 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     if like or incident_hours:
         incidents_q = db.query(models.Incident)
         if like:
-            incidents_q = incidents_q.filter(models.Incident.title.ilike(like))
+            incidents_q = incidents_q.filter(models.Incident.title.ilike(like, escape=LIKE_ESCAPE))
         for condition in incident_hours:
             incidents_q = incidents_q.filter(condition)
         results["incidents"] = [

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime
 
@@ -12,11 +12,25 @@ router = APIRouter(prefix="/api/incidents", tags=["incidents"])
 
 
 @router.get("", response_model=list[schemas.IncidentOut])
-def list_incidents(status: str | None = None, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def list_incidents(
+    status: str | None = None,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Most recent incidents, newest first, narrowed by status.
+
+    This ended in a bare `.all()`. One incident is opened per CRITICAL alert,
+    so the table grows with operational activity and "return every row" is a
+    query whose cost rises forever — on one of the screens an operator opens
+    most. Every other transactional list endpoint here is already bounded
+    (alerts 200, detections 100/500, audit 500); these were the deviation, not
+    the new rule. `ge=1` because SQLite reads `LIMIT -1` as no limit at all.
+    """
     q = db.query(models.Incident)
     if status:
         q = q.filter(models.Incident.status == status)
-    return q.order_by(models.Incident.created_at.desc()).all()
+    return q.order_by(models.Incident.created_at.desc()).limit(limit).all()
 
 
 def _require_exists(db: Session, model, value: "str | None", label: str) -> None:

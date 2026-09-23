@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -32,11 +32,23 @@ def _safe_evidence_path(raw_path: str) -> Path:
 
 
 @router.get("", response_model=list[schemas.EvidenceOut])
-def list_evidence(incident_id: str | None = None, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def list_evidence(
+    incident_id: str | None = None,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Most recent evidence, newest first, optionally scoped to one incident.
+
+    Bounded for the same reason as `GET /api/incidents`: one row is written
+    per captured snapshot or clip, so an unbounded `.all()` is a query that
+    gets slower for as long as the system keeps running. `ge=1` because SQLite
+    reads `LIMIT -1` as no limit at all.
+    """
     q = db.query(models.Evidence)
     if incident_id:
         q = q.filter(models.Evidence.incident_id == incident_id)
-    return q.order_by(models.Evidence.created_at.desc()).all()
+    return q.order_by(models.Evidence.created_at.desc()).limit(limit).all()
 
 
 @router.get("/{evidence_id}", response_model=schemas.EvidenceOut)

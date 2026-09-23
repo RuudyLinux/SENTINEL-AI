@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..db import get_db
+from ..db import LIKE_ESCAPE, get_db, like_pattern
 from ..security import get_current_user
 from ..self_heal import engine as self_heal
 from ..ws import manager
@@ -142,7 +142,11 @@ def self_heal_events(
     status: str | None = None,
     severity: str | None = None,
     q: str | None = None,
-    limit: int = Query(default=100, le=500),
+    # `ge=1` is not decoration: SQLite reads `LIMIT -1` as NO LIMIT, so an
+    # upper bound alone let `?limit=-1` return the whole self-heal event table
+    # to any authenticated user. Same reasoning, and the same fix, as
+    # detections and review/queue already carry (tests/test_list_limits.py).
+    limit: int = Query(default=100, ge=1, le=500),
     offset: int = 0,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
@@ -159,8 +163,7 @@ def self_heal_events(
     if severity:
         query = query.filter(models.SelfHealEvent.severity == severity)
     if q:
-        like = f"%{q}%"
-        query = query.filter(models.SelfHealEvent.message.ilike(like))
+        query = query.filter(models.SelfHealEvent.message.ilike(like_pattern(q), escape=LIKE_ESCAPE))
     total = query.count()
     rows = query.order_by(models.SelfHealEvent.timestamp.desc()).offset(offset).limit(limit).all()
     camera_codes = _camera_code_map(db, {r.camera_id for r in rows if r.camera_id})

@@ -41,12 +41,32 @@ PLATE_OCR_ACCEPTED = Counter(
     "OCR reads that passed the ANPR quality gate (plausible format AND sufficient confidence).",
     ["camera_code"], registry=REGISTRY,
 )
+PLATE_OCR_REJECTED = Counter(
+    "sentinel_plate_ocr_rejected_total",
+    "OCR reads that FAILED the ANPR quality gate, by reason: implausible format "
+    "(including an unknown state code), below the confidence floor, too few "
+    "preprocessing variants agreeing, or nothing read at all. The counterpart to "
+    "ocr_accepted — together they say what the gate is actually doing.",
+    ["camera_code", "reason"], registry=REGISTRY,
+)
+PLATE_DETECT_ATTEMPTS = Counter(
+    "sentinel_plate_detect_attempts_total",
+    "Vehicle crops submitted to plate detection.",
+    ["camera_code"], registry=REGISTRY,
+)
 PLATE_LOCALIZED = Counter(
     "sentinel_plate_localized_total",
     "Vehicle crops in which an actual plate region was found. The gap against "
-    "ocr_attempts is the fallback-to-whole-crop rate — the honest measure of "
+    "detect_attempts is the fallback-to-whole-crop rate — the honest measure of "
     "how often localization is carrying the read.",
-    ["camera_code"], registry=REGISTRY,
+    ["camera_code", "source"], registry=REGISTRY,
+)
+PLATE_CONSENSUS_REACHED = Counter(
+    "sentinel_plate_consensus_total",
+    "Tracked vehicles whose plate reached temporal consensus (enough agreeing "
+    "observations to be persisted as a trusted sighting) versus those persisted "
+    "as uncorroborated observations awaiting review.",
+    ["camera_code", "outcome"], registry=REGISTRY,
 )
 VEHICLE_SIGHTINGS = Counter(
     "sentinel_vehicle_sightings_total", "Vehicle sighting rows created or updated.",
@@ -80,6 +100,42 @@ INFERENCE_SECONDS = Histogram(
 OCR_SECONDS = Histogram(
     "sentinel_ocr_seconds", "Plate OCR wall time per pass.", ["camera_code"], registry=REGISTRY,
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+PLATE_DETECT_SECONDS = Histogram(
+    "sentinel_plate_detect_seconds",
+    "Plate LOCALIZATION wall time per vehicle crop, separate from OCR so the two "
+    "costs can be attributed independently.",
+    ["camera_code"], registry=REGISTRY,
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+
+# --- ANPR quality signals ---
+# Deliberately SEPARATE series. OCR confidence, plate-detection confidence and
+# cross-variant agreement measure different things, and a single blended "ANPR
+# score" would hide exactly the case this pipeline is built to catch: a
+# high-confidence read that nothing corroborates. None of these is an accuracy
+# measurement — accuracy requires ground truth, which only tools/anpr_bench.py
+# has.
+OCR_CONFIDENCE = Histogram(
+    "sentinel_ocr_confidence",
+    "OCR confidence of gate-passing reads, as reported by the engine. NOT accuracy.",
+    ["camera_code"], registry=REGISTRY,
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+PLATE_DETECT_CONFIDENCE = Histogram(
+    "sentinel_plate_detect_confidence",
+    "Confidence of accepted plate-region detections. Labelled by source because a "
+    "trained model's probability and the classical localizer's geometric "
+    "plausibility score are different quantities and must never be pooled.",
+    ["camera_code", "source"], registry=REGISTRY,
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+)
+PLATE_VARIANTS_AGREEING = Histogram(
+    "sentinel_plate_variants_agreeing",
+    "How many preprocessing variants produced the selected read. Always 1 when "
+    "multi-variant preprocessing is disabled (the default).",
+    ["camera_code"], registry=REGISTRY,
+    buckets=(1, 2, 3, 4, 5, 6, 7),
 )
 DB_WRITE_SECONDS = Histogram(
     "sentinel_db_write_seconds", "Database commit/flush wall time, including retries.",

@@ -38,7 +38,37 @@ def create_watchlist_entry(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator", "Supervisor", "Investigator")),
 ):
+    """Add one entity to the watchlist.
+
+    Refuses a second IN-FORCE entry for the same (entity_type, identifier).
+    Found by clicking SAVE three times against the running system: three
+    identical in-force entries for one plate. The extra rows are not the real
+    failure — what they do to Deactivate is. `plate_entry_in_force` takes
+    `.first()`, so removing one of three identical entries leaves the plate
+    exactly as watchlisted as before: the operator performs the documented
+    removal, watches the vehicle stay flagged, and has nothing on screen that
+    explains why. This codebase already fixed the mirror image of that once
+    (a stale `watchlist_flag` surviving deactivation).
+
+    409 naming the existing entry rather than silently de-duplicating: the
+    operator may have meant to change the priority or reason, and quietly
+    discarding that input would hide it from them. A deactivated or expired
+    entry does not block a new one — re-adding a plate that was removed, or
+    whose watch period lapsed, is ordinary work.
+    """
     identifier = normalize_plate(payload.identifier) if payload.entity_type == "plate" else payload.identifier
+    existing = watchlist.entries_in_force(db).filter(
+        models.WatchlistEntry.entity_type == payload.entity_type,
+        models.WatchlistEntry.identifier == identifier,
+    ).first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{identifier} is already on the {payload.entity_type} watchlist "
+                f"(priority {existing.priority}). Deactivate the existing entry before adding it again."
+            ),
+        )
     entry = models.WatchlistEntry(
         entity_type=payload.entity_type, identifier=identifier, reason=payload.reason,
         priority=payload.priority, valid_until=payload.valid_until, added_by=user.id,

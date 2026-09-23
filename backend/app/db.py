@@ -150,6 +150,36 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
+# --- LIKE/ILIKE search patterns -------------------------------------------
+#
+# LIKE treats `%` and `_` as wildcards, so free text pasted straight into a
+# pattern is read by the database as SYNTAX rather than as the characters the
+# operator typed. Measured against the running system: `GET /api/search?q=%`
+# returned every camera in the database — 30 rows matching nothing the
+# operator asked for — and `GJ_5` matched `GJ05`.
+#
+# For an investigative platform a search that silently widens itself is worse
+# than one that finds nothing, because the extra rows look like findings. Four
+# endpoints built patterns this way (global search, audit actor/action, the
+# self-heal message search), so the helper lives here, with the rest of the
+# query plumbing, instead of being copied into each router.
+#
+# The escape character is declared to the database via `escape=LIKE_ESCAPE` at
+# each call site; SQLite and PostgreSQL both honour that, so both backends
+# agree — the same reason `ensure_columns` and the PRAGMA handling above exist.
+LIKE_ESCAPE = "\\"
+
+
+def like_pattern(text: str) -> str:
+    """A contains-match pattern in which `text` is matched LITERALLY."""
+    escaped = (
+        text.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+    return f"%{escaped}%"
+
+
 def get_db():
     db = SessionLocal()
     try:

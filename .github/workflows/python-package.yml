@@ -159,3 +159,39 @@ jobs:
         run: |
           alembic upgrade head
           alembic check
+
+  training-tooling:
+    # Dataset tooling (M1): schema, vehicle-disjoint splitting, QC, evaluation
+    # metrics. A separate job from the backend because it shares nothing with
+    # it — stdlib only, no torch, no OpenCV, no ffmpeg — so it runs in seconds
+    # and a failure here is unambiguous.
+    #
+    # The job exists primarily for ONE assertion: the cross-split leakage gate.
+    # A dataset where a single vehicle identity appears in both train and test
+    # must FAIL the build. Frames of one vehicle are near-duplicates, so a leaked
+    # identity means the model is scored on its own training data — which is
+    # undetectable from the accuracy number itself, because it simply looks like
+    # a very good model. See training/tests/test_split_and_leakage.py
+    # (TestCiLeakageGate) and docs/ANPR_M1_DATA_TOOLING.md.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      # `python -m pytest`, not bare `pytest`, for the same sys.path reason the
+      # backend job documents above.
+      - name: Test (dataset tooling)
+        run: python -m pytest tests -q
+      # Same inter-test coupling gate the backend job runs, for the same
+      # reason: these tests assert on split assignment, which must not depend
+      # on collection order any more than it depends on record order.
+      - name: Test (randomized order)
+        run: python -m pytest tests -q --random-order

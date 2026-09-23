@@ -21,6 +21,37 @@ from ..self_heal import engine as self_heal
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
 
+# Every table holding a foreign key to `cameras.id` must appear in exactly one
+# of these two sets, and `test_end_to_end_hardening.py` fails the build if one
+# appears in neither — a structural guard, because "a table was missed from a
+# delete list" has now happened three times in this codebase (BUG-C below,
+# BUG-D in seed.reset_demo_data, and SelfHealEvent, which was missed here and
+# turned an ordinary camera delete into a raw 500).
+#
+# BLOCKERS are operational history: deleting the camera would detach records
+# that outlive it and are evidence of what happened. Refused with a 409 that
+# names them.
+CAMERA_BLOCKER_MODELS = {
+    "detections": models.Detection,
+    "alerts": models.Alert,
+    "incidents": models.Incident,
+    "evidence": models.Evidence,
+    "plates": models.Plate,
+    "tracks": models.Track,
+    # `zones` is a blocker too, but only its ACTIVE rows — counted separately
+    # in delete_camera, and listed in CAMERA_CASCADE_MODELS for the retired
+    # rows. It is the one table that appears in both, deliberately.
+}
+
+# CASCADE rows describe the camera rather than outliving it: configuration the
+# operator already retired, and per-camera recovery telemetry. Both are
+# meaningless once the camera is gone, and leaving either behind is the
+# dangling foreign key the blocker list exists to prevent. Neither is evidence:
+# the audit log, which is the compliance record, is separate, hash-chained, and
+# never references a camera row.
+CAMERA_CASCADE_MODELS = (models.Zone, models.SelfHealEvent)
+
+
 @router.get("", response_model=list[schemas.CameraOut])
 def list_cameras(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     cameras = db.query(models.Camera).order_by(models.Camera.created_at.desc()).all()
@@ -519,22 +550,44 @@ def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.Us
       The guard below closes that gap from the application side, giving BOTH
       backends the same, explainable 409 instead of one silently corrupting
       and the other 500-ing.
+
+    Follow-up found by walking the UI (2026-09-21): the zone count below
+    included zones the operator had ALREADY deleted. `DELETE /api/zones/{id}`
+    is a soft delete (active=False) and `GET /api/zones` hides those rows, so
+    an operator saw a camera with zero zones, tried to delete it, and was told
+    it still held "1 zones" — a zone no screen in the product can show them,
+    let alone remove. The error named something they could not act on, which
+    made the camera undeletable through the UI entirely.
+
+    A zone is CONFIGURATION, not chain-of-custody evidence, and retiring one
+    is already audited, so a retired zone is deleted along with its camera
+    while an ACTIVE zone still blocks. That keeps the guard's promise — the
+    message always names something visible and actionable — without weakening
+    what it was built to protect: detections, alerts, incidents, evidence,
+    plates and tracks are untouched and still refuse.
     """
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
 
+    # Resolved before the blocker count so the count reflects only zones the
+    # operator can actually see on the zones/map screens.
+    retired_zones = db.query(models.Zone).filter(
+        models.Zone.camera_id == camera_id, models.Zone.active == False,  # noqa: E712
+    ).all()
+    retired_zone_ids = [z.id for z in retired_zones]
+
     # Counted rather than just existence-checked: the message has to tell the
     # operator what is actually in the way, not merely that something is.
+    # Active zones are counted separately from the rest because only the ACTIVE
+    # ones block (see the docstring); everything else blocks on any row at all.
     blockers = {
-        "detections": db.query(models.Detection).filter(models.Detection.camera_id == camera_id).count(),
-        "alerts": db.query(models.Alert).filter(models.Alert.camera_id == camera_id).count(),
-        "incidents": db.query(models.Incident).filter(models.Incident.camera_id == camera_id).count(),
-        "evidence": db.query(models.Evidence).filter(models.Evidence.camera_id == camera_id).count(),
-        "plates": db.query(models.Plate).filter(models.Plate.camera_id == camera_id).count(),
-        "zones": db.query(models.Zone).filter(models.Zone.camera_id == camera_id).count(),
-        "tracks": db.query(models.Track).filter(models.Track.camera_id == camera_id).count(),
+        label: db.query(model).filter(model.camera_id == camera_id).count()
+        for label, model in CAMERA_BLOCKER_MODELS.items()
     }
+    blockers["zones"] = db.query(models.Zone).filter(
+        models.Zone.camera_id == camera_id, models.Zone.active == True,  # noqa: E712
+    ).count()
     held = {name: count for name, count in blockers.items() if count}
     if held:
         log_action(db, user, "delete_camera", resource=camera_id, result="FAILURE")
@@ -550,7 +603,33 @@ def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.Us
         )
 
     stop_worker(camera_id)
+    if retired_zone_ids:
+        # An AlertRule holds a foreign key to the zone, so removing the zone row
+        # out from under one would raise a ForeignKeyViolation instead of
+        # answering the request. A rule pointing at a retired zone is already
+        # inert — rules_engine only evaluates zones with active=True — so it is
+        # retired with the zone it can no longer evaluate rather than left as a
+        # dangling reference.
+        db.query(models.AlertRule).filter(models.AlertRule.zone_id.in_(retired_zone_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(models.Zone).filter(models.Zone.id.in_(retired_zone_ids)).delete(synchronize_session=False)
+    cascaded = {}
+    for model in CAMERA_CASCADE_MODELS:
+        if model is models.Zone:
+            continue  # handled above, together with the rules that point at it
+        removed = db.query(model).filter(model.camera_id == camera_id).delete(synchronize_session=False)
+        if removed:
+            cascaded[model.__tablename__] = removed
     db.delete(camera)
     db.commit()
-    log_action(db, user, "delete_camera", resource=camera_id)
+    # Named in the audit trail, not silent: rows removed as part of this
+    # deletion are recorded, because "the camera was deleted" alone would not
+    # say that its retired zones and recovery log went with it.
+    trailer = ""
+    if retired_zone_ids:
+        trailer += f" (+{len(retired_zone_ids)} retired zones)"
+    if cascaded:
+        trailer += " (+" + ", ".join(f"{n} {t}" for t, n in sorted(cascaded.items())) + ")"
+    log_action(db, user, "delete_camera", resource=f"{camera_id}{trailer}")
     return {"ok": True}

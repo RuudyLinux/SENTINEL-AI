@@ -28,6 +28,43 @@ logger = logging.getLogger("sentinel.audit")
 GENESIS_HASH = "0" * 64
 _MAX_CHAIN_RETRIES = 5
 
+# Upper bound on the `resource` a single audit row may store.
+#
+# Real, reachable case: `POST /api/auth/login` audits a failed attempt with the
+# SUBMITTED username as the resource, so this column takes attacker-controlled
+# text with no account and no credential behind it. Measured against the
+# running system before this bound existed — a 5,000-character username stored
+# a 5,000-character row, and the audit page (every cell `whitespace-nowrap`)
+# rendered a table 36,215px wide, making the compliance screen unusable. The
+# login rate limiter bounds how MANY attempts are made; nothing bounded how
+# LARGE each one's audit row was.
+#
+# Applied here rather than at the login call site because this function is the
+# single funnel every audit write passes through, so the bound covers callers
+# that do not exist yet — and the login path is only the one that happens to be
+# reachable without credentials, not the only one taking free text.
+#
+# 512 is far above every identifier the system actually records (a uid is ~14
+# characters, the longest real resource is a comma-joined camera list from
+# demo_reset) and far below anything that can distort a table or a datastore.
+MAX_AUDIT_RESOURCE_CHARS = 512
+_TRUNCATION_MARKER = "...[truncated]"
+
+
+def _bounded_resource(resource: str) -> str:
+    """Bound `resource`, and SAY SO when it was shortened.
+
+    A silent cut would make the audit trail quietly disagree with what was
+    actually submitted, which is worse than a shortened value: a reader of the
+    log could not tell a 512-character resource from a 5,000-character one.
+    The marker is inside the bound, so the stored string never exceeds it.
+    """
+    if resource is None:
+        return ""
+    if len(resource) <= MAX_AUDIT_RESOURCE_CHARS:
+        return resource
+    return resource[: MAX_AUDIT_RESOURCE_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
 
 def _canonical_fields(entry: models.AuditLog) -> str:
     """Deterministic string of everything the hash must cover. Field ORDER is
@@ -55,6 +92,10 @@ def log_action(db: Session, user: "models.User | None", action: str, resource: s
     LINK must never block the real operation it is describing.
     """
     from datetime import datetime
+
+    # Bounded before the entry is built, so the value that is hashed is the
+    # value that is stored — the chain covers exactly what the row contains.
+    resource = _bounded_resource(resource)
 
     for attempt in range(_MAX_CHAIN_RETRIES):
         tail = db.query(models.AuditLog).order_by(models.AuditLog.chain_seq.desc()).first()
