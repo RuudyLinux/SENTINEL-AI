@@ -10,6 +10,7 @@ from ..db import get_db
 from ..security import get_current_user, require_roles
 from ..config import settings
 from ..audit import log_action
+from ..pipeline import worker
 from ..pipeline.worker import start_worker, stop_worker, RUNNING, CAMERA_STATS
 from ..pipeline.source import CameraSource
 from ..pipeline.egress_policy import blocked_reason
@@ -461,6 +462,15 @@ def system_diagnostics(user: models.User = Depends(require_roles("Administrator"
         "torch_num_threads": torch.get_num_threads(),
         "cv2_num_threads": _cv2.getNumThreads(),
         "cameras_running": sum(1 for t in RUNNING.values() if not t.done()),
+        # A transition the camera lifecycle table (worker.py) did not expect —
+        # an illegal move is still applied (refusing would leave the runtime
+        # state asserting something the camera is no longer doing), so this
+        # counter is how a gap in that table becomes visible instead of a log
+        # line nobody reads. Nonzero here is a real bug report; it should
+        # always read empty.
+        "illegal_state_transitions": {
+            f"{frm}->{to}": count for (frm, to), count in worker.ILLEGAL_TRANSITIONS.items()
+        },
     }
 
 

@@ -94,6 +94,26 @@ class TestCameraDiagnostics:
         swallowed by `/{camera_id}/diagnostics`."""
         assert client.get("/api/cameras/diagnostics/system", headers=auth).status_code == 200
 
+    def test_illegal_state_transitions_are_reported_when_clean(self, client, auth):
+        """The camera lifecycle table (worker._TRANSITIONS) is meant to stay
+        empty; this is the surface that would show it if it did not."""
+        from app.pipeline import worker
+        worker.ILLEGAL_TRANSITIONS.clear()
+        body = client.get("/api/cameras/diagnostics/system", headers=auth).json()
+        assert body["illegal_state_transitions"] == {}
+
+    def test_an_illegal_state_transition_shows_up_here(self, client, auth):
+        from app.pipeline import worker
+        worker.CAMERA_STATS.clear()
+        worker.ILLEGAL_TRANSITIONS.clear()
+        worker._set_grid_state("probe-cam", "CONNECTING")
+        worker._set_grid_state("probe-cam", "DISCONNECTED")
+        worker._set_grid_state("probe-cam", "PROCESSING")  # illegal: DISCONNECTED -> PROCESSING
+        body = client.get("/api/cameras/diagnostics/system", headers=auth).json()
+        assert body["illegal_state_transitions"] == {"DISCONNECTED->PROCESSING": 1}
+        worker.CAMERA_STATS.clear()
+        worker.ILLEGAL_TRANSITIONS.clear()
+
 
 class TestCameraLifecycle:
     @pytest.mark.parametrize("action", ["start", "stop", "restart"])
