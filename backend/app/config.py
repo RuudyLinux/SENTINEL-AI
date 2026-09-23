@@ -338,6 +338,31 @@ class Settings(BaseSettings):
     # queued probe still holds a request and still ends up waiting 20s).
     camera_test_connection_max_concurrent: int = 3
 
+    # Size of the asyncio default thread executor, which is the pool EVERY
+    # blocking call in this process shares: each camera worker's
+    # `to_thread(source.read)`, every inference offload, every DB commit via
+    # db_retry, evidence hashing and the connection probes above.
+    #
+    # Left unset, Python sizes it `min(32, cpu_count + 4)` -- 20 threads on a
+    # 16-core machine -- and that ceiling is independent of how many cameras
+    # are registered. Measured on this machine with all 34 cameras connected:
+    # the number reporting `online` oscillated (12, then 4) with NO error
+    # recorded on any of them, because a camera's read was not failing, it was
+    # waiting for a thread that the other 33 workers were holding. A camera
+    # that cannot get a thread looks exactly like a camera whose stream died.
+    #
+    # 0 means "size it for the workload": one thread per registered camera
+    # plus headroom for the API, DB and inference, bounded so a large catalog
+    # cannot spawn an unreasonable number. Threads blocked on a socket read
+    # cost memory, not CPU, so the ceiling that matters is the machine's, not
+    # a fixed 32. Set a positive number to pin it exactly.
+    worker_thread_pool_size: int = 0
+    # Headroom added to the camera count when sizing automatically: API
+    # requests, DB commits and inference offloads must still get a thread
+    # while every camera is reading.
+    worker_thread_pool_headroom: int = 24
+    # Absolute ceiling for the automatic calculation.
+    worker_thread_pool_max: int = 160
 
     # Optional egress policy for operator-supplied camera sources (workstream
     # C3, see pipeline/egress_policy.py). When True, a source whose host

@@ -1,11 +1,17 @@
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("sentinel.main")
+
+#: Installed at startup, shut down at exit. Held here rather than on `app`
+#: because `asyncio.to_thread` reaches the loop's default executor, not the
+#: application object.
+_executor: "ThreadPoolExecutor | None" = None
 
 from .db import Base, engine, SessionLocal, ensure_columns, ensure_indexes
 from . import models, background
@@ -51,6 +57,38 @@ for r in (auth, cameras, streams, detections, vehicles, persons, search,
           alerts, watchlists, zones, rules, incidents, evidence, users, audit,
           analytics, system, self_heal, camera_control, metrics, review, governance):
     app.include_router(r.router)
+
+
+def _size_thread_pool(camera_count: int) -> int:
+    """How many threads the shared executor needs for this many cameras.
+
+    Every camera worker parks one thread on a blocking `source.read()` for as
+    long as the stream takes to deliver a frame, and that is the same pool
+    that serves DB commits, inference offloads and connection probes. Python's
+    default (`min(32, cpu_count + 4)`) does not know how many cameras exist,
+    so past that number of cameras the workers simply queue against each
+    other -- which presents as cameras flickering between `online` and
+    `degraded` with no error, since a read waiting for a thread is
+    indistinguishable from a read waiting for a camera.
+    """
+    if settings.worker_thread_pool_size > 0:
+        return settings.worker_thread_pool_size
+    return max(32, min(settings.worker_thread_pool_max, camera_count + settings.worker_thread_pool_headroom))
+
+
+async def _install_thread_pool() -> None:
+    global _executor
+    db = SessionLocal()
+    try:
+        camera_count = db.query(models.Camera).count()
+    finally:
+        db.close()
+    size = _size_thread_pool(camera_count)
+    _executor = ThreadPoolExecutor(max_workers=size, thread_name_prefix="sentinel-worker")
+    asyncio.get_running_loop().set_default_executor(_executor)
+    logger.info(
+        "shared thread pool: %d workers for %d registered camera(s)", size, camera_count,
+    )
 
 
 async def _on_startup():
@@ -185,6 +223,11 @@ async def _on_startup():
     finally:
         db.close()
 
+    # Size the shared thread pool BEFORE any camera worker is started: every
+    # one of them parks a thread on a blocking read, and the default pool does
+    # not scale with the number of cameras. See _size_thread_pool.
+    await _install_thread_pool()
+
     # Real Sentinel Camera Grid 24/7 auto-connect: discover the real catalogue
     # (register-only, safe if the grid is unreachable/unconfigured — logged,
     # never fatal to startup) and start the connection supervisor, which
@@ -247,6 +290,14 @@ async def _on_shutdown():
     # sent, so it is stopped (and given a final flush) here rather than being
     # abandoned when the loop is torn down.
     await manager.shutdown()
+    # Last, because everything above may still hand work to it. Threads parked
+    # on a blocking socket read do not notice a shutdown request, so this does
+    # not wait for them -- the loop is going away regardless, and the camera
+    # workers' own `finally: source.release()` has already run above.
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=False, cancel_futures=True)
+        _executor = None
 
 
 @app.get("/api/health")
