@@ -135,13 +135,22 @@ class ConnectionManager:
     def _ensure_flush_task(self) -> None:
         if self._flush_task is not None and not self._flush_task.done():
             return
+        # Ask about the loop BEFORE building the coroutine. Written the other
+        # way round -- create_task(self._flush_loop()) inside a try -- Python
+        # evaluates the call first, so with no running loop a coroutine object
+        # was already constructed and then dropped by the RuntimeError. That
+        # is an "coroutine '_flush_loop' was never awaited" RuntimeWarning on
+        # every synchronous publish, and a small object leak behind it. The
+        # coroutine is now only created when there is a loop to run it.
         try:
-            self._flush_task = asyncio.create_task(self._flush_loop())
+            asyncio.get_running_loop()
         except RuntimeError:
             # No running event loop (e.g. a synchronous unit test calling into
             # a producer). Buffered events will flush on the next publish that
             # does have a loop; nothing is lost and nothing raises.
             self._flush_task = None
+            return
+        self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _flush_loop(self) -> None:
         """Drain the batch buffers on a fixed interval.

@@ -14,7 +14,9 @@ as a background task so the camera's own read/inference loop is never
 blocked waiting for the post-event window to elapse.
 """
 import asyncio
+import logging
 import subprocess
+import tempfile
 import time
 from collections import deque
 from datetime import datetime
@@ -29,6 +31,8 @@ from ..config import settings
 from ..evidence_hash import sha256_file
 from ..db import SessionLocal
 from ..audit import log_action
+
+logger = logging.getLogger(__name__)
 
 _RING: dict[str, deque[tuple[float, bytes]]] = {}
 _SUBSCRIBERS: dict[str, list[asyncio.Queue]] = {}
@@ -90,19 +94,56 @@ def _encode_clip(frames: list[bytes], path: str) -> bool:
         "-movflags", "+faststart",
         str(path),
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        for frame in decoded:
-            if frame.shape[:2] != (h, w):
-                frame = cv2.resize(frame, (w, h))
-            proc.stdin.write(frame.tobytes())
-        proc.stdin.close()
-        proc.wait(timeout=60)
-    except Exception:
-        proc.kill()
-        proc.wait(timeout=10)
+    # stderr goes to a temporary FILE, not a pipe, and this is the whole
+    # point rather than a style choice. A pipe has a fixed OS buffer: with
+    # stderr=PIPE and nobody reading it, an ffmpeg chatty enough to fill that
+    # buffer blocks writing to stderr while this thread is blocked writing
+    # frames to stdin, and neither side can move. No timeout rescues that --
+    # `wait(timeout=...)` is only reached once the frame loop has finished,
+    # and the frame loop is exactly where the deadlock happens. Draining
+    # stderr after the loop (communicate) has the same hole. The old code
+    # never hit it only because `-loglevel error` keeps ffmpeg quiet, which
+    # is a property of the argument list, not of this function. A file has no
+    # such limit, and it is read once the process has exited.
+    #
+    # `with proc` on top closes stdin whichever way the block exits; leaving
+    # it open was the ResourceWarning ("unclosed file") the test suite showed.
+    err = b""
+    with tempfile.TemporaryFile() as errfile:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errfile)
+        try:
+            with proc:
+                for frame in decoded:
+                    if frame.shape[:2] != (h, w):
+                        frame = cv2.resize(frame, (w, h))
+                    proc.stdin.write(frame.tobytes())
+                proc.stdin.close()
+                proc.wait(timeout=60)
+        except Exception as exc:
+            proc.kill()
+            proc.wait(timeout=10)
+            # Most often a BrokenPipeError: ffmpeg rejected its arguments and
+            # exited while this side was still feeding it frames. That used to
+            # return a bare False, identical to "no frame decoded", so a
+            # misconfigured encoder looked exactly like an empty ring buffer.
+            errfile.seek(0)
+            detail = errfile.read().decode("utf-8", "replace").strip()[-500:]
+            logger.warning("clip encode failed (%s): %s", type(exc).__name__, detail or exc)
+            return False
+        errfile.seek(0)
+        err = errfile.read()
+
+    if proc.returncode != 0:
+        # Non-fatal by contract (the caller treats False as "no clip"), but
+        # the reason is worth having: a silent False here used to be
+        # indistinguishable from "no frame decoded".
+        logger.warning(
+            "clip encode failed (ffmpeg exit %s): %s",
+            proc.returncode,
+            err.decode("utf-8", "replace").strip()[-500:],
+        )
         return False
-    return proc.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 0
+    return Path(path).exists() and Path(path).stat().st_size > 0
 
 
 async def build_event_clip(
