@@ -81,6 +81,32 @@ _last_restart_attempt: dict[str, float] = {}
 # without making the low-level loop itself infinite.
 _MIN_RESTART_INTERVAL_S = 20.0
 
+# Grid-wide circuit breaker. Real finding, not a hypothetical: cv2's FFmpeg
+# backend swallows RTSP's actual response entirely -- `VideoCapture.open()`
+# returns a plain bool, and a real "401 Unauthorized" from the grid (the
+# credentials are rejected, not merely unconfigured) is indistinguishable
+# from a network blip at the Python level. Only "credentials not configured"
+# (a blank env var, checked before cv2 is ever touched -- see
+# camera_connection.py's _open_with_timeout) sets grid_state=AUTH_ERROR and
+# gets the long sentinel_grid_auth_cooldown_seconds backoff below; a live
+# rejection falls through to the generic _MIN_RESTART_INTERVAL_S floor
+# instead, which every camera clears on every ~30s sweep. With the
+# always-connected policy (max_autoconnect=100) that is up to 30 real
+# cameras retrying a rejected shared login every ~30 seconds, forever --
+# exactly the sustained load that gets (or keeps) the account blocked, and
+# exactly what a real run of this produced.
+#
+# The fix does not try to make cv2 surface the 401 (that needs capturing
+# FFmpeg's own stderr, a materially bigger and more fragile change). Instead
+# it detects the SHAPE the failure has when it's the shared login, not
+# individual cameras: many distinct grid cameras attempted, and NONE of them
+# actually connected. That is the same "one shared account, so retrying
+# per-camera hammers the same login for no new information" reasoning the
+# AUTH_ERROR cooldown comment already states -- applied at the level that
+# can actually detect a live rejection, not only a blank credential.
+_GRID_WIDE_FAILURE_THRESHOLD = 5
+_grid_wide_cooldown_until = 0.0
+
 _supervisor_task: "asyncio.Task[None] | None" = None
 
 
@@ -122,6 +148,30 @@ def _is_running(camera_id: str) -> bool:
     return bool(task and not task.done())
 
 
+def _grid_wide_rejection_detected() -> "int | None":
+    """Returns how many distinct grid cameras were attempted if this sweep's
+    state has the SHAPE of a shared-login rejection (many attempted, zero
+    actually connected) — None otherwise. Synchronous and cheap: reads
+    CAMERA_STATS, the same in-memory dict every other diagnostic here already
+    reads, no query, no I/O.
+
+    "Attempted" means a worker has run for it at least once (started_at is
+    set) — a camera the supervisor has never gotten to yet must not count
+    toward "everyone is failing", or the very first sweep after a restart
+    would trip this before a single connection was even tried."""
+    attempted = [
+        cid for cid in AUTO_MANAGED
+        if worker.CAMERA_STATS.get(cid, {}).get("started_at") is not None
+    ]
+    if len(attempted) < _GRID_WIDE_FAILURE_THRESHOLD:
+        return None
+    connected = sum(
+        1 for cid in attempted
+        if worker.CAMERA_STATS.get(cid, {}).get("grid_state") in ("CONNECTED", "PROCESSING")
+    )
+    return len(attempted) if connected == 0 else None
+
+
 async def _connect_eligible(db: Session) -> int:
     """One sweep: (re)connect eligible, not-currently-running, auto-managed
     cameras, up to settings.sentinel_grid_max_autoconnect concurrent
@@ -131,7 +181,25 @@ async def _connect_eligible(db: Session) -> int:
     at a high cap (N cameras * stagger seconds) — that's the staggering
     working as intended, not a bug; the caller (_sweep_loop) awaits it fully
     before its own next-sweep sleep, same as before."""
+    global _grid_wide_cooldown_until
     if not settings.sentinel_grid_autoconnect or not _grid_credentials_configured():
+        return 0
+
+    now = time.monotonic()
+    if now < _grid_wide_cooldown_until:
+        return 0
+
+    rejected_count = _grid_wide_rejection_detected()
+    if rejected_count is not None:
+        _grid_wide_cooldown_until = now + settings.sentinel_grid_auth_cooldown_seconds
+        logger.warning(
+            "Sentinel Grid supervisor: %d distinct grid camera(s) attempted, "
+            "none connected — treating this as a shared-credential rejection "
+            "rather than %d independent camera problems, and pausing ALL grid "
+            "connect attempts for %.0fs instead of continuing to retry each "
+            "one individually.",
+            rejected_count, rejected_count, settings.sentinel_grid_auth_cooldown_seconds,
+        )
         return 0
 
     # Excludes anything the operator explicitly disconnected from BOTH the

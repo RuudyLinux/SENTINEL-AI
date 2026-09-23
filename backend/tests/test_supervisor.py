@@ -41,6 +41,8 @@ def _clean_supervisor_state(monkeypatch):
     supervisor.AUTO_MANAGED.clear()
     supervisor.OPERATOR_DISCONNECTED.clear()
     supervisor._last_restart_attempt.clear()
+    supervisor._grid_wide_cooldown_until = 0.0
+    worker.CAMERA_STATS.clear()
     monkeypatch.setattr(config.settings, "sentinel_grid_email", "someone@example.com")
     monkeypatch.setattr(config.settings, "sentinel_grid_password", "correct-password")
     monkeypatch.setattr(config.settings, "sentinel_grid_autoconnect", True)
@@ -54,6 +56,8 @@ def _clean_supervisor_state(monkeypatch):
     supervisor.AUTO_MANAGED.clear()
     supervisor.OPERATOR_DISCONNECTED.clear()
     supervisor._last_restart_attempt.clear()
+    supervisor._grid_wide_cooldown_until = 0.0
+    worker.CAMERA_STATS.clear()
 
 
 def _grid_camera(db_session, code=None, **kwargs):
@@ -486,3 +490,128 @@ def test_restart_actually_awaits_the_old_tasks_cancellation_before_starting_a_ne
         "the old worker's cancellation must be awaited BEFORE the new worker starts, "
         f"got order: {events}"
     )
+
+
+class TestGridWideCircuitBreaker:
+    """Real finding, not a hypothetical: cv2's FFmpeg backend swallows RTSP's
+    actual response, so a genuine "401 Unauthorized" from the grid (the
+    credentials ARE set but the grid rejects them — a rate-limited or blocked
+    account) is indistinguishable, at the Python level, from an ordinary
+    network blip. It never sets grid_state=AUTH_ERROR (that only fires for a
+    blank credential, checked before cv2 is ever touched), so it never gets
+    that state's long cooldown — every camera just retries on the ordinary
+    ~20s floor, forever. Measured live: with the always-connected policy
+    (max_autoconnect=100), that is up to 30 real cameras hammering a
+    rejected shared login every sweep, indefinitely — which is exactly the
+    sustained load that gets (or keeps) a grid account blocked.
+
+    The breaker detects the SHAPE a shared-login rejection has (many
+    distinct cameras attempted, none of them actually connected) rather than
+    trying to parse what cv2 never exposes.
+    """
+
+    def _mark_attempted(self, camera_id: str, grid_state: str | None) -> None:
+        worker.CAMERA_STATS[camera_id] = {"started_at": "2026-01-01T00:00:00", "grid_state": grid_state}
+        supervisor.AUTO_MANAGED.add(camera_id)
+
+    def test_below_the_threshold_never_trips(self):
+        """A handful of unlucky cameras is not the same shape as a rejected
+        shared login — must not fire on ordinary partial failure."""
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD - 1):
+            self._mark_attempted(f"cam{i}", "DISCONNECTED")
+        assert supervisor._grid_wide_rejection_detected() is None
+
+    def test_at_the_threshold_with_zero_connected_trips(self):
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "DISCONNECTED")
+        assert supervisor._grid_wide_rejection_detected() == supervisor._GRID_WIDE_FAILURE_THRESHOLD
+
+    def test_even_one_real_connection_prevents_the_trip(self):
+        """The whole point: distinguishing 'the grid is down' from 'most of
+        the fleet is struggling but the grid itself is fine' — one genuine
+        CONNECTED camera among many failing ones is the second case."""
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "DISCONNECTED")
+        self._mark_attempted("cam_ok", "CONNECTED")
+        assert supervisor._grid_wide_rejection_detected() is None
+
+    def test_processing_also_counts_as_genuinely_connected(self):
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "DISCONNECTED")
+        self._mark_attempted("cam_ok", "PROCESSING")
+        assert supervisor._grid_wide_rejection_detected() is None
+
+    def test_a_camera_never_yet_attempted_does_not_count_toward_the_total(self):
+        """started_at is None until a worker has actually run for it once —
+        the very first sweep after a restart must not trip this before a
+        single connection was even tried."""
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            worker.CAMERA_STATS[f"cam{i}"] = {"started_at": None, "grid_state": None}
+            supervisor.AUTO_MANAGED.add(f"cam{i}")
+        assert supervisor._grid_wide_rejection_detected() is None
+
+    def test_a_tripped_breaker_stops_new_connect_attempts_entirely(self, monkeypatch, db_session):
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "ERROR")
+        cams = [_grid_camera(db_session) for _ in range(3)]
+        monkeypatch.setattr(supervisor, "_eligible_camera_ids", lambda db: [c.id for c in cams])
+        started = []
+        monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
+
+        result = asyncio.run(supervisor._connect_eligible(db_session))
+
+        assert result == 0
+        assert started == [], "the breaker tripped; no new camera should have been started this sweep"
+
+    def test_the_cooldown_holds_for_subsequent_sweeps_too(self, monkeypatch, db_session):
+        """Not just the sweep that tripped it — the whole point is pausing
+        ALL grid connect attempts for the cooldown window, not one sweep."""
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "ERROR")
+        cams = [_grid_camera(db_session) for _ in range(3)]
+        monkeypatch.setattr(supervisor, "_eligible_camera_ids", lambda db: [c.id for c in cams])
+        started = []
+        monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
+
+        asyncio.run(supervisor._connect_eligible(db_session))  # trips it
+        # Clear the failing CAMERA_STATS as if cleanup ran — the cooldown
+        # timestamp itself, not the state that triggered it, must be what
+        # keeps the next sweep from starting anything.
+        worker.CAMERA_STATS.clear()
+        result = asyncio.run(supervisor._connect_eligible(db_session))
+
+        assert result == 0
+        assert started == []
+
+    def test_the_cooldown_expires_and_normal_connects_resume(self, monkeypatch, db_session):
+        for i in range(supervisor._GRID_WIDE_FAILURE_THRESHOLD):
+            self._mark_attempted(f"cam{i}", "ERROR")
+        cams = [_grid_camera(db_session) for _ in range(3)]
+        monkeypatch.setattr(supervisor, "_eligible_camera_ids", lambda db: [c.id for c in cams])
+        started = []
+        monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
+
+        asyncio.run(supervisor._connect_eligible(db_session))  # trips it
+        worker.CAMERA_STATS.clear()
+        # Simulate the cooldown having already elapsed.
+        supervisor._grid_wide_cooldown_until = time.monotonic() - 1.0
+
+        result = asyncio.run(supervisor._connect_eligible(db_session))
+
+        assert result == 3
+        assert set(started) == {c.id for c in cams}
+
+    def test_a_genuinely_healthy_fleet_is_never_paused(self, monkeypatch, db_session):
+        """Negative control: plenty of attempted cameras, most connected —
+        ordinary operation must never trip this."""
+        for i in range(10):
+            self._mark_attempted(f"cam{i}", "PROCESSING" if i < 8 else "DEGRADED")
+        cams = [_grid_camera(db_session) for _ in range(2)]
+        monkeypatch.setattr(supervisor, "_eligible_camera_ids", lambda db: [c.id for c in cams])
+        started = []
+        monkeypatch.setattr(supervisor.worker, "start_worker", lambda cid: started.append(cid))
+
+        result = asyncio.run(supervisor._connect_eligible(db_session))
+
+        assert result == 2
+        assert set(started) == {c.id for c in cams}
