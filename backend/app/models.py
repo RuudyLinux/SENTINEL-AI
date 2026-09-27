@@ -5,6 +5,7 @@ from datetime import datetime
 from sqlalchemy import (
     Column, String, Float, Integer, Boolean, DateTime, ForeignKey, JSON
 )
+from sqlalchemy import false as sa_false
 from sqlalchemy.orm import relationship
 
 from .db import Base
@@ -65,6 +66,11 @@ class Camera(Base):
     catalog_live_status = Column(String, default="")
     catalog_synced_at = Column(DateTime, nullable=True)
     catalog_stale = Column(Boolean, default=False)
+    # A retired camera is kept, not deleted: its detections, alerts, incidents,
+    # evidence and audit rows must keep pointing at a real camera row. It never
+    # connects, starts or counts as an active camera again (routers/cameras.py
+    # POST /{id}/retire). Reversible with POST /{id}/reinstate.
+    retired = Column(Boolean, default=False, nullable=False, server_default=sa_false())
     # Phase 6: the catalogue's other two stream URLs, preserved alongside the
     # RTSP one already used for AI ingestion (source_uri). Genuinely
     # optional — a record missing either stays NULL, never fabricated.

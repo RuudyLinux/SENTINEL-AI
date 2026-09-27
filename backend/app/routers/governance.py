@@ -102,3 +102,57 @@ def purge_expired(
     summary["deleted_count"] = len(deleted_ids)
     summary["eligible_ids"] = deleted_ids
     return summary
+
+
+def _purgeable_detections_query(db: Session):
+    """Old detections nothing else points at. A detection that fired an alert,
+    identified a plate read, or is linked from an evidence item is part of the
+    record of an event and is never eligible, whatever its age."""
+    if settings.detection_retention_days is None:
+        return None
+    cutoff = datetime.utcnow() - timedelta(days=settings.detection_retention_days)
+    referenced = (
+        db.query(models.Alert.detection_id).filter(models.Alert.detection_id.isnot(None))
+        .union(db.query(models.Plate.detection_id).filter(models.Plate.detection_id.isnot(None)))
+        .union(db.query(models.Evidence.detection_id).filter(models.Evidence.detection_id.isnot(None)))
+    )
+    return db.query(models.Detection).filter(
+        models.Detection.timestamp < cutoff,
+        models.Detection.id.notin_(referenced),
+    )
+
+
+@router.post("/purge-detections")
+def purge_detections(
+    payload: schemas.PurgeExpiredRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(require_roles("Administrator")),
+):
+    """Purge raw detection rows older than `detection_retention_days`.
+
+    Same contract as /purge-expired: dry-run unless BOTH `dry_run=False` and
+    `confirm=True`, and every call is audited. Alerts, incidents, evidence,
+    plate reads, tracks and the audit log are never touched, and neither is any
+    detection they reference.
+    """
+    if settings.detection_retention_days is None:
+        raise HTTPException(
+            status_code=400,
+            detail="detection_retention_days is not configured — no detection retention policy is active.",
+        )
+    q = _purgeable_detections_query(db)
+    eligible = q.count()
+    summary = {
+        "detection_retention_days": settings.detection_retention_days,
+        "eligible_count": eligible,
+        "dry_run": True,
+        "deleted_count": 0,
+    }
+    if payload.dry_run or not payload.confirm:
+        log_action(db, user, "governance_detection_purge_dry_run", resource=f"{eligible} eligible")
+        return summary
+    deleted = q.delete(synchronize_session=False)
+    db.commit()
+    log_action(db, user, "governance_purge_detections", resource=f"{deleted} detection rows")
+    summary.update(dry_run=False, deleted_count=deleted)
+    return summary

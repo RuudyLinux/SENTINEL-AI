@@ -136,7 +136,11 @@ async def discover_and_register() -> None:
 def _eligible_camera_ids(db: Session) -> list[str]:
     rows = (
         db.query(models.Camera)
-        .filter(models.Camera.source_type == "sentinel_grid", models.Camera.catalog_stale == False)  # noqa: E712
+        .filter(
+            models.Camera.source_type == "sentinel_grid",
+            models.Camera.catalog_stale == False,  # noqa: E712
+            models.Camera.retired == False,  # noqa: E712
+        )
         .order_by(models.Camera.camera_code.asc())
         .all()
     )

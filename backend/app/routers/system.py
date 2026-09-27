@@ -27,7 +27,7 @@ def system_status(db: Session = Depends(get_db), user: models.User = Depends(get
     """Real subsystem checks, not hardcoded strings — each one actually
     exercises the thing it claims to report on."""
     running_workers = sum(1 for t in RUNNING.values() if not t.done())
-    total_cameras = db.query(models.Camera).count()
+    total_cameras = db.query(models.Camera).filter(models.Camera.retired == False).count()  # noqa: E712
 
     try:
         db.execute(text("SELECT 1"))
@@ -79,7 +79,9 @@ async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(
         stop_worker(camera.id)
     summary = reset_demo_data(db)
     demo_codes = [c["camera_code"] for c in DEMO_CAMERAS]
-    for camera in db.query(models.Camera).filter(models.Camera.camera_code.in_(demo_codes)).all():
+    for camera in db.query(models.Camera).filter(
+        models.Camera.camera_code.in_(demo_codes), models.Camera.retired == False,  # noqa: E712
+    ).all():
         start_worker(camera.id)
     log_action(db, user, "demo_reset", resource=",".join(summary["cameras"]))
     return summary

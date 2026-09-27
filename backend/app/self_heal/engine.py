@@ -194,6 +194,18 @@ def rebuild_open_problems() -> None:
         db.close()
 
 
+def forget_camera(camera_id: str) -> None:
+    """Drop a deleted camera from the open-problem index.
+
+    Deleting a camera deletes its SelfHealEvent rows (routers/cameras.py), but
+    this in-memory index kept the latest one, so a deleted camera's failure
+    stayed on the Problems page — pointing at a camera that no longer exists —
+    until the next restart rebuilt the index from the database.
+    """
+    for key in [k for k in _LATEST if k[1] == camera_id]:
+        _LATEST.pop(key, None)
+
+
 def open_problems() -> list["models.SelfHealEvent"]:
     """Every tracked (component, camera_id)'s latest event, where that
     latest status is not a resolved one — i.e. genuinely still open."""

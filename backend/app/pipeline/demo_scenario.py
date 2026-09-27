@@ -106,6 +106,9 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
     missing = [code for code in ("C-014", "C-019") if code not in by_code]
     if missing:
         raise DemoScenarioError(f"Demo cameras not registered: {missing} — run POST /api/system/demo/reset first")
+    retired = [code for code, c in by_code.items() if c.retired]
+    if retired:
+        raise DemoScenarioError(f"Demo cameras are retired: {sorted(retired)} — reinstate them to run the scenario")
 
     # A high-confidence read is required to clear the real ANPR gate — same
     # threshold the live pipeline enforces, not bypassed here.

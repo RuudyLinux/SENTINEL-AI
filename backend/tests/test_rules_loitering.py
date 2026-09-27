@@ -108,3 +108,29 @@ def test_zone_and_loitering_alerts_suppressed_outside_schedule_window(monkeypatc
     t[0] += 10.0  # well past the 1s loitering threshold if the schedule gate were absent
     alerts = asyncio.run(rules_engine.evaluate(db_session, camera, det, 640, 480))
     assert alerts == []
+
+
+def test_loitering_threshold_boundary_is_deterministic(monkeypatch, db_session):
+    """threshold X: dwell X-1 does not fire, dwell X fires (the rule is `>=`),
+    and X+1 inside the cooldown does not fire again."""
+    rules_engine._alert_claims.clear()
+    rules_engine._zone_presence.clear()
+    t = [5000.0]
+    monkeypatch.setattr(rules_engine.time, "monotonic", lambda: t[0])
+    camera, zone = _make_camera_and_zone(db_session, loitering_seconds=10.0)
+    db_session.add(models.AlertRule(name="Loiter", rule_type="loitering", zone_id=zone.id, active=True))
+    db_session.commit()
+    ts = datetime.utcnow()
+
+    def loitering_fired() -> bool:
+        det = _make_person_detection(db_session, camera, ts, track_id="boundary")
+        alerts = asyncio.run(rules_engine.evaluate(db_session, camera, det, 640, 480))
+        return any("Loitering" in r for a in alerts for r in a.reasons)
+
+    assert loitering_fired() is False          # dwell 0
+    t[0] += 9.0
+    assert loitering_fired() is False          # dwell X-1
+    t[0] += 1.0
+    assert loitering_fired() is True           # dwell X
+    t[0] += 1.0
+    assert loitering_fired() is False          # dwell X+1, same track, inside cooldown

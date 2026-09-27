@@ -16,6 +16,7 @@ from app.pipeline import plate_detector, worker
 from app.pipeline.anpr import OcrRead
 
 
+
 def _vehicle_with_plate(plate_y: int = 150, plate_w: int = 120, plate_h: int = 30) -> np.ndarray:
     """A dark vehicle-ish rectangle with a light, high-contrast plate region
     carrying glyph-like bars — enough edge structure for the localizer."""
@@ -165,3 +166,23 @@ class TestFullFrameOffsetting:
         )
         assert plate_bbox is None
         assert plate_crop is None
+
+
+def test_plate_model_path_is_resolved_from_the_backend_not_the_database(monkeypatch, tmp_path):
+    """DB_PATH may point anywhere (a Docker volume, a test directory); the plate
+    weights ship with the backend. Resolving next to the database silently lost
+    the plate detector whenever the two were apart."""
+    from app.config import BASE_DIR
+    weights = BASE_DIR / "qa-plate-probe.pt"
+    weights.write_bytes(b"not a real model")
+    try:
+        monkeypatch.setattr(plate_detector.settings, "db_path", tmp_path / "elsewhere" / "x.db")
+        monkeypatch.setattr(plate_detector.settings, "plate_model_name", "qa-plate-probe.pt")
+        seen = {}
+        monkeypatch.setattr("ultralytics.YOLO", lambda path: seen.setdefault("path", path))
+        plate_detector.get_plate_model.cache_clear()
+        plate_detector.get_plate_model()
+        assert seen.get("path") == str(weights)
+    finally:
+        weights.unlink()
+        plate_detector.get_plate_model.cache_clear()

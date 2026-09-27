@@ -171,6 +171,23 @@ def _find_correlatable_incident(
     return query.order_by(models.Incident.created_at.desc()).first()
 
 
+def _rule_switched_off(db: Session, rule_type: str, zone_id: "str | None" = None) -> bool:
+    """True when an operator has disabled every rule of this type (for this zone).
+
+    Watchlist and zone-entry alerts fire without any AlertRule row existing —
+    that is the out-of-the-box behaviour and stays so. But once a rule for them
+    does exist, Admin -> Rules offers a Disable button, and that button used to
+    do nothing: the engine only read the rule to label the alert with its id,
+    so a "disabled" rule kept firing. Disabling now means what it says. Any one
+    active rule of the type still keeps the alert on.
+    """
+    query = db.query(models.AlertRule.active).filter(models.AlertRule.rule_type == rule_type)
+    if zone_id is not None:
+        query = query.filter(models.AlertRule.zone_id == zone_id)
+    states = [bool(active) for (active,) in query.all()]
+    return bool(states) and not any(states)
+
+
 def _plate_is_corroborated(vehicle: models.Vehicle) -> bool:
     """Whether this vehicle's plate has ever been corroborated across frames.
 
@@ -216,7 +233,11 @@ async def evaluate(
     # Order matters: `_on_cooldown` RECORDS the time when it returns False, so
     # calling it first and then declining to fire would consume the cooldown
     # window of an alert that was never sent.
-    entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle and vehicle.watchlist_flag else None
+    entry = (
+        watchlist.plate_entry_in_force(db, vehicle.plate_text)
+        if vehicle and vehicle.watchlist_flag and not _rule_switched_off(db, "watchlist_plate")
+        else None
+    )
     if entry is not None and not await _on_cooldown((camera.id, "watchlist", vehicle.id)):
         rule = db.query(models.AlertRule).filter(
             models.AlertRule.rule_type == "watchlist_plate", models.AlertRule.active == True  # noqa: E712
@@ -289,7 +310,9 @@ async def evaluate(
         if not _within_schedule(zone, at):
             continue
 
-        if not await _on_cooldown((camera.id, "zone", zone.id, track_key)):
+        # Same ordering rule as the watchlist check: decide whether the rule is
+        # on BEFORE `_on_cooldown`, which records a firing as a side effect.
+        if not _rule_switched_off(db, "zone_entry", zone.id) and not await _on_cooldown((camera.id, "zone", zone.id, track_key)):
             reasons.append(f"Restricted-zone entry: '{zone.name}' on {camera.camera_code}")
             if zone.severity == "CRITICAL" or severity != "CRITICAL":
                 severity = zone.severity if zone.severity in ("HIGH", "CRITICAL") else severity

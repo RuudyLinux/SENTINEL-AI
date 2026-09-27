@@ -49,6 +49,14 @@ def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.Us
             return None
     except JWTError:
         return None
+    # A resource token (see create_resource_token) is signed with the same
+    # secret and carries the same `sub`, so without this check it passed here
+    # as a full session token. Resource tokens travel in URLs (<img src>,
+    # opened links) where they end up in browser history and proxy logs, and
+    # a stream token lives an hour: anyone holding one had the whole API as
+    # that user, not one file or one camera. Only session tokens lack `scope`.
+    if "scope" in payload:
+        return None
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if user is None or not user.active:
         return None
@@ -76,6 +84,14 @@ def require_roles(*allowed_roles: str):
             raise HTTPException(status_code=403, detail=f"Role '{role_name}' not permitted for this action")
         return user
     return dependency
+
+
+# Every role that takes operational action on alerts, incidents and plate
+# reads. The Auditor is deliberately absent: seed.py defines it as
+# "Audit-log and compliance visibility", and an auditor who can dismiss the
+# alerts or close the incidents they are auditing is not an auditor.
+OPERATIONAL_ROLES = ("Administrator", "Control Room Operator", "Investigator", "Supervisor")
+require_operational_role = require_roles(*OPERATIONAL_ROLES)
 
 
 # --- Resource tokens (P0-E) ---------------------------------------------

@@ -15,7 +15,7 @@ export default function IncidentDetailPage() {
   const { data: timelineData, error: timelineError, reload: reloadTimeline } = useApiData<any>(`/api/incidents/${incidentId}/timeline`);
   const { data: summary, error: summaryError } = useApiData<any>(`/api/incidents/${incidentId}/summary`);
   const { data: evidenceData, error: evidenceError, reload: reloadEvidence } = useApiData<any[]>(`/api/evidence?incident_id=${incidentId}`);
-  const { data: camerasData } = useApiData<any[]>("/api/cameras");
+  const { data: camerasData } = useApiData<any[]>("/api/cameras?include_retired=true");
   const timeline = timelineData?.events || [];
   const evidence = evidenceData || [];
   const cameras = camerasData || [];
@@ -50,6 +50,15 @@ export default function IncidentDetailPage() {
       reloadAll();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not add note");
+    }
+  }
+
+  async function viewEvidence(evidenceId: string) {
+    setActionError(null);
+    try {
+      await openTokenedResource(`/api/evidence/${evidenceId}/file-token`, `/api/evidence/${evidenceId}/file`);
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Could not open the evidence file");
     }
   }
 
@@ -208,7 +217,7 @@ export default function IncidentDetailPage() {
                 <span className="flex items-center gap-2">{e.evidence_type} <EvidenceIntegrityBadge status={e.verification_status} /></span>
                 {e.file_path && (
                   <button
-                    onClick={() => openTokenedResource(`/api/evidence/${e.id}/file-token`, `/api/evidence/${e.id}/file`)}
+                    onClick={() => viewEvidence(e.id)}
                     className="text-accent text-xs hover:underline"
                   >
                     VIEW

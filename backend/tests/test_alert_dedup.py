@@ -49,3 +49,16 @@ def test_cooldown_expires_after_the_window(monkeypatch):
     assert _cooldown(key) is False
     clock.now += rules_engine.COOLDOWN_SECONDS + 1
     assert _cooldown(key) is False  # window elapsed: fires again
+
+
+def test_cooldown_boundary_is_exact(monkeypatch):
+    """A repeat just inside the cooldown is suppressed; one at exactly the
+    cooldown length is allowed (the store compares elapsed < ttl)."""
+    clock = _Clock()
+    _fixed_clock(monkeypatch, clock)
+    key = ("cam-boundary", "zone", "z", "trk")
+    assert _cooldown(key) is False
+    clock.now += rules_engine.COOLDOWN_SECONDS - 0.001
+    assert _cooldown(key) is True
+    clock.now += 0.001
+    assert _cooldown(key) is False

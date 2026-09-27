@@ -101,10 +101,21 @@ _TO_LETTER = str.maketrans({"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6
 _MAX_SUBSTITUTIONS = 2
 
 
+def cuda_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=1)
 def get_reader():
     import easyocr
-    return easyocr.Reader(["en"], gpu=False, verbose=False)
+    # Follows the hardware: on a CPU-only torch build this is False, exactly as
+    # before. With a CUDA build (see README "GPU runtime") OCR runs on the GPU
+    # too, instead of staying the CPU bottleneck behind a GPU detector.
+    return easyocr.Reader(["en"], gpu=cuda_available(), verbose=False)
 
 
 def normalize_plate(raw: str) -> str:

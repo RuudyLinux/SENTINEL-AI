@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -7,6 +8,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("sentinel.main")
+
+from . import log_redaction  # noqa: E402
+
+# Before any request is served: uvicorn logs full URLs, and several carry a
+# token (see app/log_redaction.py).
+log_redaction.install()
 
 #: Installed at startup, shut down at exit. Held here rather than on `app`
 #: because `asyncio.to_thread` reaches the loop's default executor, not the
@@ -19,7 +26,7 @@ from .seed import run_seed
 from .ws import manager
 from .pipeline.worker import start_worker, stop_worker, RUNNING
 from .pipeline import supervisor
-from .security import get_user_from_token
+from .security import get_user_from_token, resource_token_expiry
 from .config import settings
 
 from .routers import (
@@ -89,6 +96,35 @@ async def _install_thread_pool() -> None:
     logger.info(
         "shared thread pool: %d workers for %d registered camera(s)", size, camera_count,
     )
+
+
+def _mark_all_cameras_offline(db) -> int:
+    """No camera worker survives a process restart, so at boot every camera is
+    offline until a worker proves otherwise. Without this, a camera that was
+    online when the process died (or was killed) stayed "online" in the
+    database — and in the dashboard's online count — with no worker behind it;
+    measured after a hard restart: "4/34 online" with 2 workers running."""
+    reset = (
+        db.query(models.Camera)
+        .filter(models.Camera.status != "offline")
+        .update({models.Camera.status: "offline"}, synchronize_session=False)
+    )
+    db.commit()
+    return reset
+
+
+def _resume_local_workers(db) -> list[str]:
+    """Resume detection workers for cameras registered in a previous run.
+    rtsp/onvif are deliberately excluded — those require an explicit operator
+    start (see routers/cameras.py POST /{id}/start), same as grid cameras.
+    mock_vms behaves like webcam/video_file: purely local, safe to auto-resume.
+    Retired cameras are never resumed (models.Camera.retired)."""
+    started = []
+    for camera in db.query(models.Camera).filter(models.Camera.retired == False).all():  # noqa: E712
+        if camera.source_type in ("webcam", "video_file", "mock_vms"):
+            start_worker(camera.id)
+            started.append(str(camera.id))
+    return started
 
 
 async def _on_startup():
@@ -195,6 +231,9 @@ async def _on_startup():
     # which caps their watchlist alerts at HIGH until a fresh corroborated
     # sighting arrives — the safe direction for a missing safety signal.
     ensure_columns("vehicles", {"plate_corroborated": "BOOLEAN"})
+    # Camera retirement (see models.Camera.retired): every existing camera
+    # migrates as active, which is true of all of them.
+    ensure_columns("cameras", {"retired": "BOOLEAN NOT NULL DEFAULT 0"})
     ensure_indexes("plates", ["review_status"])
     ensure_indexes("alerts", ["feedback"])
     ensure_indexes("audit_logs", ["chain_seq"])
@@ -212,14 +251,10 @@ async def _on_startup():
     db = SessionLocal()
     try:
         run_seed(db)
-        # Resume detection workers for any cameras registered from a previous run.
-        # rtsp/onvif are deliberately excluded — those require an explicit operator
-        # start (see routers/cameras.py POST /{id}/start), same as catalog-synced
-        # cameras. mock_vms behaves like webcam/video_file: purely local, safe to
-        # auto-resume.
-        for camera in db.query(models.Camera).all():
-            if camera.source_type in ("webcam", "video_file", "mock_vms"):
-                start_worker(camera.id)
+        reset = _mark_all_cameras_offline(db)
+        if reset:
+            logger.info("startup: marked %d camera(s) offline until their workers report in", reset)
+        _resume_local_workers(db)
     finally:
         db.close()
 
@@ -323,9 +358,29 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = None):
     if user is None:
         await ws.close(code=4401)
         return
+    # The token is checked once, at the handshake, and a socket then stays
+    # open for as long as the tab does — so a session token that expired (8h)
+    # kept receiving live surveillance events indefinitely. Same bound the
+    # MJPEG stream already applies: the connection ends when its token does,
+    # and the client reconnects with whatever token it now holds.
+    deadline = resource_token_expiry(token)
     await manager.connect(ws)
     try:
         while True:
-            await ws.receive_text()  # dashboard doesn't need to send anything; keep the socket alive
+            remaining = (deadline - datetime.utcnow()).total_seconds() if deadline else 0
+            if remaining <= 0:
+                await ws.close(code=4401)
+                break
+            try:
+                # The dashboard sends nothing; this only keeps the socket alive
+                # and notices a disconnect.
+                await asyncio.wait_for(ws.receive_text(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
     except WebSocketDisconnect:
+        pass
+    finally:
+        # Any other exit (a transport error, a cancelled task at shutdown) used
+        # to leave the socket in `manager.active`, where every later broadcast
+        # tried to send to it.
         manager.disconnect(ws)

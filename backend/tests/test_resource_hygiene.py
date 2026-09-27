@@ -18,7 +18,9 @@ import asyncio
 import subprocess
 import warnings
 
+import imageio_ffmpeg
 import numpy as np
+import pytest
 
 from app import ws as ws_module
 from app.pipeline import clips
@@ -75,6 +77,16 @@ def _tiny_frames(n: int = 4) -> list[bytes]:
 
 
 class TestClipEncoderPipes:
+    @pytest.fixture(autouse=True)
+    def _resolve_ffmpeg_before_popen_is_patched(self):
+        """imageio_ffmpeg finds its binary once per process (lru_cache) by
+        spawning it via subprocess. Tests below replace subprocess.Popen with
+        deliberately broken fakes; if one of them happened to run first, the
+        lookup ran under the fake, failed, and cached "no ffmpeg" for every
+        later test in the session — the intermittent random-order failure of
+        every real clip encode. Resolving it up front makes order irrelevant."""
+        imageio_ffmpeg.get_ffmpeg_exe()
+
     def test_a_successful_encode_leaves_no_open_pipe(self, tmp_path):
         out = tmp_path / "clip.mp4"
         with warnings.catch_warnings():

@@ -54,8 +54,9 @@ export default function PersonTrackingPage() {
 
       <form onSubmit={search} className="flex gap-2 max-w-xl items-end flex-wrap">
         <div className="flex-1 min-w-[240px]">
-          <label className="text-xs text-slate-400">Reference person detection ID</label>
+          <label htmlFor="person-detection-id" className="text-xs text-slate-400">Reference person detection ID</label>
           <input
+            id="person-detection-id"
             value={detectionId}
             onChange={(e) => setDetectionId(e.target.value)}
             placeholder="det_xxxxxxxxxx (from Search / Investigate results)"
@@ -63,8 +64,9 @@ export default function PersonTrackingPage() {
           />
         </div>
         <div>
-          <label className="text-xs text-slate-400">Min similarity</label>
+          <label htmlFor="person-min-similarity" className="text-xs text-slate-400">Min similarity</label>
           <input
+            id="person-min-similarity"
             type="number" min="0" max="1" step="0.05" value={minSimilarity}
             onChange={(e) => setMinSimilarity(parseFloat(e.target.value) || 0)}
             className="block w-24 bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent mt-1"

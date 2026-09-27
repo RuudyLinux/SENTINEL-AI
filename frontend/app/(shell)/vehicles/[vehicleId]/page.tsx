@@ -60,7 +60,7 @@ export default function VehicleInvestigationPage() {
     useApiData<any>(vehicleId ? `/api/vehicles/${vehicleId}/route` : null);
   const { data: sightings } =
     useApiData<any[]>(vehicleId ? `/api/vehicles/${vehicleId}/sightings` : null);
-  const { data: cameras } = useApiData<any[]>("/api/cameras");
+  const { data: cameras } = useApiData<any[]>("/api/cameras?include_retired=true");
 
   const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);

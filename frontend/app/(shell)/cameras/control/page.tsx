@@ -23,7 +23,8 @@ const BULK_BUTTONS: { action: BulkAction; label: string; icon: typeof Wifi }[] =
   { action: "start", label: "Start", icon: Play },
   { action: "start_ai", label: "Start AI", icon: BrainCircuit },
   { action: "restart", label: "Restart", icon: RotateCcw },
-  { action: "stop", label: "Stop", icon: Square },
+  // "stop" only switches AI off; the stream stays connected (see CONFIRM_TEXT).
+  { action: "stop", label: "Stop AI", icon: Square },
   { action: "disconnect", label: "Disconnect", icon: WifiOff },
 ];
 

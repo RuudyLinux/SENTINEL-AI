@@ -4,7 +4,7 @@ from datetime import datetime
 
 from .. import models, schemas
 from ..db import get_db
-from ..security import get_current_user
+from ..security import get_current_user, require_operational_role
 from ..audit import log_action
 from .. import watchlist
 
@@ -48,7 +48,7 @@ def _require_exists(db: Session, model, value: "str | None", label: str) -> None
 
 
 @router.post("", response_model=schemas.IncidentOut)
-def create_incident(payload: schemas.IncidentCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def create_incident(payload: schemas.IncidentCreate, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     _require_exists(db, models.Camera, payload.camera_id, "Camera")
     _require_exists(db, models.Alert, payload.alert_id, "Alert")
     _require_exists(db, models.Vehicle, payload.vehicle_id, "Vehicle")
@@ -170,7 +170,7 @@ def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: mod
 
 
 @router.post("/{incident_id}/notes")
-def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -183,7 +183,7 @@ def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session 
 
 
 @router.post("/{incident_id}/assign")
-def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -203,7 +203,7 @@ def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depen
 
 
 @router.post("/{incident_id}/close")
-def close_incident(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def close_incident(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")

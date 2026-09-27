@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db, SessionLocal
 from ..security import require_roles
+from ..pipeline import ai_capacity
 from ..audit import log_action
 from ..pipeline.db_retry import close_session
 from ..ws import manager
@@ -99,14 +100,24 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
         if not camera:
             return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": "Camera not found"}
         code = str(camera.camera_code)
+        if bool(camera.retired) and action in ("connect", "start", "start_ai", "restart"):
+            return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": True, "detail": "Camera is retired"}
 
+        ai_wanted = bool(camera.ai_person) or bool(camera.ai_vehicle)
         if action in ("connect", "start"):
             if camera.source_type == "sentinel_grid":
                 supervisor.connect(camera_id)
             else:
                 start_worker(camera_id)
-            detail = "Connected"
+            refusal = ai_capacity.blocked(camera_id) if ai_wanted else None
+            if ai_wanted and refusal is None:
+                ai_capacity.try_acquire(camera_id)  # reserve now, so two quick starts cannot both pass
+            detail = "Connected" if refusal is None else f"Connected without AI — {refusal}"
         elif action == "start_ai":
+            refusal = ai_capacity.blocked(camera_id)
+            if refusal is not None:
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": refusal}
+            ai_capacity.try_acquire(camera_id)
             if camera.source_type == "sentinel_grid":
                 supervisor.connect(camera_id)
             else:
@@ -115,6 +126,7 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Connected, but AI-enable write did not persist (database busy) — retry"}
             detail = "AI started"
         elif action == "stop":
+            ai_capacity.release(camera_id)
             if not await _set_ai(db, camera, False, code):
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "AI-disable write did not persist (database busy) — retry"}
             detail = "AI stopped"
@@ -163,7 +175,7 @@ async def bulk_camera_action(
     if payload.camera_ids is not None:
         target_ids = payload.camera_ids
     else:
-        target_ids = [c.id for c in db.query(models.Camera.id).all()]
+        target_ids = [c.id for c in db.query(models.Camera.id).filter(models.Camera.retired == False).all()]  # noqa: E712
     if not target_ids:
         raise HTTPException(status_code=400, detail="No cameras to operate on")
 

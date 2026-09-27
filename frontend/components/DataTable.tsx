@@ -31,7 +31,13 @@ export default function DataTable<T extends { id: string }>({
             <tr
               key={row.id}
               onClick={() => onRowClick?.(row)}
-              className={`border-t border-border ${onRowClick ? "cursor-pointer hover:bg-panel2 transition-colors duration-150" : ""}`}
+              // A clickable row is the only route to the alert/incident/evidence
+              // detail pages, so it must be reachable and operable by keyboard.
+              tabIndex={onRowClick ? 0 : undefined}
+              onKeyDown={onRowClick ? (e) => {
+                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onRowClick(row); }
+              } : undefined}
+              className={`border-t border-border ${onRowClick ? "cursor-pointer hover:bg-panel2 focus:bg-panel2 focus:outline focus:outline-1 focus:outline-accent transition-colors duration-150" : ""}`}
             >
               {columns.map((c) => {
                 const value = c.render ? c.render(row) : (row as any)[c.key];

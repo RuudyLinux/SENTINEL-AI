@@ -75,10 +75,28 @@ claim from going stale between real runs — it is not a substitute for one.
    ```
 
 3. Open http://localhost:3000 → log in (`admin` / `sentinel123`) → **Cameras → Add Camera**
-   → upload a short video (or use a webcam) → **Live Cameras** to watch real detections stream
+   → upload a short clip of **real traffic footage** (or use a webcam; the bundled demo clip is
+   a synthetic rectangle and produces no detections) → **Live Cameras** to watch real detections stream
    in, or add a **Restricted Zone** / **Watchlist** entry under Map / Watchlists to see the
    real rules engine fire an alert and auto-create an incident, then **Investigate** →
    **Generate Evidence Package**.
+
+**Demo procedure (real grid cameras).**
+
+1. Keep `SENTINEL_GRID_AUTOCONNECT=false` so no camera connects by itself.
+2. Start the backend (CPU: `.venv`, `MAX_AI_CAMERAS=1`; GPU: `.venv-gpu`,
+   `MAX_AI_CAMERAS=2`) and the frontend, then log in.
+3. **Camera Control** → connect one camera (GRID-cam02 was the stable test camera)
+   and check the live view is moving and the card shows **AI RUNNING**.
+4. Draw a **small** restricted zone over one lane. A zone covering a busy junction
+   raises an alert for every vehicle (48 in 2 minutes in the final test).
+5. Wait for the alert. CRITICAL alerts open an incident. Open it and check the
+   snapshot and clip, press **Verify** (SHA-256), then check **Admin → Audit**.
+6. ANPR only reads plates that are large and sharp in the frame. On this grid, most
+   plates are not readable at source resolution (see `docs/AI_ACCURACY.md`), so a
+   plate result is not guaranteed. Low-confidence or uncorroborated reads show as
+   *pending review*.
+7. Never run **Demo reset** on a database with real footage.
 
 **If port 8000 is taken.** It is a popular default, and an unrelated local
 service holding it is not a hypothetical — it happened here, and the dashboard
@@ -348,6 +366,188 @@ guard, one audit-log entry per bulk call, and live per-camera progress over the 
 `connect`/`start` are honest aliases — this codebase has no real distinction between them.
 RBAC is enforced server-side (`require_roles("Administrator", "Control Room Operator")`) —
 a disabled frontend button is a convenience, not the security boundary.
+
+## Final submission audit fixes (2026-09-27)
+
+- **Resource tokens were full session tokens.** The short-lived tokens put in evidence/package/
+  stream URLs share the JWT secret and `sub` claim with login tokens, and nothing checked their
+  `scope` claim, so any leaked `?token=` (one-hour stream tokens included) worked as a bearer
+  token on every API route and on `/ws`. `get_user_from_token` now rejects scoped tokens.
+- **The Auditor role could change what it audits.** Alert acknowledge/escalate/dismiss/feedback,
+  incident create/note/assign/close, and plate-review accept/correct/reject accepted any
+  logged-in user. They now require an operational role (Administrator, Control Room Operator,
+  Investigator, Supervisor). The Auditor keeps read access.
+- **Disabling a rule did nothing.** Watchlist and zone-entry alerts ignored `AlertRule.active`.
+  They still fire when no rule row exists (the default), but once rules exist and every one of
+  that type (for zone entry: that zone) is disabled, the alert stops.
+- `/ws` now drops a client from the broadcast list on any exit, not only a clean disconnect.
+- **Camera workers held SQLite's write lock through OCR.** A vehicle's Detection row was
+  flushed, then ANPR ran (seconds on a loaded CPU, plus a one-off ~8s EasyOCR model load),
+  then the row was committed. Every other writer queued behind it. Measured with three
+  cameras running: camera creation failed with "database is locked" after the 30s busy
+  timeout, evidence clips for alerts were lost, and audit writes surfaced as 500s. OCR now
+  runs before the flush (`worker._anpr_ocr`). After the fix: 20 API writes under the same
+  load took 10-40ms each, and there were zero lock errors in the log.
+- Evidence clip rows are written from a worker thread rather than on the event loop, and
+  `audit.log_action` retries a locked database instead of failing the audited request.
+- Investigate → **Export Report** was a plain link without the resource token the package
+  endpoint requires, so it always failed. Evidence **Download** reused a token minted at page
+  load, which expired 5 minutes later. Both now mint a fresh token per click.
+- Clickable table rows (alerts, incidents, evidence, cameras) are keyboard-operable, and the
+  Watchlist, Rules and Person-tracking form labels are linked to their fields.
+- **`/ws` outlived its token.** The session token was checked once at the handshake, so a
+  socket kept receiving live events after the token expired. The socket now closes with 4401
+  at the token's `exp`, and the dashboard reconnects (with backoff) using its current token.
+- **A deleted camera's failure stayed on Self-Heal → Problems.** Deleting a camera removed its
+  recovery-log rows but not the in-memory open-problem index, so the problem lingered until
+  a restart. The index is now cleared on delete.
+
+**Judge-demo footage.** The bundled `app/demo_assets/car-detection.mp4` that the two demo
+cameras (C-014, C-019) play is a synthetic moving rectangle. It proves decoding and
+streaming work anywhere, but YOLO correctly detects nothing in it. On those cameras the
+only vehicle identity is the one **Trigger scenario** injects (see
+`pipeline/demo_scenario.py`). To show live detection and tracking, add a camera with real
+traffic footage (**Cameras → Add Camera → upload**).
+
+**Capacity.** Each AI camera runs its own YOLO instance with 8 torch threads. On the 16-core
+test machine, three AI cameras (one of them 1080p real footage with ANPR) held the CPU at
+~100%, and camera test-connection probes then hit their 20s timeout. Stopping the heavy
+camera brought the probe back to 0.27s. For a live demo, keep to two or three AI cameras.
+
+**ANPR validation.** The ANPR pipeline (plate localization, preprocessing variants, EasyOCR,
+Indian-format validation, temporal voting) is covered by unit and integration tests. It has
+not been validated end to end on real Indian number-plate footage in this build. The
+measured accuracy caveats in `docs/ANPR_ACCURACY.md` apply, and no real-world accuracy
+figure is claimed.
+
+**Sessions.** Login tokens (8h) are held in browser `localStorage`. Logout clears them on
+the client only: there is no server-side revocation, so a copied token stays valid until it
+expires. Disabling a user does take effect immediately, because every request and every
+WebSocket handshake re-checks that the account is active. Revocation lists and cookie-based
+sessions are deliberately out of scope for this build.
+
+**Deployment.** SQLite (the default) suits a single-machine demo with a handful of cameras,
+and PostgreSQL is the supported production datastore. Statewide scale is a design target,
+not something this build has been tested at. The master project document's scenario script
+(C-014 → C-019 → C-027 with a live plate read) is the design plan: the implemented **Trigger
+scenario** covers C-014 → C-019 with an injected plate read, as described above.
+
+Regression tests: `backend/tests/test_submission_audit_fixes.py`.
+
+### Real-camera fixes (2026-09-27, measured on the government grid)
+
+- **Live view fell behind real time.** The camera loop read a frame, processed it, then read
+  the next, so a 25-30fps stream consumed at ~5fps queued up: the picture ran at ~0.2x real
+  time (the camera's clock advanced 11s per 60s). A per-session reader thread
+  (`pipeline/frame_reader.py`) now decodes continuously and keeps only the newest frame. The
+  loop always takes the newest one and older frames are dropped. After the fix, in a healthy
+  grid window, the camera clock advanced 61s in 60s with two AI cameras running; frame age at
+  processing is typically under 100ms. The grid itself sometimes stalls and then flushes
+  bursts of frames; the app shows the newest frame it has received and cannot show more.
+- **Retiring a camera.** `POST /api/cameras/{id}/retire` (Administrator, button on Cameras)
+  takes a camera out of service without deleting its history, which a camera with evidence
+  cannot be (delete returns 409). A retired camera never connects, starts, auto-starts at boot,
+  or counts in statistics. Its alerts, incidents and evidence stay intact.
+  `POST /{id}/reinstate` undoes it. C-014 and C-019 (the synthetic demo cameras) are retired.
+- **Stale "online" after a restart.** At boot every camera is set offline until its worker
+  reports in; a hard kill previously left the dashboard reading "4/34 online" with 2 running.
+- **AI rate vs CPU.** Inference runs on every Nth frame the loop takes (`DETECT_EVERY_N_FRAMES`,
+  default 3). Measured with 2 AI cameras: N=3 gives ~0.9 AI fps per camera at ~52% CPU; N=1
+  gives ~2.2 AI fps per camera at ~98% CPU. Tracking is better at higher AI fps.
+- **Demo reset wipes data.** `POST /api/system/demo/reset` deletes ALL detections, plates,
+  vehicles, alerts, incidents and evidence, including data from real cameras. Do not run it
+  on a database holding real footage.
+- **Clip encoding ran the machine out of memory — fixed.** The encoder decoded every
+  buffered frame before writing any: ~750 MB for one 15s 1080p clip at GPU frame rates, and a
+  busy zone raises several clips at once. The live test process died with an OpenCV
+  "Insufficient memory" error. Frames are now decoded one at a time as they are written, and at
+  most 2 clips encode at once. The same busy zone then produced 48 alerts and 39 clips in under
+  2 minutes at 1.6 GB RSS.
+- **Tokens in access logs — fixed.** uvicorn logged full URLs, including the `?token=` of the
+  WebSocket handshake and stream/evidence links. `app/log_redaction.py` now redacts token values
+  on uvicorn's own loggers however it is launched; verified on a live log (43 WebSocket
+  handshakes and every stream request: 0 tokens written).
+
+### Measured accuracy
+
+Superseded by **`docs/AI_ACCURACY.md`** (2026-09-28): a reproducible benchmark on
+24 audited real grid frames. Summary:
+
+- **Detector:** yolo11s at 960px, conf 0.30. Vehicle P 0.860 / R 0.508 and person
+  P 0.959 / R 0.538, against 0.842 / 0.354 and 1.000 / 0.288 for the previous
+  yolov8s at 640px. Night preprocessing was tested and made every metric worse,
+  so none is applied.
+- **Tracker:** tuned ByteTrack (`app/pipeline/bytetrack_sentinel.yaml`). At the
+  live AI rate, day track fragments fell 30% to 0% and night 40% to 35%.
+- **ANPR:** a trained plate detector located plates on 9 of 17 real vehicles
+  (classical: 2). On the 3 plates readable at source resolution, character
+  accuracy rose from 0 to 0.58, with no wrong plate published. **No plate was
+  read fully correctly.** A plate-specific OCR model was tested, and rejected
+  because it published confident wrong plates.
+- **Capacity:** the selected configuration uses one AI camera's worth of this
+  CPU. For two cameras use `DETECTOR_IMGSZ=640`, or the GPU runtime below.
+- **Tracking ID merges:** ByteTrack matches by position only, and on night
+  footage a lost car's ID was picked up by a motorbike rider. An ID whose object
+  changes kind (car/bus/truck vs person/motorbike) now gets a new ID
+  (`pipeline/detector.py`). Rider and bike trading an ID stay one object.
+  Same-kind merges (car to car) are not detected.
+
+### AI capacity guard
+
+`MAX_AI_CAMERAS` (default 1) caps how many cameras run AI at once. Connecting
+more cameras is allowed. They stream live video without AI, and the camera card
+shows **AI WAITING**. Starting AI beyond the limit is refused with *"AI capacity
+limit reached (N AI camera(s) on this machine). Stop AI on another camera
+first, or run the GPU runtime (see README)."* The worker enforces the same slot
+check, so no path (bulk action, PATCH, restart, supervisor) can exceed it. A
+worker that stops on its own (crash, source that cannot be opened) frees its
+slot. Before this was fixed, such a camera kept the only slot until someone
+pressed disconnect.
+`GET /api/cameras/diagnostics/system` reports `ai_device`, `ai_cameras` and
+`max_ai_cameras`.
+
+### GPU runtime (optional, measured 2026-09-28)
+
+The default `backend/.venv` is CPU-only and stays that way. A separate CUDA
+environment runs the same code on an NVIDIA GPU (measured on an RTX 3050 Ti
+Laptop, 4 GB):
+
+```bash
+cd backend
+uv venv .venv-gpu --python 3.11
+uv pip install --python .venv-gpu/Scripts/python.exe torch torchvision --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv-gpu/Scripts/python.exe -r requirements.txt
+```
+
+Then start the backend with `.venv-gpu/Scripts/python.exe` and `MAX_AI_CAMERAS=2`.
+YOLO and EasyOCR select CUDA automatically; nothing else changes. With the
+CPU environment the same command falls back to CPU.
+
+| Real grid camera(s), `DETECT_EVERY_N_FRAMES=1` | AI fps / camera | Inference | App CPU | GPU util | Frame age |
+|---|---|---|---|---|---|
+| CPU, 1 camera | 2.0 | 126 ms | ~92% of machine | — | 219 ms |
+| GPU, 1 camera | 8.2 | 16 ms | 22% of machine | 25-48% | 78 ms |
+| GPU, 2 cameras | 6.2 / 6.9 | 26 / 38 ms | 32% of machine | 27-64% | <100 ms |
+
+Detection results on the benchmark are identical on CPU and GPU. GPU memory
+used by the process was ~1.2 GB with one camera and ~2.7 GB with two, so a
+third camera is not recommended on a 4 GB card. With another heavy process
+competing for the CPU, one GPU camera fell to 4.4 AI fps (10.5-minute run).
+
+**Model weights** are not in git. `yolo11s.pt` downloads on first use. The plate
+detector (AGPL-3.0) must be fetched once into `backend/`:
+
+```bash
+cd backend
+.venv/Scripts/python.exe -c "from huggingface_hub import hf_hub_download; hf_hub_download('morsetechlab/yolov11-license-plate-detection','license-plate-finetune-v1n.pt',local_dir='.')"
+```
+
+Without it the app logs a warning and uses the classical plate localizer.
+
+**Detection storage:** ~694 bytes per detection row. One AI camera writes ~300 MB/day at
+`DETECT_EVERY_N_FRAMES=3` and ~780 MB/day at 1. `DETECTION_RETENTION_DAYS` plus
+`POST /api/governance/purge-detections` (Administrator, dry-run by default, audited) removes old
+detections that no alert, plate read or evidence item references. It is off by default.
 
 ## 10/10 roadmap gap-closure (2026-09-10)
 

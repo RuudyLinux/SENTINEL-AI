@@ -1,7 +1,8 @@
 "use client";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
-import { API_BASE } from "@/lib/api";
+import { useState } from "react";
+import { ApiError, openTokenedResource } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import SeverityBadge from "@/components/SeverityBadge";
 import EmptyState from "@/components/EmptyState";
@@ -15,10 +16,27 @@ export default function InvestigationWorkspacePage() {
   const caseId = params.get("case");
 
   const { data: incidentsData, error: incidentsError, reload: reloadIncidents } = useApiData<any[]>("/api/incidents");
-  const { data: camerasData, error: camerasError, reload: reloadCameras } = useApiData<any[]>("/api/cameras");
+  const { data: camerasData, error: camerasError, reload: reloadCameras } = useApiData<any[]>("/api/cameras?include_retired=true");
   const { data: incident, error: incidentError, reload: reloadIncident } = useApiData<any>(caseId ? `/api/incidents/${caseId}` : null);
   const { data: timelineData, error: timelineError, reload: reloadTimeline } = useApiData<any>(caseId ? `/api/incidents/${caseId}/timeline` : null);
   const { data: route, error: routeError } = useApiData<any>(incident?.vehicle_id ? `/api/vehicles/${incident.vehicle_id}/route` : null);
+
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // The package endpoint takes a short-lived resource token, not the session
+  // header — a plain <a href> to it always failed with 422 (no token).
+  async function exportReport() {
+    if (!caseId) return;
+    setExportError(null);
+    try {
+      await openTokenedResource(
+        `/api/evidence/incidents/${caseId}/package-token`,
+        `/api/evidence/incidents/${caseId}/package?fmt=json`
+      );
+    } catch (err) {
+      setExportError(err instanceof ApiError ? err.message : "Could not export the case report");
+    }
+  }
 
   const incidents = incidentsData || [];
   const cameras = camerasData || [];
@@ -69,10 +87,12 @@ export default function InvestigationWorkspacePage() {
           <h1 className="text-lg font-semibold">{incident?.title}</h1>
         </div>
         <div className="flex gap-2">
-          <a href={`${API_BASE}/api/evidence/incidents/${caseId}/package?fmt=json`} target="_blank" className="text-xs border border-border rounded px-3 py-1.5 hover:border-accent">EXPORT REPORT</a>
+          <button onClick={exportReport} className="text-xs border border-border rounded px-3 py-1.5 hover:border-accent">EXPORT REPORT</button>
           <button onClick={() => router.push("/investigate")} className="text-xs border border-border rounded px-3 py-1.5">BACK TO CASES</button>
         </div>
       </div>
+
+      {exportError && <ErrorState message={exportError} />}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div>

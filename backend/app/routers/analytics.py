@@ -15,8 +15,10 @@ router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 @router.get("/overview")
 def overview(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    total_cameras = db.query(models.Camera).count()
-    online_cameras = db.query(models.Camera).filter(models.Camera.status == "online").count()
+    # Retired cameras are history, not part of the operational fleet.
+    active = db.query(models.Camera).filter(models.Camera.retired == False)  # noqa: E712
+    total_cameras = active.count()
+    online_cameras = active.filter(models.Camera.status == "online").count()
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     detections_today = db.query(models.Detection).filter(models.Detection.timestamp >= today_start).count()
     active_alerts = db.query(models.Alert).filter(models.Alert.status == "new").count()
@@ -80,7 +82,7 @@ def alerts_by_type(db: Session = Depends(get_db), user: models.User = Depends(ge
 
 @router.get("/camera-uptime")
 def camera_uptime(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    cams = db.query(models.Camera).all()
+    cams = db.query(models.Camera).filter(models.Camera.retired == False).all()  # noqa: E712
     return [{"camera_code": c.camera_code, "status": c.status, "fps": c.fps, "error_count": c.error_count} for c in cams]
 
 

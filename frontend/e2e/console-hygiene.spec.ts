@@ -103,6 +103,14 @@ for (const viewport of VIEWPORTS) {
       });
       page.on("pageerror", (err) => problems.push(`[${page.url()}] uncaught: ${err.message}`));
       page.on("requestfailed", (req) => {
+        // Next.js prefetches every in-view <Link> as an `?_rsc=` request; moving
+        // on to the next route aborts the ones still in flight. That is the
+        // browser cancelling work nobody needs, not a failure — and it only
+        // appears once cameras exist, which is why an empty CI database never
+        // tripped it. Any other failure, or an RSC request that failed for a
+        // real reason, is still reported.
+        const aborted = req.failure()?.errorText === "net::ERR_ABORTED";
+        if (aborted && req.url().includes("_rsc=")) return;
         if (!isIgnorable(req.url())) problems.push(`[${page.url()}] request failed: ${req.url()}`);
       });
       page.on("response", (res) => {

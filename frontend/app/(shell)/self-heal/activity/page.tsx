@@ -39,11 +39,11 @@ export default function RecoveryActivityPage() {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        <select value={component} onChange={(e) => setComponent(e.target.value)} className="bg-panel border border-border rounded px-2 py-1.5 text-xs text-slate-300">
+        <select aria-label="Filter by component" value={component} onChange={(e) => setComponent(e.target.value)} className="bg-panel border border-border rounded px-2 py-1.5 text-xs text-slate-300">
           <option value="">All components</option>
           {COMPONENTS.map((c) => <option key={c} value={c}>{c.replace(/_/g, " ")}</option>)}
         </select>
-        <select value={status} onChange={(e) => setStatus(e.target.value)} className="bg-panel border border-border rounded px-2 py-1.5 text-xs text-slate-300">
+        <select aria-label="Filter by status" value={status} onChange={(e) => setStatus(e.target.value)} className="bg-panel border border-border rounded px-2 py-1.5 text-xs text-slate-300">
           <option value="">All statuses</option>
           <option value="RECOVERED">Recovered</option>
           <option value="FAILED">Failed</option>

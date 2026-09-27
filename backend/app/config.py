@@ -59,11 +59,34 @@ class Settings(BaseSettings):
     evidence_dir: Path = BASE_DIR / "evidence_store"
 
     # Detection pipeline
-    model_name: str = "yolov8n.pt"
-    model_version: str = "yolov8n-coco-1.0"
+    # Chosen on an audited benchmark of 24 real grid frames (docs/AI_ACCURACY.md):
+    # yolo11s at 960px, conf 0.30, NMS IoU 0.5 gave vehicle P 0.860 / R 0.508
+    # and person P 0.959 / R 0.538, against 0.842 / 0.354 and 1.000 / 0.288 for
+    # the previous yolov8s at 640px / conf 0.40 — higher recall at no loss of
+    # precision. yolov8m matched it at 3x the CPU cost (349 vs 123 ms/frame).
+    # Weights download on first use (not in git).
+    model_name: str = "yolo11s.pt"
+    # Provenance stamped on every detection and evidence row. Empty (the
+    # default) derives it from model_name, so switching MODEL_NAME can never
+    # leave evidence claiming the old model. Set explicitly only to record a
+    # custom-trained model's own version string.
+    model_version: str = ""
     rule_version: str = "rules-1.0"
     detect_every_n_frames: int = 3  # throttle inference for CPU
-    confidence_threshold: float = 0.4
+    confidence_threshold: float = 0.30
+    # YOLO input size and NMS IoU (see model_name for the measurement).
+    detector_imgsz: int = 960
+    detector_iou: float = 0.5
+    # Boxes from this confidence reach ByteTrack (its second association stage
+    # keeps tracks alive through glare-dimmed frames); only boxes at or above
+    # confidence_threshold are published. Measured: day track fragments 30% -> 0%
+    # and night 40% -> 35% at the live AI rate, with bytetrack_sentinel.yaml.
+    tracker_feed_confidence: float = 0.10
+    # Cameras that may run AI at the same time (pipeline/ai_capacity.py).
+    # Measured on the demo machine: 1 AI camera on CPU holds ~92% CPU and a
+    # second saturates it. Raise only with the GPU runtime, after measuring.
+    max_ai_cameras: int = 1
+    tracker_config: str = str(Path(__file__).resolve().parent / "pipeline" / "bytetrack_sentinel.yaml")
 
     # ANPR quality gate: a normalized OCR read only becomes a Vehicle/Plate
     # correlation record if it looks like a plate AND clears this confidence.
@@ -121,13 +144,22 @@ class Settings(BaseSettings):
     # cardinality, and an operator must be able to revert that in one env var
     # without a code change.
     plate_pipeline_v2: bool = True
-    # Optional dedicated license-plate detection weights. Deliberately empty by
-    # default: this repo bundles only yolov8n.pt (COCO), which has no plate
-    # class, and a plate model is a real asset a deployment supplies. Empty (or
-    # a path that does not exist) falls back to classical CV localization —
-    # see pipeline/plate_detect.py. Never fabricated, never auto-downloaded.
-    plate_model_name: str = ""
+    # Dedicated license-plate detector. Measured on 17 real tracked vehicles
+    # (docs/AI_ACCURACY.md): it located a plate on 9, against 2 for the classical
+    # localizer, and lifted character accuracy on the readable plates from 0.00
+    # to 0.58 with no wrong plate published. Weights: morsetechlab
+    # yolov11-license-plate-detection, AGPL-3.0 (the licence ultralytics itself
+    # carries). Not in git and never auto-downloaded — README "Plate detector"
+    # gives the download command. A missing file is logged and falls back to
+    # classical localization (pipeline/plate_detect.py); nothing is fabricated.
+    plate_model_name: str = "license-plate-finetune-v1n.pt"
     plate_detect_confidence: float = 0.25
+    # With a dedicated plate detector configured, a vehicle crop in which it
+    # finds no plate is not OCR'd as a whole. The whole-crop fallback exists
+    # for the classical localiser, which misses often; with a trained detector
+    # a miss almost always means no legible plate, and the fallback cost ~200ms
+    # per vehicle per frame (measured: OCR was 452 of 661ms per frame).
+    plate_whole_crop_fallback_with_model: bool = False
     # Plate crops are upscaled to this glyph height before OCR. Effective glyph
     # height dominates OCR accuracy on real CCTV frames far more than the OCR
     # engine choice does.
@@ -444,8 +476,20 @@ class Settings(BaseSettings):
     # indefinitely until an administrator explicitly configures a period,
     # never auto-deleted based on an assumed default.
     evidence_retention_days: int | None = None
+    # Raw detection rows older than this many days may be purged by an
+    # Administrator (POST /api/governance/purge-detections). None = no policy,
+    # nothing is ever purged. Detections referenced by an alert, a plate read
+    # or an evidence item are never eligible, whatever their age. Measured
+    # volume: roughly 5 rows/s per AI camera, i.e. ~430k rows/day/camera.
+    detection_retention_days: int | None = None
 
     model_config = SettingsConfigDict(env_file=".env")
+
+    @model_validator(mode="after")
+    def _derive_model_version(self) -> "Settings":
+        if not self.model_version:
+            self.model_version = f"{Path(self.model_name).stem}-coco-1.0"
+        return self
 
     @model_validator(mode="after")
     def _enforce_production_jwt_secret(self) -> "Settings":

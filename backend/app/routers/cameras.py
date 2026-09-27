@@ -16,7 +16,7 @@ from ..pipeline.source import CameraSource
 from ..pipeline.egress_policy import blocked_reason
 from ..pipeline.catalog import fetch_catalog, upsert_from_catalog, CatalogError
 from ..pipeline.sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGridError
-from ..pipeline import supervisor
+from ..pipeline import supervisor, ai_capacity
 from ..self_heal import engine as self_heal
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
@@ -54,8 +54,17 @@ CAMERA_CASCADE_MODELS = (models.Zone, models.SelfHealEvent)
 
 
 @router.get("", response_model=list[schemas.CameraOut])
-def list_cameras(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    cameras = db.query(models.Camera).order_by(models.Camera.created_at.desc()).all()
+def list_cameras(
+    include_retired: bool = False,
+    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+):
+    """Active cameras. Retired cameras are left out of every operational view
+    by default; `include_retired=true` lists them too, for screens that show
+    history (an alert or incident still names the camera it came from)."""
+    query = db.query(models.Camera)
+    if not include_retired:
+        query = query.filter(models.Camera.retired == False)  # noqa: E712
+    cameras = query.order_by(models.Camera.created_at.desc()).all()
     # Richer connection-lifecycle state (LIVE/CONNECTING/PROCESSING/DEGRADED/
     # RECONNECTING/DISCONNECTED/AUTH_ERROR/ERROR) lives in-memory in
     # CAMERA_STATS, not the DB — attached here (transient attribute, not
@@ -69,6 +78,7 @@ def list_cameras(db: Session = Depends(get_db), user: models.User = Depends(get_
         # diagnostics (Camera Grid UI) without a per-camera round-trip.
         camera.reconnect_count = stats.get("reconnects")  # type: ignore[attr-defined]
         camera.last_error = stats.get("last_error")  # type: ignore[attr-defined]
+        camera.ai_blocked = bool(stats.get("ai_blocked"))  # type: ignore[attr-defined]
     return cameras
 
 
@@ -369,6 +379,12 @@ def update_camera(
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
     updates = payload.model_dump(exclude_unset=True)
+    turning_ai_on = (updates.get("ai_person") or updates.get("ai_vehicle")) and not (camera.ai_person or camera.ai_vehicle)
+    running = camera_id in RUNNING and not RUNNING[camera_id].done()
+    if turning_ai_on and running:
+        refusal = ai_capacity.blocked(camera_id)
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
     for field, value in updates.items():
         setattr(camera, field, value)
     db.commit()
@@ -471,6 +487,10 @@ def system_diagnostics(user: models.User = Depends(require_roles("Administrator"
         "illegal_state_transitions": {
             f"{frm}->{to}": count for (frm, to), count in worker.ILLEGAL_TRANSITIONS.items()
         },
+        "ai_device": "cuda" if torch.cuda.is_available() else "cpu",
+        "gpu_memory_allocated_mb": (torch.cuda.memory_allocated() // 2**20) if torch.cuda.is_available() else None,
+        "ai_cameras": sorted(ai_capacity.holders()),
+        "max_ai_cameras": settings.max_ai_cameras,
     }
 
 
@@ -483,9 +503,7 @@ async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: mo
     supervisor.restart — the single shared implementation also used by the
     bulk Camera Control Center restart (routers/camera_control.py), so the
     two can never drift again."""
-    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
+    camera = _active_camera_or_error(db, camera_id)
     await supervisor.restart(camera_id, str(camera.source_type))
     log_action(db, user, "restart_camera", resource=camera.camera_code)
     return {"ok": True}
@@ -500,9 +518,7 @@ async def start_camera(camera_id: str, db: Session = Depends(get_db), user: mode
     and AI-processing are independent, by design. For a real Sentinel Grid
     camera this also marks it auto-managed, so the 24/7 supervisor
     (pipeline/supervisor.py) reconnects it automatically if it later drops."""
-    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
+    camera = _active_camera_or_error(db, camera_id)
     if camera.source_type == "sentinel_grid":
         supervisor.connect(camera_id)
     else:
@@ -527,6 +543,51 @@ def stop_camera(camera_id: str, db: Session = Depends(get_db), user: models.User
     db.commit()
     log_action(db, user, "stop_camera", resource=camera.camera_code)
     return {"ok": True}
+
+
+def _active_camera_or_error(db: Session, camera_id: str) -> models.Camera:
+    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if bool(camera.retired):
+        raise HTTPException(status_code=409, detail="Camera is retired; reinstate it before connecting")
+    return camera
+
+
+@router.post("/{camera_id}/retire")
+def retire_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Take a camera out of service for good while keeping its history.
+
+    Deleting a camera with detections, alerts, incidents or evidence is refused
+    (409) because it would orphan chain-of-custody records. Retiring stops its
+    worker, drops it from supervision, and excludes it from every active view,
+    count and start path; every historical record keeps pointing at it.
+    """
+    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if camera.source_type == "sentinel_grid":
+        supervisor.disconnect(camera_id)
+    else:
+        stop_worker(camera_id)
+    camera.retired = True
+    camera.status = "offline"
+    db.commit()
+    log_action(db, user, "retire_camera", resource=camera.camera_code)
+    return {"ok": True, "camera_code": camera.camera_code, "retired": True}
+
+
+@router.post("/{camera_id}/reinstate")
+def reinstate_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Undo a retirement. The camera comes back offline; connecting it is a
+    separate, deliberate step."""
+    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    camera.retired = False
+    db.commit()
+    log_action(db, user, "reinstate_camera", resource=camera.camera_code)
+    return {"ok": True, "camera_code": camera.camera_code, "retired": False}
 
 
 @router.delete("/{camera_id}")
@@ -633,6 +694,7 @@ def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.Us
             cascaded[model.__tablename__] = removed
     db.delete(camera)
     db.commit()
+    self_heal.forget_camera(camera_id)
     # Named in the audit trail, not silent: rows removed as part of this
     # deletion are recorded, because "the camera was deleted" alone would not
     # say that its retired zones and recovery log went with it.

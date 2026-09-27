@@ -50,10 +50,11 @@ def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(
     except Exception:
         db_ok = False
 
-    total_cameras = db.query(models.Camera).count()
-    online_cameras = db.query(models.Camera).filter(models.Camera.status == "online").count()
-    degraded_cameras = db.query(models.Camera).filter(models.Camera.status == "degraded").count()
-    offline_cameras = db.query(models.Camera).filter(models.Camera.status == "offline").count()
+    active = db.query(models.Camera).filter(models.Camera.retired == False)  # noqa: E712  (retired = history, not fleet)
+    total_cameras = active.count()
+    online_cameras = active.filter(models.Camera.status == "online").count()
+    degraded_cameras = active.filter(models.Camera.status == "degraded").count()
+    offline_cameras = active.filter(models.Camera.status == "offline").count()
     running_workers = sum(1 for t in RUNNING.values() if not t.done())
     ai_running = any(s.get("grid_state") == "PROCESSING" for s in CAMERA_STATS.values())
 

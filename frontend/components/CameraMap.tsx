@@ -47,7 +47,7 @@ export default function CameraMap({
         className="map-tiles-dark"
       />
       {cameras.map((c) => (
-        <Marker key={c.id} position={[c.lat, c.lng]} icon={cameraIcon(c.status === "online" ? "#22c55e" : "#64748b")}>
+        <Marker key={c.id} position={[c.lat, c.lng]} title={`${c.camera_code} — ${c.name} (${c.status})`} alt={`Camera ${c.camera_code}`} icon={cameraIcon(c.status === "online" ? "#22c55e" : "#64748b")}>
           <Popup>
             <div className="text-xs">
               <div className="font-semibold">{c.camera_code} — {c.name}</div>

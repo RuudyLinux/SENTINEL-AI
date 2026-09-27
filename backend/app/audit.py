@@ -18,7 +18,7 @@ retried against a freshly-read tail rather than swallowed.
 import hashlib
 import logging
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from . import models
@@ -81,7 +81,10 @@ def compute_entry_hash(entry: models.AuditLog, prev_hash: str) -> str:
     return hashlib.sha256((prev_hash + "|" + _canonical_fields(entry)).encode("utf-8")).hexdigest()
 
 
-def log_action(db: Session, user: "models.User | None", action: str, resource: str = "", result: str = "SUCCESS", ip: str = ""):
+def log_action(
+    db: Session, user: "models.User | None", action: str, resource: str = "", result: str = "SUCCESS",
+    ip: str = "", actor: "str | None" = None,
+):
     """Insert one audit row and extend the hash chain.
 
     Best-effort against races the same way SelfHealEvent is (see models.py):
@@ -107,7 +110,9 @@ def log_action(db: Session, user: "models.User | None", action: str, resource: s
             # known BEFORE the hash is computed — a Python-side Column default is only
             # evaluated by SQLAlchemy at flush time, too late for compute_entry_hash below.
             user_id=user.id if user else None,
-            username=user.username if user else "anonymous",
+            # `actor` names a non-user origin ("system"); "anonymous" stays for
+            # unauthenticated requests such as a failed login.
+            username=user.username if user else (actor or "anonymous"),
             action=action, resource=resource, result=result, ip=ip,
             timestamp=datetime.utcnow(), chain_seq=next_seq, prev_hash=prev_hash,
         )
@@ -120,6 +125,18 @@ def log_action(db: Session, user: "models.User | None", action: str, resource: s
             # Another writer took this chain_seq between our read and our
             # commit — roll back and retry against the now-current tail.
             db.rollback()
+            continue
+        except OperationalError as exc:
+            # A camera worker holding SQLite's write lock past the busy
+            # timeout. This was not caught at all, so the lock escaped as a
+            # 500 on the operation being audited — an upload, an alert
+            # acknowledgement, an evidence download — contradicting this
+            # function's own contract above. Retried like a chain collision;
+            # anything that is not a lock is still a real error and raised.
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            db.rollback()
+            logger.warning("audit chain: database locked writing action=%s (attempt %d)", action, attempt + 1)
             continue
     logger.error("audit chain: could not land a consistent link after %d attempts for action=%s", _MAX_CHAIN_RETRIES, action)
     return None

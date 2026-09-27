@@ -24,7 +24,7 @@ export default function AlertsPage() {
   const { data: alertsData, error, reload } = useApiData<any[]>(alertsPath, { pollMs: 5000 });
   const alerts = alertsData || [];
 
-  const { data: camsData } = useApiData<any[]>("/api/cameras");
+  const { data: camsData } = useApiData<any[]>("/api/cameras?include_retired=true");
   const cameras = useMemo(() => Object.fromEntries((camsData || []).map((c) => [c.id, c])), [camsData]);
 
   useLiveSocket((e) => {

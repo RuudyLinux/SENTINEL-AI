@@ -37,7 +37,7 @@ export default function ErrorLogsPage() {
         <div className="relative">
           <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
           <input
-            value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search message…"
+            aria-label="Search error messages" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search message…"
             className="bg-panel border border-border rounded pl-8 pr-3 py-1.5 text-xs text-slate-200 w-56 focus:outline-none focus:border-accent"
           />
         </div>

@@ -178,3 +178,28 @@ def client():
         session.close()
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _no_plate_model_unless_a_test_configures_one(monkeypatch):
+    """Production names a trained plate model (config.plate_model_name), and a
+    developer machine may have those weights while CI does not. Tests must not
+    change behaviour with that: every test runs on the classical localizer
+    unless it sets plate_model_name itself."""
+    from app.config import settings
+    from app.pipeline import plate_detector
+    monkeypatch.setattr(settings, "plate_model_name", "")
+    plate_detector.get_plate_model.cache_clear()
+    yield
+    plate_detector.get_plate_model.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _free_ai_slots():
+    """AI slots (pipeline/ai_capacity) are process-global, and tests call
+    `_process_frame` directly without the stop_worker that would release them,
+    so a slot taken by one test would otherwise block AI in the next."""
+    from app.pipeline import ai_capacity
+    ai_capacity._HOLDERS.clear()
+    yield
+    ai_capacity._HOLDERS.clear()

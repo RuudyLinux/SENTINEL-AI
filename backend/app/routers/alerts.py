@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..db import get_db
-from ..security import get_current_user
+from ..security import get_current_user, require_operational_role
 from ..audit import log_action
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
@@ -62,7 +62,7 @@ def get_alert(alert_id: str, db: Session = Depends(get_db), user: models.User = 
 
 
 @router.post("/{alert_id}/acknowledge", response_model=schemas.AlertOut)
-def acknowledge(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def acknowledge(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     a = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -74,7 +74,7 @@ def acknowledge(alert_id: str, db: Session = Depends(get_db), user: models.User 
 
 
 @router.post("/{alert_id}/escalate", response_model=schemas.AlertOut)
-def escalate(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def escalate(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     a = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -85,7 +85,7 @@ def escalate(alert_id: str, db: Session = Depends(get_db), user: models.User = D
 
 
 @router.post("/{alert_id}/dismiss", response_model=schemas.AlertOut)
-def dismiss(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def dismiss(alert_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     a = db.query(models.Alert).filter(models.Alert.id == alert_id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -98,7 +98,7 @@ def dismiss(alert_id: str, db: Session = Depends(get_db), user: models.User = De
 @router.post("/{alert_id}/feedback", response_model=schemas.AlertOut)
 def submit_feedback(
     alert_id: str, payload: schemas.AlertFeedbackRequest,
-    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
     """Operator judgement on whether this alert was real (10/10 roadmap P6).
 

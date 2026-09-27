@@ -45,7 +45,7 @@ COPY . .
 
 # NOTE ON MODEL WEIGHTS: `*.pt` is excluded by .dockerignore (it is gitignored
 # too, so a clean checkout has none), which means ultralytics downloads
-# yolov8n.pt, and EasyOCR its recognition models, on FIRST USE — not at build
+# the YOLO weights, and EasyOCR its recognition models, on FIRST USE — not at build
 # time. Consequences, stated rather than discovered in production:
 #   * the first camera started in a fresh container needs outbound internet;
 #   * that first start is slow (weights are tens to hundreds of MB);

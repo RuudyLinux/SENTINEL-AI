@@ -158,3 +158,15 @@ class TestSearchSections:
 
     def test_search_requires_authentication(self, client):
         assert client.get("/api/search?q=anything").status_code == 401
+
+
+def test_a_plate_is_only_recognised_as_a_whole_word():
+    """A plate-shaped run inside a longer word is not a plate. This made a
+    random-order test fail intermittently: its random marker sometimes
+    contained a plate-shaped substring that was carved out of the query."""
+    from app.routers.search import parse_natural_language
+
+    assert "plate" not in parse_natural_language("ZTIME1BC234 before 9am")
+    assert parse_natural_language("ZTIME1BC234 before 9am")["text"] == "ZTIME1BC234"
+    assert parse_natural_language("find GJ05AB1234 after 6pm")["plate"] == "GJ05AB1234"
+    assert parse_natural_language("GJ 05 AB 1234")["plate"] == "GJ05AB1234"

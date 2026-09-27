@@ -96,6 +96,7 @@ def test_filenames_do_not_collide_across_concurrent_cameras(monkeypatch, db_sess
     path — the naming strategy is camera_code + alert_id + microsecond
     timestamp, so this is inherently collision-safe."""
     monkeypatch.setattr(worker.settings, "evidence_dir", tmp_path)
+    monkeypatch.setattr(worker.settings, "max_ai_cameras", 2)  # both cameras run AI
     monkeypatch.setattr(worker, "detect_and_track", lambda f, cid, want_person=True, want_vehicle=True: [
         {"cls": "person", "confidence": 0.9, "bbox": [100, 100, 300, 300], "track_id": 1}
     ])

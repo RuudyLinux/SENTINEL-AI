@@ -22,6 +22,19 @@ ALL_CLASSES = {**PERSON_CLASSES, **VEHICLE_CLASSES}
 
 _MODELS_BY_CAMERA: dict[str, YOLO] = {}
 
+# ByteTrack associates boxes by position only, whatever their class. Replayed on
+# real night footage (docs/AI_ACCURACY.md) a lost car's ID was picked up seconds
+# later by a motorbike rider, and a rider's ID by a car. One ID spanning two
+# objects mixes their plate votes and loitering time, so an ID whose object
+# changes kind is given a fresh ID from here on. person <-> motorbike is the
+# exception: a rider and the bike under them trade the ID constantly, and that
+# is one moving object, not two.
+_KIND = {"person": "rider", "motorbike": "rider", "car": "4w", "bus": "4w", "truck": "4w"}
+_SPLIT_ID_BASE = 1_000_000  # above anything ultralytics hands out in a session
+# camera_id -> tracker id -> (kind, published id)
+_IDS_BY_CAMERA: dict[str, dict[int, tuple[str, int]]] = {}
+_NEXT_SPLIT_ID: dict[str, int] = {}
+
 
 def get_model(camera_id: str) -> YOLO:
     model = _MODELS_BY_CAMERA.get(camera_id)
@@ -34,6 +47,24 @@ def get_model(camera_id: str) -> YOLO:
 def release_model(camera_id: str) -> None:
     """Drop a camera's model/tracker instance (call on camera stop/delete)."""
     _MODELS_BY_CAMERA.pop(camera_id, None)
+    _IDS_BY_CAMERA.pop(camera_id, None)
+    _NEXT_SPLIT_ID.pop(camera_id, None)
+
+
+def _published_track_id(camera_id: str, track_id: int, cls: str) -> int:
+    """The tracker's ID, unless its object has changed kind since last seen."""
+    ids = _IDS_BY_CAMERA.setdefault(camera_id, {})
+    kind = _KIND.get(cls, cls)
+    known = ids.get(track_id)
+    if known is None:
+        ids[track_id] = (kind, track_id)
+        return track_id
+    if known[0] == kind:
+        return known[1]
+    split_id = _NEXT_SPLIT_ID.get(camera_id, _SPLIT_ID_BASE)
+    _NEXT_SPLIT_ID[camera_id] = split_id + 1
+    ids[track_id] = (kind, split_id)
+    return split_id
 
 
 def detect_and_track(
@@ -55,9 +86,11 @@ def detect_and_track(
     results = model.track(
         frame,
         classes=class_ids,
-        conf=settings.confidence_threshold,
+        conf=min(settings.tracker_feed_confidence, settings.confidence_threshold),
+        iou=settings.detector_iou,
+        imgsz=settings.detector_imgsz,
         persist=True,
-        tracker="bytetrack.yaml",
+        tracker=settings.tracker_config,
         verbose=False,
     )
     out = []
@@ -69,10 +102,13 @@ def detect_and_track(
     for box in r.boxes:
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
+        if conf < settings.confidence_threshold:
+            continue  # fed to the tracker only; not a published detection
         x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-        track_id = int(box.id[0]) if box.id is not None else None
+        cls = ALL_CLASSES.get(cls_id, str(cls_id))
+        track_id = _published_track_id(camera_id, int(box.id[0]), cls) if box.id is not None else None
         out.append({
-            "cls": ALL_CLASSES.get(cls_id, str(cls_id)),
+            "cls": cls,
             "confidence": conf,
             "bbox": [x1, y1, x2, y2],
             "track_id": track_id,

@@ -105,8 +105,9 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <label className="text-xs text-slate-400">Department</label>
+            <label htmlFor="login-department" className="text-xs text-slate-400">Department</label>
             <select
+              id="login-department"
               value={department}
               onChange={(e) => setDepartment(e.target.value)}
               className="mt-1 w-full bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent transition-colors duration-150"

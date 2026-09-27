@@ -47,7 +47,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ..config import settings
+from ..config import BASE_DIR, settings
 
 logger = logging.getLogger("sentinel.plate_detector")
 
@@ -121,10 +121,12 @@ def get_plate_model():
     if not name:
         return None
     # Resolved relative to the backend directory, matching how
-    # settings.model_name ("yolov8n.pt") is resolved by ultralytics.
+    # settings.model_name is resolved by ultralytics.
     candidate = Path(name)
     if not candidate.is_absolute():
-        candidate = Path(settings.db_path).parent / name
+        # BASE_DIR, not the database's folder: DB_PATH can live anywhere (the
+        # Docker volume, a test dir) and the weights are shipped with the backend.
+        candidate = BASE_DIR / name
     if not candidate.exists():
         logger.warning(
             "PLATE_MODEL_NAME=%s is configured but the weights file does not exist (%s) — "

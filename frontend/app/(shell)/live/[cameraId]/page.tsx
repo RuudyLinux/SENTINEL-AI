@@ -90,7 +90,7 @@ export default function SingleCameraPage() {
           <div className="border border-border rounded-lg p-3 bg-panel text-xs text-slate-400 space-y-1">
             <div>FPS: {camera.fps?.toFixed(1) ?? "—"}</div>
             <div>Resolution: {camera.resolution || "—"}</div>
-            <div>Errors: {camera.error_count}</div>
+            <div title="Every read failure and error recorded for this camera since it was added — not reset on reconnect or restart">Errors (lifetime): {camera.error_count}</div>
             {typeof camera.reconnect_count === "number" && <div>Reconnects: {camera.reconnect_count}</div>}
             {camera.last_error && <div className="text-critical truncate" title={camera.last_error}>Last error: {camera.last_error}</div>}
           </div>

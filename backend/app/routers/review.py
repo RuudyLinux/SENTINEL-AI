@@ -24,7 +24,7 @@ from .. import models, schemas
 from ..audit import log_action
 from ..db import get_db
 from ..pipeline.anpr import normalize_plate
-from ..security import get_current_user
+from ..security import get_current_user, require_operational_role
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
@@ -54,7 +54,7 @@ def _get_plate(db: Session, plate_id: str) -> models.Plate:
 
 
 @router.post("/{plate_id}/accept", response_model=schemas.PlateOut)
-def accept_read(plate_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def accept_read(plate_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     """Operator confirms the OCR read as-is despite its low confidence."""
     plate = _get_plate(db, plate_id)
     plate.review_status = "auto_accepted"
@@ -68,7 +68,7 @@ def accept_read(plate_id: str, db: Session = Depends(get_db), user: models.User 
 @router.post("/{plate_id}/correct", response_model=schemas.PlateOut)
 def correct_read(
     plate_id: str, payload: schemas.PlateReviewCorrectRequest,
-    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
     """Operator supplies the true plate text. `plate_text_raw` (literal OCR
     output) and `plate_text_normalized` (grammar-repaired OCR output) are left
@@ -90,7 +90,7 @@ def correct_read(
 @router.post("/{plate_id}/reject", response_model=schemas.PlateOut)
 def reject_read(
     plate_id: str, payload: schemas.PlateReviewRejectRequest,
-    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
     """Operator determines this read is not usable intelligence (e.g. the
     plate is genuinely unreadable, or the localizer boxed a bumper sticker).

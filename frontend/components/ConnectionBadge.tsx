@@ -46,18 +46,24 @@ export default function ConnectionBadge({ camera }: { camera: any }) {
 }
 
 // AI processing is independent of connection state — a camera can be
-// CONNECTED with AI off. Reflects the real per-camera flags (ai_person /
-// ai_vehicle), not grid_state, so it stays accurate even before/after a
-// PATCH that hasn't yet flipped grid_state to PROCESSING/CONNECTED.
+// CONNECTED with AI off. "AI ON" used to follow the ai_person/ai_vehicle
+// flags alone, so a disconnected camera read "DISCONNECTED · AI ON" although
+// nothing was running. RUNNING now means the worker is actually processing
+// (grid_state PROCESSING); ENABLED means AI is switched on for this camera but
+// no worker is processing it right now.
 export function AiBadge({ camera }: { camera: any }) {
-  const on = !!(camera.ai_person || camera.ai_vehicle);
+  const enabled = !!(camera.ai_person || camera.ai_vehicle);
+  const running = enabled && camera.grid_state === "PROCESSING";
+  const [text, style, title] = running
+    ? ["AI RUNNING", "text-accent border-accent/40 bg-accent/10", "AI is processing this camera's live frames"]
+    : enabled && camera.ai_blocked
+      ? ["AI WAITING", "text-high border-high/40 bg-transparent", "AI capacity limit reached on this machine: this camera is streaming without AI until another camera's AI is stopped"]
+    : enabled
+      ? ["AI ENABLED", "text-slate-400 border-border border-dashed bg-transparent", "AI is switched on for this camera and will run once it is connected"]
+      : ["AI OFF", "text-slate-500 border-border bg-transparent", "AI is switched off for this camera"];
   return (
-    <span
-      className={`inline-block text-[10px] border rounded px-1.5 py-0.5 whitespace-nowrap ${
-        on ? "text-accent border-accent/40 bg-accent/10" : "text-slate-500 border-border bg-transparent"
-      }`}
-    >
-      AI {on ? "ON" : "OFF"}
+    <span className={`inline-block text-[10px] border rounded px-1.5 py-0.5 whitespace-nowrap ${style}`} title={title}>
+      {text}
     </span>
   );
 }

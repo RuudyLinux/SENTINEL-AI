@@ -16,7 +16,7 @@ const QUICK_ACTIONS: { action: string; label: string; icon: typeof Wifi }[] = [
   { action: "start", label: "Start All", icon: Play },
   { action: "start_ai", label: "Start AI", icon: BrainCircuit },
   { action: "restart", label: "Restart All", icon: RotateCcw },
-  { action: "stop", label: "Stop All", icon: Square },
+  { action: "stop", label: "Stop AI All", icon: Square },
 ];
 
 function CameraControlWidget() {

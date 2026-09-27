@@ -91,6 +91,9 @@ class CameraOut(BaseModel):
     ai_vehicle: bool
     ai_anpr: bool
     camera_group: str = ""
+    retired: bool = False
+    # AI is switched on but no AI slot is free (pipeline/ai_capacity.py).
+    ai_blocked: bool = False
     last_frame_at: Optional[datetime] = None
     # Richer connection-lifecycle state (24/7 auto-connect task) — in-memory
     # only (CAMERA_STATS), attached by routers/cameras.py.list_cameras; null
@@ -316,6 +319,8 @@ class AlertOut(BaseModel):
     severity: str
     status: str
     vehicle_id: Optional[str] = None
+    # The real detection that fired the rule — the link evidence and review use.
+    detection_id: Optional[str] = None
     confidence: float
     # Coerced, not merely typed: these columns are nullable JSON, and a single
     # row with NULL made the WHOLE list endpoint fail response validation

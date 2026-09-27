@@ -39,6 +39,7 @@ export default function Header({ onMenuClick }: { onMenuClick?: () => void }) {
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          aria-label="Global search"
           placeholder="Search camera, person, vehicle, plate..."
           className="w-full min-w-0 bg-panel2 border border-border rounded-md pl-9 pr-3 py-1.5 text-sm outline-none focus:border-accent transition-colors duration-150"
         />

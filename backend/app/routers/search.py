@@ -14,7 +14,10 @@ from ..pipeline.anpr import normalize_plate
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
-PLATE_TOKEN_RE = re.compile(r"[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{3,4}", re.IGNORECASE)
+# Word-bounded: without \b the pattern matched INSIDE longer words, so a query
+# word such as "ZTIME1BC234" had "ME1BC234" carved out as a plate and the rest
+# ("ZTI") used as the text filter — a search for one thing returning another.
+PLATE_TOKEN_RE = re.compile(r"\b[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{3,4}\b", re.IGNORECASE)
 TIME_AFTER_RE = re.compile(r"after\s+(\d{1,2})\s*(am|pm)?", re.IGNORECASE)
 TIME_BEFORE_RE = re.compile(r"before\s+(\d{1,2})\s*(am|pm)?", re.IGNORECASE)
 
@@ -96,6 +99,7 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
         results["cameras"] = [
             {"id": c.id, "camera_code": c.camera_code, "name": c.name}
             for c in db.query(models.Camera).filter(
+                models.Camera.retired == False,  # noqa: E712
                 (models.Camera.camera_code.ilike(like, escape=LIKE_ESCAPE))
                 | (models.Camera.name.ilike(like, escape=LIKE_ESCAPE))
                 | (models.Camera.location.ilike(like, escape=LIKE_ESCAPE))

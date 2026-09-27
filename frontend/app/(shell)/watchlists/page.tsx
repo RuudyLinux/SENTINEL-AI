@@ -59,16 +59,16 @@ export default function WatchlistsPage() {
 
       <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex flex-wrap gap-2 items-end max-w-2xl">
         <div className="flex-1 min-w-[140px]">
-          <label className="text-xs text-slate-400">{tab === "plate" ? "Plate number" : tab === "vehicle" ? "Vehicle identifier" : "Person identifier / note"}</label>
-          <input required value={form.identifier} onChange={(e) => setForm({ ...form, identifier: e.target.value.toUpperCase() })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
+          <label htmlFor="watchlist-identifier" className="text-xs text-slate-400">{tab === "plate" ? "Plate number" : tab === "vehicle" ? "Vehicle identifier" : "Person identifier / note"}</label>
+          <input id="watchlist-identifier" required value={form.identifier} onChange={(e) => setForm({ ...form, identifier: e.target.value.toUpperCase() })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>
         <div className="flex-1">
-          <label className="text-xs text-slate-400">Reason</label>
-          <input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
+          <label htmlFor="watchlist-reason" className="text-xs text-slate-400">Reason</label>
+          <input id="watchlist-reason" value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>
         <div>
-          <label className="text-xs text-slate-400">Priority</label>
-          <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
+          <label htmlFor="watchlist-priority" className="text-xs text-slate-400">Priority</label>
+          <select id="watchlist-priority" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
             <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
           </select>
         </div>

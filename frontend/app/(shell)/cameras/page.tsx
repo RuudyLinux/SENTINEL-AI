@@ -26,6 +26,7 @@ export default function CamerasPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [canManage, setCanManage] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [groupFilter, setGroupFilter] = useState<string>("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
@@ -35,6 +36,7 @@ export default function CamerasPage() {
   useEffect(() => {
     const user = getStoredUser();
     setCanManage(!!user && CAN_MANAGE_CAMERAS.includes(user.role));
+    setIsAdmin(user?.role === "Administrator");
   }, []);
 
   function toggle(id: string, e?: React.MouseEvent) {
@@ -66,6 +68,20 @@ export default function CamerasPage() {
       setActionError(err instanceof ApiError ? err.message : "Could not update camera");
     } finally {
       setEditBusy(false);
+    }
+  }
+
+  // Retiring keeps the camera's history (alerts, incidents, evidence) and takes
+  // it out of every active list; the backend enforces Administrator.
+  async function retire(c: any, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!window.confirm(`Retire ${c.camera_code}? It stops, disappears from active camera lists and can no longer be connected. Its history is kept.`)) return;
+    setActionError(null);
+    try {
+      await api.post(`/api/cameras/${c.id}/retire`);
+      reload();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Could not retire camera");
     }
   }
 
@@ -264,6 +280,9 @@ export default function CamerasPage() {
             )}
             <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="row-action text-xs text-accent hover:underline">Edit</button>
             <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="row-action text-xs text-accent hover:underline">Restart</button>
+            {isAdmin && (
+              <button onClick={(e: React.MouseEvent) => retire(c, e)} className="row-action text-xs text-slate-400 hover:text-critical hover:underline">Retire</button>
+            )}
           </div>
         );
       },
@@ -345,7 +364,7 @@ export default function CamerasPage() {
       {groups.length > 0 && (
         <div className="flex items-center gap-2 text-xs">
           <span className="text-slate-400">Group:</span>
-          <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="bg-panel2 border border-border rounded px-2 py-1">
+          <select aria-label="Filter by camera group" value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="bg-panel2 border border-border rounded px-2 py-1">
             <option value="">All groups</option>
             {groups.map((g) => <option key={g} value={g}>{g}</option>)}
           </select>
