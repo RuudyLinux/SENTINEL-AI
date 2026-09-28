@@ -1,4 +1,4 @@
-"""9. Timestamp propagation — SOURCE PTS reconstruction, backend-aware."""
+"""Source timestamp (PTS) reconstruction, per backend."""
 from datetime import datetime, timedelta
 
 from app.pipeline.timing import compute_source_timestamp

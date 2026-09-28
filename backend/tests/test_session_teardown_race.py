@@ -1,21 +1,16 @@
-"""Regression: tearing down a camera worker must not race its own DB thread.
+"""Tearing down a worker mustn't race its own DB thread.
 
-The defect this pins down was reproducible under the 12-worker concurrency
-stress test roughly two runs in five, and it was a real production fault, not a
-test artefact:
-
-`db_retry` hands every commit/flush to a worker thread via `asyncio.to_thread`.
-Cancelling a camera worker unwinds the *await* immediately, but cannot stop the
-thread — so `_camera_loop`'s `finally: db.close()` ran on the event-loop thread
-while that thread was still inside `commit()`:
+Hit about 2 runs in 5 of the 12-worker stress test, and a real production
+fault. db_retry runs commits via to_thread; cancelling a worker unwinds the
+await but not the thread, so the loop's finally db.close() ran while the
+thread was still in commit():
 
     sqlalchemy.exc.IllegalStateChangeError: Method 'close()' can't be called
     here; method '_prepare_impl()' is already in progress
 
-A SQLAlchemy Session is explicitly not thread-safe. Because the raise came from
-a `finally`, it escaped to `_camera_loop_supervised`, which marked a perfectly
-healthy camera OFFLINE and recorded a critical self-heal event. Every
-stop_worker and every process shutdown could trigger it.
+Sessions aren't thread-safe, and from a finally that reached
+_camera_loop_supervised, which marked a healthy camera OFFLINE on any stop
+or shutdown.
 """
 import asyncio
 import threading
@@ -27,9 +22,8 @@ from app.pipeline import db_retry
 
 
 class _SlowSession:
-    """Stands in for a Session whose commit is still running on a worker thread
-    when teardown begins. Records the real ordering so the test asserts what
-    actually happened rather than merely that nothing raised."""
+    """A Session whose commit is still running on a thread when teardown
+    starts. Records the order of events so the test checks what happened."""
 
     def __init__(self, commit_seconds: float = 0.4):
         self.commit_seconds = commit_seconds
@@ -74,10 +68,8 @@ def test_close_session_waits_for_an_in_flight_threaded_commit():
 
 
 def test_cancelling_a_worker_mid_commit_still_closes_cleanly():
-    """The real-world shape: a task cancelled while its commit is in flight.
-
-    `asyncio.to_thread` cannot interrupt the thread, so the commit continues
-    after the await unwinds. Teardown must tolerate that.
+    """A task cancelled mid-commit. to_thread can't stop the thread, so the
+    commit carries on after the await unwinds.
     """
     session = _SlowSession(commit_seconds=0.3)
 
@@ -107,8 +99,8 @@ def test_cancelling_a_worker_mid_commit_still_closes_cleanly():
 
 
 def test_close_session_never_raises_even_if_close_itself_fails():
-    """This runs from a `finally` on a cancellation path. An exception there
-    replaces the cancellation and is what marked healthy cameras offline."""
+    """Runs from a finally on cancel; raising there is what took healthy
+    cameras offline."""
 
     class _Exploding:
         def close(self):
@@ -118,15 +110,11 @@ def test_close_session_never_raises_even_if_close_itself_fails():
 
 
 def test_a_stuck_operation_defers_the_close_instead_of_blocking_teardown(monkeypatch):
-    """A pathological stall must not hold shutdown open — but it must not skip
-    the close either.
+    """A stuck close mustn't hold up shutdown, and mustn't be skipped either.
 
-    An earlier version simply returned on timeout, reasoning that the connection
-    would go back to the pool once the Session was collected. That was wrong,
-    and this suite caught it: the Session is still referenced so it is never
-    collected, and on SQLite its open write transaction keeps the database
-    locked for every other writer in the process — every subsequent test died
-    on "database is locked". The close is handed to a daemon thread instead.
+    Just returning on timeout left the Session referenced (never collected)
+    with its write transaction open, and every later test died on
+    "database is locked". It's handed to a daemon thread now.
     """
     monkeypatch.setattr(db_retry, "_CLOSE_LOCK_TIMEOUT_SECONDS", 0.15)
     session = _SlowSession(commit_seconds=0.8)
@@ -142,8 +130,7 @@ def test_a_stuck_operation_defers_the_close_instead_of_blocking_teardown(monkeyp
     assert elapsed < 0.6, "teardown must not block on a stuck operation"
     assert session.closed is False, "it must not close underneath the running commit"
 
-    # The transaction is still released, just later — this is the property whose
-    # absence broke the whole suite.
+    # still released, just later; without this the whole suite broke
     thread.join(timeout=10)
     for _ in range(100):
         if session.closed:
@@ -154,18 +141,15 @@ def test_a_stuck_operation_defers_the_close_instead_of_blocking_teardown(monkeyp
 
 
 def test_the_close_budget_exceeds_the_databases_own_busy_wait():
-    """A contended commit legitimately blocks for SQLite's entire busy-wait
-    budget. A close timeout shorter than that is guaranteed to fire under
-    exactly the load this code exists to survive — which is what happened at
-    10s against a 30s busy_timeout."""
+    """A contended commit can sit in the whole busy_timeout, so a shorter
+    close timeout fires under exactly that load (10s vs 30s did)."""
     from app.db import SQLITE_BUSY_TIMEOUT_SECONDS
 
     assert db_retry._CLOSE_LOCK_TIMEOUT_SECONDS > SQLITE_BUSY_TIMEOUT_SECONDS
 
 
 def test_one_lock_per_session_not_a_global_one():
-    """Two cameras' sessions must not serialize against each other — that would
-    turn a correctness fix into a throughput regression."""
+    """Two cameras' sessions don't serialize on each other."""
     a, b = _SlowSession(), _SlowSession()
     assert db_retry._lock_for(a) is db_retry._lock_for(a)
     assert db_retry._lock_for(a) is not db_retry._lock_for(b)

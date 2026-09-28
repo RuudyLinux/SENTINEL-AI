@@ -15,13 +15,10 @@ router = APIRouter(prefix="/api/evidence", tags=["evidence"])
 
 
 def _safe_evidence_path(raw_path: str) -> Path:
-    """Every current write path for Evidence.file_path is server-generated
-    (worker.py._save_snapshot, pipeline/clips.py — timestamped filenames
-    under settings.evidence_dir, never client input), so this is defense in
-    depth rather than a fix for a reachable exploit today: resolves the
-    stored path and refuses to serve anything outside the evidence
-    directory, so a future bug (or a bad row from some other path) can
-    never turn this endpoint into an arbitrary-file-read."""
+    """Refuse to serve anything outside the evidence dir. Every current write
+    path is server-generated (worker._save_snapshot, clips.py), so this is
+    defence in depth: a future bug or a bad row can't turn this into an
+    arbitrary file read."""
     resolved = Path(raw_path).resolve()
     evidence_root = settings.evidence_dir.resolve()
     if evidence_root not in resolved.parents and resolved != evidence_root:
@@ -38,12 +35,11 @@ def list_evidence(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent evidence, newest first, optionally scoped to one incident.
+    """Most recent evidence, newest first, optionally for one incident.
 
-    Bounded for the same reason as `GET /api/incidents`: one row is written
-    per captured snapshot or clip, so an unbounded `.all()` is a query that
-    gets slower for as long as the system keeps running. `ge=1` because SQLite
-    reads `LIMIT -1` as no limit at all.
+    Bounded like GET /api/incidents; a row per snapshot or clip means an
+    unbounded .all() keeps getting slower. ge=1 because SQLite reads
+    LIMIT -1 as no limit.
     """
     q = db.query(models.Evidence)
     if incident_id:
@@ -61,8 +57,8 @@ def get_evidence(evidence_id: str, db: Session = Depends(get_db), user: models.U
 
 @router.get("/{evidence_id}/file-token")
 def get_evidence_file_token(evidence_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """RBAC-checked (login required) + audited step that hands out a
-    short-lived token scoped to exactly this evidence file (P0-E)."""
+    """Login required, audited: hands out a short-lived token for exactly
+    this evidence file."""
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e:
         raise HTTPException(status_code=404, detail="Evidence not found")
@@ -72,10 +68,8 @@ def get_evidence_file_token(evidence_id: str, db: Session = Depends(get_db), use
 
 @router.get("/{evidence_id}/file")
 def download_evidence_file(evidence_id: str, token: str, db: Session = Depends(get_db)):
-    # Browsers can't attach an Authorization: Bearer header to a plain
-    # <img src>/<a href> navigation, so this validates a short-lived signed
-    # resource token instead of dropping auth entirely (P0-E). The token is
-    # only obtainable via the RBAC-checked, audited /file-token endpoint above.
+    # <img src>/<a href> can't send a bearer header, so this takes a
+    # short-lived signed token, only obtainable from /file-token above
     user = get_user_from_resource_token("evidence_file", evidence_id, token, db)
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e or not e.file_path:
@@ -87,26 +81,19 @@ def download_evidence_file(evidence_id: str, token: str, db: Session = Depends(g
 
 @router.post("/{evidence_id}/verify")
 def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Re-hash an evidence file and COMPARE it against the digest recorded when
-    it was captured.
+    """Re-hash an evidence file and compare with the digest taken at capture.
 
-    This previously computed a hash at verification time, stored it, and stamped
-    the record "verified" — which verified nothing. With no baseline to compare
-    against, a file altered between capture and inspection hashed cleanly and
-    was reported as verified. For police evidence that is the wrong answer in
-    the one case the feature exists for.
+    Hashing at verification time and calling it "verified" proved nothing: a
+    file altered after capture hashed cleanly. Evidence is hashed at capture
+    now (app/evidence_hash.py), so this reports:
 
-    Evidence is now hashed at capture (see app/evidence_hash.py), so this can do
-    a real comparison and report an honest outcome:
-
-    - `verified`  — the file still matches its capture-time digest.
-    - `tampered`  — it does not. The stored baseline is NEVER overwritten, so
-      the original digest remains available as the record of what was captured.
-    - `unverifiable` — the file is missing or unreadable now.
-    - `no_baseline` — captured before capture-time hashing existed, or hashing
-      failed at capture. A digest is recorded now so future checks have
-      something to compare against, but this call cannot claim the file is
-      unaltered, and does not.
+    - verified: still matches the capture digest
+    - tampered: doesn't. The stored digest is never overwritten, it stays as
+      the record of what was captured
+    - unverifiable: file missing or unreadable
+    - no_baseline: captured before capture-time hashing, or hashing failed
+      then. A digest is recorded now for next time, but this call can't say
+      the file is unaltered
     """
     e = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
     if not e:
@@ -134,9 +121,8 @@ def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: model
 
     e.verification_status = outcome
     db.commit()
-    # Audited with the real outcome — a tamper finding is exactly the event an
-    # audit trail must carry, and recording every check as a plain success
-    # would bury it.
+    # audited with the real outcome; a tamper result is exactly what the
+    # trail is for
     log_action(
         db, user, "verify_evidence", resource=evidence_id,
         result="SUCCESS" if matches else "FAILURE",
@@ -151,36 +137,29 @@ def verify_evidence(evidence_id: str, db: Session = Depends(get_db), user: model
 
 
 def _mask_plate(plate: str) -> str:
-    """First two and last two characters kept, middle masked: GJ05AB1234 ->
-    GJ******34. Enough for an operator to correlate two documents about the
-    same vehicle without the export itself disclosing the registration."""
+    """GJ05AB1234 -> GJ******34. Enough to match two documents about the same
+    vehicle without the export giving away the registration."""
     if len(plate) <= 4:
         return "*" * len(plate)
     return f"{plate[:2]}{'*' * (len(plate) - 4)}{plate[-2:]}"
 
 
 def _redact_package(package: dict, plate: "str | None") -> dict:
-    """Mask a registration EVERYWHERE it appears in the package.
+    """Mask a registration everywhere in the package.
 
-    Deliberately a whole-document substitution rather than field-by-field
-    masking. The plate reaches this document through at least five
-    independent paths — `vehicle.plate_text`, the rule narrative in
-    `alert.reasons`, `incident.title`, `incident.description` (built by
-    joining those reasons), and `audit_trail[].resource` (a watchlist entry's
-    resource IS the plate) — so masking the obvious field would produce a
-    document that merely LOOKS redacted while still disclosing the
-    registration three other ways. Partial redaction is worse than none,
-    because the reader believes it worked.
+    Whole-document substitution, not per field: the plate gets in through
+    vehicle.plate_text, alert.reasons, incident.title and description, and
+    audit_trail[].resource (a watchlist entry's resource is the plate).
+    Masking the obvious field would look redacted and still leak it three
+    ways, which is worse than no redaction.
 
-    Integrity data is never touched: evidence ids, SHA-256 digests and
-    verification statuses pass through unchanged, so a redacted package can
-    still be verified against the originals.
+    Integrity data is untouched: ids, SHA-256 digests and verification
+    statuses pass through, so a redacted package still verifies.
     """
     if not plate:
         return package
     masked = _mask_plate(plate)
-    # Serialize, substitute, re-parse: catches every nested occurrence
-    # regardless of which key it arrived under, including ones added later.
+    # serialize, substitute, re-parse: catches nested and future keys too
     blob = json.dumps(package, default=str).replace(plate, masked)
     redacted = json.loads(blob)
     redacted["redaction"] = {
@@ -206,19 +185,14 @@ def generate_package(
     incident_id: str, token: str, fmt: str = "json", redact: bool = False,
     db: Session = Depends(get_db),
 ):
-    """Generate an Evidence Package (doc §29): incident summary, camera timeline,
-    vehicle details, evidence list, notes, and audit trail — real data pulled
-    from the DB. Triggered via a plain link/new-tab navigation (can't carry a
-    bearer header), so it validates a short-lived signed resource token
-    instead of dropping auth entirely (P0-E) — see /package-token above.
+    """Evidence package (doc §29): incident summary, camera timeline,
+    vehicle details, evidence list, notes and audit trail from the DB. Opened
+    by plain navigation, so it takes a short-lived signed token from
+    /package-token instead of a bearer header.
 
-    `redact=true` masks the vehicle registration throughout the document (see
-    `_redact_package`) for an export going to a wider audience than the
-    investigation itself. It is OPT-IN, not the default: the unredacted
-    package is the evidentiary artefact, and silently degrading it would be
-    the wrong default for a chain-of-custody document. Which mode was used is
-    recorded in the audit trail and inside the package itself, so a reader can
-    always tell whether they are holding a complete export.
+    redact=true masks the registration throughout (_redact_package) for
+    wider distribution. Opt-in: the unredacted package is the evidentiary
+    artefact. Which mode was used goes in the audit trail and the package.
     """
     user = get_user_from_resource_token("evidence_package", incident_id, token, db)
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
@@ -235,8 +209,7 @@ def generate_package(
         from ..pipeline.correlate import get_route
         sightings = get_route(db, vehicle.id)
 
-    # Chain-of-custody: actual AuditLog rows touching this incident or any
-    # of its evidence items, not just a label claiming one exists.
+    # chain of custody: the actual AuditLog rows for this incident and its evidence
     audit_resources = [incident_id] + [e.id for e in evidence_items]
     audit_trail = (
         db.query(models.AuditLog)
@@ -260,8 +233,7 @@ def generate_package(
 
     if redact:
         package = _redact_package(package, vehicle.plate_text if vehicle else None)
-    # The audit trail records WHICH export was produced: a redacted package
-    # and a full one are different disclosures of the same incident.
+    # redacted and full exports are different disclosures, record which
     audit_action = "generate_evidence_package_redacted" if redact else "generate_evidence_package"
     suffix = "_redacted" if redact else ""
 

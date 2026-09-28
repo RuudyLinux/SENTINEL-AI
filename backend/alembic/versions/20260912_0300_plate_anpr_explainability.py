@@ -1,20 +1,13 @@
-"""ANPR explainability columns on `plates`.
+"""ANPR explainability columns on plates.
 
-Records WHY a plate sighting was believed, not just what it said: which
-preprocessing variant produced the winning OCR read, how many variants agreed
-on it, whether the temporal layer corroborated it across frames, and where the
-plate crop OCR actually looked at was saved.
+Why a sighting was believed: winning preprocessing variant, variants
+agreeing, corroborated across frames, and the saved plate crop. Four columns,
+not a blended score; plates.confidence stays the OCR engine's number
+(anpr.OcrRead, plate_tracker.Consensus).
 
-These are deliberately four separate columns rather than one blended score.
-`plates.confidence` remains the OCR engine's own number and is never adjusted
-by any of them — see pipeline/anpr.py::OcrRead and pipeline/plate_tracker.py::
-Consensus for why corroboration and confidence must not be folded together.
-
-All four are NULLABLE with NO backfill. In particular `corroborated` is NOT
-defaulted to true for existing rows: those were written by a pipeline that
-persisted a plate on its FIRST passing read, so asserting they were corroborated
-would claim evidence that was never gathered. NULL reads as "unknown", which is
-the only true statement available about them.
+Nullable, no backfill. corroborated especially isn't set true on old rows,
+they came from a pipeline that persisted on the first passing read. NULL =
+unknown.
 
 Revision ID: 3b1e7c9d4a02
 Revises: f273294cc229

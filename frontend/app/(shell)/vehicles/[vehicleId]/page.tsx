@@ -13,8 +13,8 @@ import ErrorState from "@/components/ErrorState";
 
 const CameraMap = dynamic(() => import("@/components/CameraMap"), { ssr: false });
 
-/** Milliseconds each hop is held during journey replay. Slow enough to read the
- * camera and timestamp, fast enough that a long journey is not a chore. */
+/** ms each hop is held during replay; slow enough to read, fast enough that a
+ * long journey isn't a chore. */
 const REPLAY_INTERVAL_MS = 1400;
 
 function RiskPanel({ score, severity, factors }: { score: number; severity: string; factors: any[] }) {
@@ -28,8 +28,7 @@ function RiskPanel({ score, severity, factors }: { score: number; severity: stri
         {score}
         <span className="text-base text-slate-500">/100</span>
       </div>
-      {/* Every point is attributed. The score is a transparent weighted sum,
-          not a model output, and the UI has to be able to prove that. */}
+      {/* every point is attributed; it's a weighted sum, not a model output */}
       {factors.length === 0 ? (
         <p className="text-xs text-slate-500">
           No risk factors recorded — nothing about this vehicle has raised a signal.
@@ -68,9 +67,8 @@ export default function VehicleInvestigationPage() {
 
   const hops = useMemo(() => route?.sightings ?? [], [route]);
 
-  // A new sighting for THIS vehicle arriving live extends the journey without a
-  // page reload — the core "if another camera sees it, the screen updates"
-  // behavior. Filtered by vehicle so an unrelated detection never refetches.
+  // a new sighting for THIS vehicle extends the journey live; filtered by
+  // vehicle so unrelated detections don't refetch
   useLiveSocket(
     useCallback(
       (e: LiveEvent) => {
@@ -132,8 +130,7 @@ export default function VehicleInvestigationPage() {
       <div className="rounded-lg border border-border bg-panel p-4">
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-semibold font-mono">{summary.vehicle.plate_text || "Unidentified vehicle"}</h1>
-          {/* "LIVE" is asserted only from a genuinely recent sighting; anything
-              older is explicitly labelled as a last known position. */}
+          {/* LIVE only from a recent sighting, otherwise "last known position" */}
           {summary.is_live ? (
             <span className="badge bg-ok/15 text-ok border border-ok/30 inline-flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-ok animate-pulse-subtle" /> LIVE
@@ -281,9 +278,8 @@ export default function VehicleInvestigationPage() {
                   center={activeHop ? [activeHop.lat, activeHop.lng] : undefined}
                 />
               </div>
-              {/* The system knows where cameras saw this vehicle and when, and
-                  nothing in between. Saying so on the map itself prevents the
-                  route line being read as a GPS track. */}
+              {/* we only know where cameras saw it and when; saying so on the
+                  map keeps the line from being read as a GPS track */}
               <p className="text-[11px] text-slate-500">
                 Reconstructed camera-to-camera route from {hops.length} observed sighting
                 {hops.length === 1 ? "" : "s"}. Lines connect consecutive sightings — they are not a
@@ -307,21 +303,18 @@ export default function VehicleInvestigationPage() {
                 <span className="text-xs text-slate-500">
                   track {s.track_id ?? "—"} · {s.vehicle_class || "vehicle"} ·{" "}
                   {s.reads_count} read{s.reads_count === 1 ? "" : "s"}
-                  {/* A null plate_bbox means OCR fell back to the whole vehicle
-                      crop — a genuinely lower-quality read, shown rather than hidden. */}
+                  {/* null plate_bbox = OCR read the whole vehicle crop, a weaker read */}
                   {!s.plate_bbox && " · not localized"}
-                  {/* Which preprocessing variant produced the read, and how many
-                      variants agreed. Only meaningful once multi-variant reading
-                      is enabled; hidden entirely on rows that predate it. */}
+                  {/* winning variant and how many agreed; only with
+                      multi-variant on, hidden on older rows */}
                   {s.ocr_variant && ` · ${s.ocr_variant}`}
                   {s.variants_agreeing > 1 && ` · ${s.variants_agreeing} variants agree`}
                 </span>
                 <span className="text-xs text-slate-400">
                   {Math.round((s.confidence ?? 0) * 100)}%
-                  {/* Confidence and corroboration are separate facts. An
-                      uncorroborated read is a real observation that only one
-                      frame supports — shown as such rather than folded into the
-                      percentage, which would misrepresent what OCR reported. */}
+                  {/* confidence and corroboration are separate: an
+                      uncorroborated read is real but only one frame backs it,
+                      so it's shown as such, not folded into the percentage */}
                   {s.corroborated === false && (
                     <span className="block text-[10px] text-amber-500/80">uncorroborated</span>
                   )}

@@ -3,9 +3,9 @@
     python tools/ai_bench.py candidates DATASET_DIR --models yolov8x.pt yolo11m.pt
     python tools/ai_bench.py evaluate   DATASET_DIR --models yolov8s.pt --sizes 640 960 1280
 
-DATASET_DIR holds `images/*.jpg` and `labels.json`. Real grid footage is not
-committed (same stance as tools/anpr_corpus): the dataset lives outside git and
-this tool is what makes a result reproducible on it.
+DATASET_DIR has images/*.jpg and labels.json. Grid footage isn't committed
+(same as tools/anpr_corpus); the dataset lives outside git and this tool
+makes results on it reproducible.
 
 labels.json:
 
@@ -14,23 +14,22 @@ labels.json:
         "objects": [{"cls": "car", "bbox": [x1, y1, x2, y2]}, ...],
         "missed": {"vehicle": 2, "person": 1}}}    # visible, but boxed by no candidate model
 
-How ground truth is built, and what that means for the numbers:
+Building the ground truth:
 
-1. `candidates` runs several large models at a low confidence and merges their
-   boxes into a numbered pool per image, rendered for review.
-2. A reviewer accepts real objects (fixing the class) and rejects the rest, and
-   counts objects that NO model boxed into `missed`. Those can never be matched,
-   so they count as false negatives for every configuration — recall is measured
-   against everything visible, not only against what some model found.
-3. `evaluate` scores configurations against that. Matching is class-agnostic
-   within a group: car/bus/truck/motorbike are one "vehicle" group, because an
-   autorickshaw labelled car by one model and truck by another is the same
-   correct detection for every rule this system runs. "person" is its own group.
+1. `candidates` runs several big models at low confidence and merges their
+   boxes into a numbered pool per image for review.
+2. A reviewer keeps real objects (fixing the class), drops the rest, and
+   counts objects NO model boxed as `missed`. Those can't match, so they're
+   false negatives for every config: recall is against everything visible.
+3. `evaluate` scores configs against that. Matching ignores class within a
+   group: car/bus/truck/motorbike are all "vehicle" (an autorickshaw called
+   car by one model and truck by another is right either way for every rule
+   here). "person" is its own group.
 
 Only objects at least MIN_HEIGHT_FRAC of the frame tall (60px at 1080p) are
-scored, on both sides: the near and middle field is where zone rules and ANPR
-operate, and sub-60px boxes cannot be reviewed reliably. Predictions below the
-cutoff are ignored, not counted as false positives.
+scored, both sides: that's where zone rules and ANPR work, and smaller boxes
+can't be reviewed reliably. Predictions under the cutoff are ignored, not
+counted as false positives.
 """
 import argparse
 import json
@@ -158,12 +157,11 @@ def cmd_candidates(args):
 
 
 def cmd_reference(args):
-    """Reference labels by agreement of strong detector runs: a box enters the
-    reference when at least `--votes` of the runs detect it (IoU > 0.5, same
-    group). Strong models at high resolution are far better than the
-    deployable ones, but still not ground truth — `audit` renders the result so
-    a reviewer can count label errors and missed objects, and the report must
-    say that the reference is model-agreement, audited."""
+    """Reference labels by agreement: a box goes in when at least `--votes`
+    strong runs detect it (IoU > 0.5, same group). Much better than the
+    deployable models but still not ground truth; `audit` renders it so a
+    reviewer can count label errors and misses, and the report has to say
+    it's model agreement, audited."""
     from ultralytics import YOLO
     ds = Path(args.dataset)
     runs = []

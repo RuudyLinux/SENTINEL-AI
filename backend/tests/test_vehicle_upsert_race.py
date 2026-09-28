@@ -1,14 +1,9 @@
-"""BUG-1 (found in the 10/10 debugging pass, 2026-09-11): concurrent first
-sighting of the same never-before-seen plate on two DIFFERENT cameras — each
-camera worker holds its own `SessionLocal()` — could create two separate
-Vehicle rows for one real vehicle, because `upsert_vehicle_for_plate`'s
-read-then-insert was a classic TOCTOU race with no DB constraint behind it
-(`Vehicle.plate_text` was `index=True` but not `unique=True`).
+"""Two cameras (each with its own session) first seeing the same new plate
+at the same time could create two Vehicle rows: upsert_vehicle_for_plate
+read then inserted with no unique constraint behind it.
 
-This is silent, not a crash: `pipeline/correlate.py::get_route()` builds a
-vehicle's cross-camera journey from `Plate.vehicle_id` — a real vehicle split
-across two Vehicle rows loses half its route, half its sighting count, and
-half its risk-scoring signal with no error anywhere.
+Silent, not a crash: get_route builds the journey from Plate.vehicle_id, so
+a split vehicle loses half its route, sightings and risk signal.
 """
 import asyncio
 import uuid
@@ -19,15 +14,10 @@ from app.pipeline.correlate import upsert_vehicle_for_plate
 
 
 def test_the_database_rejects_a_second_vehicle_row_for_the_same_plate():
-    """Deterministic reproduction of the ROOT CAUSE, at the exact layer the
-    fix lives: two sessions, both confirming "nothing exists yet" for a
-    brand-new plate BEFORE either one writes — precisely the shape of the
-    race (session A's read cannot see session B's not-yet-committed insert,
-    and vice versa) — then both proceeding to insert as if they'd each
-    legitimately discovered a new vehicle. Before the fix (no unique
-    constraint) the second `commit()` below succeeded silently, leaving two
-    rows. After the fix it raises IntegrityError — loud and immediate,
-    exactly what `upsert_vehicle_for_plate`'s recovery path now catches.
+    """The root cause, deterministic: two sessions both see "nothing yet"
+    before either writes, then both insert. Without the constraint the second
+    commit succeeded quietly; now it raises IntegrityError, which the
+    upsert's recovery path catches.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -69,15 +59,10 @@ def test_the_database_rejects_a_second_vehicle_row_for_the_same_plate():
 
 
 def test_concurrent_upsert_calls_for_a_brand_new_plate_never_produce_duplicates():
-    """The full, real recovery path: two REAL concurrent asyncio tasks (each
-    on its own session, `asyncio.to_thread`-offloaded flush — exactly how
-    two camera workers behave) racing `upsert_vehicle_for_plate` for the
-    SAME never-before-seen plate. Regardless of which one's write actually
-    lands first, exactly one Vehicle row must exist afterward, both callers
-    must get back a Vehicle for the SAME row, and — critically — neither call
-    may raise. A fresh third session is used for the final read specifically
-    to avoid SQLAlchemy's per-session identity map masking a stale in-memory
-    value with an already-committed fresher one.
+    """The real recovery path: two concurrent tasks on separate sessions
+    (like two workers) racing upsert_vehicle_for_plate for one new plate.
+    Exactly one row afterwards, both callers get it, neither raises. Read
+    back on a fresh session so the identity map can't hide anything.
     """
     plate = f"GJ05RC{uuid.uuid4().hex[:4].upper()}"
     session_a = SessionLocal()
@@ -114,11 +99,8 @@ def test_concurrent_upsert_calls_for_a_brand_new_plate_never_produce_duplicates(
 
 
 def test_vehicle_plate_text_has_a_real_database_level_unique_constraint():
-    """Schema-level proof the fix is a real DB constraint, not just
-    application-layer luck: on a fresh database (exactly what this test
-    suite runs against — see conftest.py), `Base.metadata.create_all()`
-    must have created a genuine UNIQUE index/constraint on
-    `vehicles.plate_text`, not merely a non-unique lookup index."""
+    """create_all on a fresh DB (what the suite uses) makes a real UNIQUE
+    index on vehicles.plate_text, not just a lookup index."""
     from sqlalchemy import inspect
     from app.db import engine
 
@@ -135,10 +117,8 @@ def test_vehicle_plate_text_has_a_real_database_level_unique_constraint():
 
 
 def test_multiple_null_plate_texts_are_still_allowed():
-    """The unique constraint must not accidentally forbid more than one
-    Vehicle row with no plate at all — SQL UNIQUE constraints treat NULL as
-    distinct from every other NULL, which is exactly the behavior needed
-    and this test locks down."""
+    """Several plate-less vehicles are still allowed; UNIQUE treats NULLs as
+    distinct."""
     a = models.Vehicle(plate_text=None, vehicle_type="car")
     b = models.Vehicle(plate_text=None, vehicle_type="truck")
     session = SessionLocal()

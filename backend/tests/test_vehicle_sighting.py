@@ -1,9 +1,8 @@
-"""V2 Phase 1/2 — vehicle sightings and cross-camera route reconstruction.
+"""Vehicle sightings and cross-camera routes.
 
-Locks down the fix for the biggest data-quality problem in the pre-V2 pipeline:
-a Plate row was inserted on EVERY OCR frame, and `get_route` builds a vehicle's
-journey from those rows — so a vehicle stopped at one junction produced dozens
-of identical route hops between a camera and itself.
+A Plate row used to be inserted for every OCR frame, and get_route builds the
+journey from those rows, so a car waiting at a junction made dozens of hops
+from a camera to itself.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -45,11 +44,8 @@ def _sighting(db, vehicle, camera, at, *, last_seen=None, confidence=0.9, track_
 class TestSightingUpsert:
     def test_first_read_creates_a_sighting_row(self, db_session):
         camera = _camera(db_session, "V2-C1")
-        # Not "GJ05AB1234": that literal is also used by the real pipeline in
-        # test_plate_pipeline_integration.py, which runs earlier in the full
-        # suite and persists a real Vehicle row for it — colliding here since
-        # Vehicle.plate_text became unique (BUG-1 fix, 10/10 debugging pass).
-        # Nothing in this test asserts on the specific plate text value.
+        # not GJ05AB1234: test_plate_pipeline_integration persists a Vehicle
+        # with that plate and plate_text is unique now. the value doesn't matter
         vehicle = _vehicle(db_session, "GJ05AB1230")
         detection = models.Detection(camera_id=camera.id, cls="car", confidence=0.8, bbox=[0, 0, 10, 10])
         db_session.add(detection)
@@ -102,8 +98,7 @@ class TestSightingUpsert:
         assert second.plate_bbox == [1.0, 2.0, 3.0, 4.0]
 
     def test_confidence_only_ever_moves_up(self, db_session):
-        """A later, worse read of an already well-read plate must not degrade
-        the recorded quality of the sighting."""
+        """A worse later read doesn't lower the recorded quality."""
         camera = _camera(db_session, "V2-C3")
         vehicle = _vehicle(db_session, "GJ05AB7777")
         first = asyncio.run(correlate.upsert_plate_sighting(
@@ -123,8 +118,7 @@ class TestSightingUpsert:
         assert updated.confidence == pytest.approx(0.94)
 
     def test_an_existing_snapshot_is_never_dropped(self, db_session):
-        """Evidence already captured for this sighting must survive an update
-        that had no new snapshot to offer."""
+        """An update without a snapshot keeps the one already captured."""
         camera = _camera(db_session, "V2-C4")
         vehicle = _vehicle(db_session, "GJ05AB5555")
         first = asyncio.run(correlate.upsert_plate_sighting(
@@ -149,8 +143,7 @@ class TestRouteReconstruction:
         base = datetime(2026, 3, 1, 10, 21, 4)
         vehicle = _vehicle(db_session, "GJ05RT0001")
         cameras = [_camera(db_session, f"RT-C{i}", lat=23.0 + i * 0.01) for i in range(3)]
-        # Inserted out of chronological order on purpose — ordering must come
-        # from the timestamps, not insertion order.
+        # out of order on purpose, ordering comes from timestamps
         _sighting(db_session, vehicle, cameras[2], base + timedelta(minutes=14))
         _sighting(db_session, vehicle, cameras[0], base)
         _sighting(db_session, vehicle, cameras[1], base + timedelta(minutes=7))
@@ -160,8 +153,7 @@ class TestRouteReconstruction:
         assert [hop["camera_code"] for hop in route] == ["RT-C0", "RT-C1", "RT-C2"]
 
     def test_consecutive_sightings_on_one_camera_collapse_into_one_hop(self, db_session):
-        """A vehicle recognized repeatedly at one junction is ONE hop with a
-        dwell time — not N hops between a camera and itself."""
+        """Seen repeatedly at one junction = ONE hop with a dwell time."""
         base = datetime(2026, 3, 1, 10, 21, 4)
         vehicle = _vehicle(db_session, "GJ05RT0002")
         camera_a = _camera(db_session, "RT-D1")
@@ -180,9 +172,7 @@ class TestRouteReconstruction:
         assert collapsed["reads_count"] == 6
 
     def test_a_genuine_return_to_a_camera_stays_a_separate_hop(self, db_session):
-        """Collapsing must only merge CONSECUTIVE rows. A vehicle that left and
-        came back really did pass that camera twice, and erasing that would
-        destroy real movement information."""
+        """Only consecutive rows merge. Leaving and coming back is two passes."""
         base = datetime(2026, 3, 1, 10, 0, 0)
         vehicle = _vehicle(db_session, "GJ05RT0003")
         camera_a = _camera(db_session, "RT-E1")
@@ -196,8 +186,7 @@ class TestRouteReconstruction:
         assert [hop["camera_code"] for hop in route] == ["RT-E1", "RT-E2", "RT-E1"]
 
     def test_hops_carry_the_coordinates_the_map_needs(self, db_session):
-        """The journey/map UI must not have to cross-reference /api/cameras per
-        hop to draw the route line."""
+        """The map doesn't need /api/cameras per hop to draw the route."""
         vehicle = _vehicle(db_session, "GJ05RT0004")
         camera = _camera(db_session, "RT-F1", lat=23.0225, lng=72.5714)
         _sighting(db_session, vehicle, camera, datetime(2026, 3, 1, 10, 0, 0))
@@ -210,8 +199,7 @@ class TestRouteReconstruction:
         assert hop["track_id"] == "284"
 
     def test_preserves_the_pre_v2_sighting_contract(self, db_session):
-        """schemas.SightingOut and every existing caller read these exact keys —
-        V2 adds fields, it must not rename the ones already relied on."""
+        """Existing keys stay; V2 only adds fields."""
         vehicle = _vehicle(db_session, "GJ05RT0005")
         camera = _camera(db_session, "RT-G1")
         _sighting(db_session, vehicle, camera, datetime(2026, 3, 1, 10, 0, 0))
@@ -243,8 +231,7 @@ class TestTrackUpsert:
         assert db_session.query(models.Track).filter(models.Track.camera_id == camera.id).count() == 1
 
     def test_the_same_track_id_on_another_camera_is_another_vehicle(self, db_session):
-        """ByteTrack ids are only unique per predictor and detector.py keeps one
-        per camera — keying on the id alone would merge two real vehicles."""
+        """Track ids are per camera; keying on id alone would merge two vehicles."""
         camera_a = _camera(db_session, "TRK-2")
         camera_b = _camera(db_session, "TRK-3")
         at = datetime(2026, 3, 1, 10, 0, 0)
@@ -254,8 +241,7 @@ class TestTrackUpsert:
         assert a.id != b.id
 
     def test_identity_is_added_but_never_cleared(self, db_session):
-        """A frame where the plate happened not to read must not un-identify a
-        vehicle already recognized on this track."""
+        """A frame where the plate didn't read doesn't un-identify the track."""
         camera = _camera(db_session, "TRK-4")
         vehicle = _vehicle(db_session, "GJ05TR0001")
         at = datetime(2026, 3, 1, 10, 0, 0)

@@ -1,12 +1,11 @@
-"""Camera retirement, and camera status being true at boot.
+"""Camera retirement, and camera status being right at boot.
 
-Retirement exists because a camera with history cannot be deleted (409: it
-would orphan evidence and incidents), and the only other option — disconnect —
-did not survive a restart: startup resumed every video_file camera, so the two
-synthetic demo cameras came back running AI after every reboot.
+A camera with history can't be deleted (409), and disconnecting didn't
+survive a restart since startup resumed every video_file camera, so the demo
+cameras came back running AI after every reboot.
 
-The boot reconciliation exists because a hard restart left cameras "online" in
-the database with no worker behind them; measured: "4/34 online", 2 running.
+Boot reconciliation: a hard restart left cameras "online" with no worker
+("4/34 online", 2 running).
 """
 import uuid
 
@@ -124,8 +123,7 @@ def test_only_an_administrator_can_retire(client, db_session):
 
 
 def test_boot_marks_every_camera_offline_until_a_worker_reports(db_session):
-    """A hard kill leaves `online` rows with nothing running. At boot nothing
-    is running yet, so offline is the only true status."""
+    """At boot nothing is running yet, so offline is the only true status."""
     online = _camera(db_session, status="online")
     degraded = _camera(db_session, status="degraded")
     main._mark_all_cameras_offline(db_session)

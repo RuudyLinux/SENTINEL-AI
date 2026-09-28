@@ -1,7 +1,7 @@
 """Tokens in URLs must never reach a log line (see app/log_redaction.py)."""
 import logging
 
-from app import log_redaction, main  # noqa: F401 — importing main installs the filter
+from app import log_redaction, main  # noqa: F401 - importing main installs the filter
 
 
 def _render(logger_name: str, msg: str, *args) -> str:

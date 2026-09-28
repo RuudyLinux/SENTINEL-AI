@@ -15,8 +15,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=Fals
 
 
 def hash_password(password: str) -> str:
-    # bcrypt truncates at 72 bytes; enforced explicitly instead of via passlib
-    # (passlib's bcrypt backend-detection is broken on bcrypt>=4.1 as of this build).
+    # bcrypt truncates at 72 bytes. done by hand since passlib's backend
+    # detection breaks on bcrypt>=4.1
     return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
 
 
@@ -35,11 +35,9 @@ def create_access_token(user: models.User) -> str:
 
 
 def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.User]:
-    """Same JWT validation as get_current_user, usable outside the HTTP
-    Authorization-header/OAuth2PasswordBearer machinery — for the WebSocket
-    handshake (browsers can't attach a header there; the token travels as a
-    query parameter instead, see main.py's /ws). Returns None rather than
-    raising; the caller decides what "no valid user" means for its transport."""
+    """get_current_user's JWT check without the header machinery, for the
+    WebSocket handshake where the token comes as a query param (main.py /ws).
+    Returns None instead of raising; the caller decides what that means."""
     if not token:
         return None
     try:
@@ -49,12 +47,10 @@ def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.Us
             return None
     except JWTError:
         return None
-    # A resource token (see create_resource_token) is signed with the same
-    # secret and carries the same `sub`, so without this check it passed here
-    # as a full session token. Resource tokens travel in URLs (<img src>,
-    # opened links) where they end up in browser history and proxy logs, and
-    # a stream token lives an hour: anyone holding one had the whole API as
-    # that user, not one file or one camera. Only session tokens lack `scope`.
+    # Resource tokens use the same secret and `sub`, so without this one
+    # passed as a full session token. They sit in URLs (browser history, proxy
+    # logs) and stream tokens last an hour: holding one meant the whole API as
+    # that user. Only session tokens have no `scope`.
     if "scope" in payload:
         return None
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -86,21 +82,17 @@ def require_roles(*allowed_roles: str):
     return dependency
 
 
-# Every role that takes operational action on alerts, incidents and plate
-# reads. The Auditor is deliberately absent: seed.py defines it as
-# "Audit-log and compliance visibility", and an auditor who can dismiss the
-# alerts or close the incidents they are auditing is not an auditor.
+# Roles that act on alerts, incidents and plate reads. Not Auditor: an
+# auditor who can dismiss the alerts or close the incidents they audit isn't
+# an auditor.
 OPERATIONAL_ROLES = ("Administrator", "Control Room Operator", "Investigator", "Supervisor")
 require_operational_role = require_roles(*OPERATIONAL_ROLES)
 
 
-# --- Resource tokens (P0-E) ---------------------------------------------
-# Short-lived, scoped-to-one-resource signed tokens for the handful of
-# endpoints browsers hit via plain <img src>/<a href> navigation, which
-# can't attach an Authorization: Bearer header. The client fetches a token
-# via a normal authenticated (RBAC-checked) request first, then appends it
-# as `?token=` on the actual file/stream URL. Reuses the same JWT secret —
-# no new dependency, no server-side session state.
+# Resource tokens: short-lived and scoped to one resource, for URLs a browser
+# loads via plain <img src>/<a href> and can't send a bearer header with. The
+# client gets one from a normal authenticated request and adds ?token=. Same
+# JWT secret, no server-side state.
 
 def create_resource_token(resource: str, resource_id: str, user: models.User, ttl_seconds: int) -> str:
     expire = datetime.utcnow() + timedelta(seconds=ttl_seconds)
@@ -124,12 +116,9 @@ def get_user_from_resource_token(resource: str, resource_id: str, token: str, db
 
 
 def resource_token_expiry(token: str) -> "datetime | None":
-    """When this resource token stops being valid, or None if it cannot be read.
-
-    A token's `exp` is enforced at the moment it is presented, which is enough
-    for a request that returns immediately. A long-lived response — an MJPEG
-    stream held open for hours — is authorized once and then never checked
-    again, so the caller needs the deadline to stop at.
+    """When this resource token expires, or None if it can't be read. exp is
+    checked when a token is presented, but a long response like an MJPEG
+    stream is authorized once, so the caller needs the deadline to cut it off.
     """
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])

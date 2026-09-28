@@ -18,13 +18,10 @@ def list_watchlist(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """In-force entries by default; `include_inactive=true` for the full history.
+    """In-force entries by default, include_inactive=true for everything.
 
-    This listed every row regardless of `active` or `valid_until`, so a
-    deactivated or expired entry stayed on the watchlist page looking exactly
-    like a live one — same identifier, same priority, same Deactivate button,
-    no indication it was already off. Deactivation appeared to do nothing.
-    The rows are still here for audit; they are no longer presented as in force.
+    Listing every row made a deactivated or expired entry look exactly like a
+    live one, so Deactivate seemed to do nothing. The rows are kept for audit.
     """
     q = watchlist.entries_in_force(db) if not include_inactive else db.query(models.WatchlistEntry)
     if entity_type:
@@ -40,21 +37,14 @@ def create_watchlist_entry(
 ):
     """Add one entity to the watchlist.
 
-    Refuses a second IN-FORCE entry for the same (entity_type, identifier).
-    Found by clicking SAVE three times against the running system: three
-    identical in-force entries for one plate. The extra rows are not the real
-    failure — what they do to Deactivate is. `plate_entry_in_force` takes
-    `.first()`, so removing one of three identical entries leaves the plate
-    exactly as watchlisted as before: the operator performs the documented
-    removal, watches the vehicle stay flagged, and has nothing on screen that
-    explains why. This codebase already fixed the mirror image of that once
-    (a stale `watchlist_flag` surviving deactivation).
+    409 if an in-force entry for the same (entity_type, identifier) exists.
+    Clicking SAVE three times made three, and since plate_entry_in_force takes
+    .first(), deactivating one left the plate just as flagged, with nothing on
+    screen to say why.
 
-    409 naming the existing entry rather than silently de-duplicating: the
-    operator may have meant to change the priority or reason, and quietly
-    discarding that input would hide it from them. A deactivated or expired
-    entry does not block a new one — re-adding a plate that was removed, or
-    whose watch period lapsed, is ordinary work.
+    409 naming the existing entry rather than silently merging, since the
+    operator may have wanted a different priority or reason. Deactivated or
+    expired entries don't block re-adding.
     """
     identifier = normalize_plate(payload.identifier) if payload.entity_type == "plate" else payload.identifier
     existing = watchlist.entries_in_force(db).filter(
@@ -75,14 +65,10 @@ def create_watchlist_entry(
     )
     db.add(entry)
     if payload.entity_type == "plate":
-        # Recomputed rather than set to True: an entry created with a
-        # `valid_until` already in the past is not in force, and must not flag
-        # the vehicle as though it were.
-        #
-        # The flush is required, not decorative: SessionLocal is built with
-        # autoflush=False (app/db.py), so without it the recompute below runs
-        # against a database that cannot see the entry just added, concludes
-        # nothing is in force, and leaves the vehicle unflagged.
+        # Recomputed, not just True: an entry with valid_until already past
+        # isn't in force.
+        # The flush is needed, SessionLocal has autoflush=False, so the
+        # recompute wouldn't see the new entry and would leave it unflagged.
         db.flush()
         vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == identifier).first()
         if vehicle:
@@ -100,13 +86,10 @@ def deactivate_entry(entry_id: str, db: Session = Depends(get_db), user: models.
         raise HTTPException(status_code=404, detail="Entry not found")
     entry.active = False
     if entry.entity_type == "plate":
-        # The vehicle's cached flag must follow the entry it was derived from.
-        # Without this, deactivation removed the entry but left the vehicle
-        # flagged permanently — still shown as "⚠ WATCHLIST" everywhere, still
-        # having snapshot evidence captured of it. Recomputed, not cleared:
-        # a second, still-in-force entry for the same plate keeps the flag set.
-        # Flushed first for the same reason as the create path: autoflush=False
-        # means the recompute would otherwise still see this entry as active.
+        # The cached flag has to follow the entry. Without this a deactivated
+        # plate stayed "⚠ WATCHLIST" everywhere and kept getting snapshots.
+        # Recomputed, not cleared: another in-force entry keeps it set. Flush
+        # first, same autoflush=False reason as create.
         db.flush()
         vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == entry.identifier).first()
         if vehicle:

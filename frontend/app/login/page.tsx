@@ -12,15 +12,13 @@ export default function LoginPage() {
   const [department, setDepartment] = useState("HQ");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  // A brief, one-time transition on success rather than an instant jump —
-  // the router.push itself still fires immediately; this only covers the
-  // form's own visual state in the moment before the route changes.
+  // short transition on success; router.push still fires right away, this
+  // only covers the form in the moment before the route changes
   const [success, setSuccess] = useState(false);
-  // Which backend this dashboard is actually pointed at. Checked once, here,
-  // because login is the first request anyone makes — if NEXT_PUBLIC_API_BASE
-  // resolves to another application (port 8000 is contested on a dev machine)
-  // the operator otherwise sees only "Login failed" and has no way to tell a
-  // wrong password from a wrong server.
+  // Which backend this dashboard really talks to, checked here since login is
+  // the first request. If NEXT_PUBLIC_API_BASE hits some other app (port 8000
+  // is contested on dev machines) all you'd see is "Login failed", no way to
+  // tell a wrong password from a wrong server.
   const [preflight, setPreflight] = useState<ApiPreflight | null>(null);
 
   useEffect(() => {
@@ -52,10 +50,9 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-ink px-4">
       <div className="w-full max-w-sm">
-        {/* Smart Shield branding — shows the project's own shield mark
-            (app/icon.svg) unless NEXT_PUBLIC_BRAND_LOGO_URL points at a real
-            logo (see public/branding/README.md).
-            object-contain: never stretched, aspect ratio always preserved. */}
+        {/* shield mark (app/icon.svg) unless NEXT_PUBLIC_BRAND_LOGO_URL points
+            at a real logo (public/branding/README.md). object-contain, never
+            stretched. */}
         <div className="text-center mb-8 animate-scale-in">
           <BrandLogo size={64} className="mx-auto" />
           <div className="text-2xl font-bold tracking-wide mt-4">SENTINEL VISION</div>
@@ -70,11 +67,8 @@ export default function LoginPage() {
           className="bg-panel border border-border rounded-lg p-6 space-y-4 animate-slide-up"
           style={{ animationDelay: "80ms" }}
         >
-          {/* htmlFor/id: these labels were visually adjacent to their inputs but
-              not programmatically associated with them, so a screen reader
-              announced two unlabelled text boxes. autoComplete lets a password
-              manager fill them, which matters for an account an operator uses
-              at the start of every shift. */}
+          {/* htmlFor/id so a screen reader doesn't hear two unlabelled boxes;
+              autoComplete so a password manager can fill them at shift start */}
           <div>
             <label htmlFor="login-username" className="text-xs text-slate-400">
               Police ID / Username
@@ -119,11 +113,9 @@ export default function LoginPage() {
               <option>Rajkot</option>
             </select>
           </div>
-          {/* Shown above the credential error on purpose: when the API base is
-              wrong, "Login failed" is a true but useless message, and the
-              cause is here. Login is not disabled — the check could itself be
-              wrong (a proxy, a cold start), and blocking the form on a
-              diagnostic would be worse than the problem it reports. */}
+          {/* above the credential error on purpose: with a wrong API base
+              "Login failed" is true but useless. Login isn't disabled though,
+              the check itself can be wrong (proxy, cold start). */}
           {preflight && preflight.status !== "ok" && (
             <div className="text-xs text-medium bg-medium/10 border border-medium/30 rounded px-3 py-2 animate-slide-up flex gap-2">
               <PlugZap size={14} strokeWidth={2.25} className="shrink-0 mt-px" />
@@ -146,10 +138,8 @@ export default function LoginPage() {
           <div className="text-center text-xs text-slate-500">
             Demo accounts: admin / operator1 / investigator1 / auditor1 — password: sentinel123
           </div>
-          {/* The port this build was compiled against. NEXT_PUBLIC_* values are
-              inlined at BUILD time, so when this is wrong a restart will not
-              fix it — only a rebuild will, and printing it is what makes that
-              diagnosable at all. */}
+          {/* the port this build was compiled with. NEXT_PUBLIC_* is inlined
+              at build time, so a wrong one needs a rebuild, not a restart */}
           <div className="text-center text-[10px] text-slate-600 break-all">API: {API_BASE}</div>
         </form>
       </div>

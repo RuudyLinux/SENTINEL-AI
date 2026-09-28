@@ -28,9 +28,18 @@ const BULK_BUTTONS: { action: BulkAction; label: string; icon: typeof Wifi }[] =
   { action: "disconnect", label: "Disconnect", icon: WifiOff },
 ];
 
-// Fallback only — the real source of truth is GET /api/cameras/bulk/disruptive-actions
-// (see below), fetched once so this page can never silently diverge from the
-// backend's own classification of which actions need a confirmation dialog.
+// "ing" glued onto the action name gave "START AIING" and "STOPING"
+const PROGRESS_LABEL: Record<BulkAction, string> = {
+  connect: "Connecting",
+  start: "Starting",
+  start_ai: "Starting AI on",
+  restart: "Restarting",
+  stop: "Stopping AI on",
+  disconnect: "Disconnecting",
+};
+
+// fallback only; the real list comes from GET /api/cameras/bulk/disruptive-actions
+// below, so this page can't drift from the backend
 const DEFAULT_DISRUPTIVE = new Set<BulkAction>(["restart", "disconnect", "stop"]);
 
 const DISRUPTIVE_COPY: Record<string, string> = {
@@ -163,7 +172,7 @@ export default function CameraControlCenterPage() {
       {progress && (
         <div className="border border-border rounded-lg bg-panel p-4 space-y-2 animate-fade-in">
           <div className="flex items-center justify-between text-sm">
-            <span className="font-medium text-slate-100">{progress.action.replace(/_/g, " ").toUpperCase()}ING CAMERAS</span>
+            <span className="font-medium text-slate-100">{(PROGRESS_LABEL[progress.action] ?? progress.action).toUpperCase()} CAMERAS</span>
             <span className="text-slate-400">{progress.completed} / {progress.total} completed</span>
           </div>
           <div className="h-2 bg-panel2 rounded-full overflow-hidden">
@@ -267,11 +276,9 @@ export default function CameraControlCenterPage() {
   );
 }
 
-/** Per-camera "..." action menu — owns its own open/busy state so a double
- * click can't fire the same action twice (menu closes as soon as the
- * request starts, button disabled until it resolves), and closes itself on
- * an outside click (audit finding: previously stayed open until another
- * menu item was clicked). */
+/** Per-camera "..." menu. Owns its open/busy state so a double click can't
+ * fire an action twice (closes when the request starts, disabled until it
+ * resolves), and closes on an outside click. */
 function RowActionsMenu({
   camera, canControl, onAction,
 }: { camera: Camera; canControl: boolean; onAction: (action: BulkAction) => Promise<void> }) {
@@ -300,9 +307,8 @@ function RowActionsMenu({
 
   return (
     <div ref={containerRef} className="relative inline-block">
-      {/* p-1 around a 15px icon is a 23px target — one pixel under the WCAG
-          2.5.8 minimum, and this is the ONLY way to reach every per-camera
-          action on this screen. p-1.5 makes it 27px. */}
+      {/* p-1 around a 15px icon is 23px, one under WCAG 2.5.8, and this is the
+          only way to reach the per-camera actions. p-1.5 = 27px. */}
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={!canControl || busy}

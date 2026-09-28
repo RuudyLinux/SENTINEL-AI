@@ -1,45 +1,28 @@
-"""Dedicated license-plate detection inside an already-detected vehicle crop.
+"""License-plate detection inside a vehicle crop.
 
-Supersedes the single-box `plate_detect.locate_plate` (kept as a thin
-compatibility shim). Three things this adds that the pipeline needs:
+Replaces plate_detect.locate_plate (kept as a shim). What it adds:
 
-1. **Several candidate regions, not one.** A vehicle crop can legitimately
-   contain more than one plate-shaped region — the plate, a dealer sticker, a
-   bumper reflector strip. Returning only the top-scoring one means a wrong
-   pick is unrecoverable; returning a ranked list lets the caller read the best
-   and fall back.
+- Several ranked candidates, not one. A crop can hold a plate, a dealer
+  sticker and a reflector strip; with only the top box a wrong pick can't be
+  recovered.
+- Confidence with its source. A YOLO model gives a probability, the
+  classical localizer a geometric plausibility score. Different things, so
+  every box has `source` ("model" | "heuristic") and the two are never
+  compared or averaged.
+- A quad as well as the axis-aligned box, so plate_preprocess can warp an
+  off-axis plate front-on. The box is what's stored and drawn.
 
-2. **An explicit confidence AND its provenance.** A YOLO plate model's
-   confidence is a model probability. The classical localizer's is a geometric
-   plausibility score. Those are not the same quantity and must never be
-   presented as if they were, so every box carries `source` ("model" or
-   "heuristic") alongside `confidence`. Nothing downstream may compare or
-   average the two.
+Order: the dedicated model (settings.plate_model_name) if its weights exist.
+Not bundled, never auto-downloaded; missing weights log once and fall
+through. Then classical CV: edge density plus morphological closing merges
+glyph strokes into one blob, filtered on plate geometry (aspect, size,
+position) and scored.
 
-3. **A quadrilateral, not just an axis-aligned box.** A plate seen off-axis is
-   a rotated quad; `cv2.minAreaRect` recovers it, and `plate_preprocess` warps
-   it front-on before OCR. The axis-aligned box is still reported, because that
-   is what gets stored and drawn.
-
-Detection strategy, in order:
-
-1. **A dedicated plate-detection model** (`settings.plate_model_name`), if
-   configured AND its weights exist on disk. Not bundled — this repo ships only
-   `yolov8n.pt` (COCO), which has no license-plate class. Configured-but-missing
-   weights are logged once and fall through to (2) rather than crashing a camera
-   worker or silently pretending to run. No model is ever auto-downloaded.
-
-2. **Classical CV localization** — no extra asset, works offline, and is a real
-   (if weaker) plate finder: edge density plus morphological closing joins the
-   glyph strokes of a plate into one blob, which is then filtered on the
-   geometry a real plate has (aspect ratio, relative size, vertical position)
-   and scored.
-
-If neither finds a plausible region the caller falls back to whole-crop OCR —
-exactly the pre-localization behavior. That fallback is deliberate: a
-localization miss must degrade the read, never drop it.
+Nothing found = the caller reads the whole crop. A localization miss should
+make the read worse, not drop it.
 """
 import logging
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -51,50 +34,39 @@ from ..config import BASE_DIR, settings
 
 logger = logging.getLogger("sentinel.plate_detector")
 
-# Real Indian single-row plates are ~500x120mm (aspect ~4.2); two-row plates and
-# oblique viewing angles push that down toward ~2.0. The ceiling is 8.0, not the
-# plate's own ~4.2, because morphological closing joins the CHARACTER STROKES,
-# not the plate border — the resulting blob is the text extent. A full 10-glyph
-# plate ("GJ05AB1234") is roughly 440x65mm of text, i.e. aspect ~6.8, so a 6.5
-# ceiling silently rejected correctly-detected full-length plates. Beyond 8.0 a
-# region is a bumper edge or shadow line, not text.
+# Indian single-row plates are ~500x120mm (aspect ~4.2), two-row plates and
+# oblique angles push it toward ~2.0. Ceiling is 8.0, not 4.2, because the
+# closing joins the character strokes, not the border, so the blob is the
+# text: a full GJ05AB1234 is ~440x65mm of text, aspect ~6.8, and 6.5 was
+# rejecting good full-length plates. Past 8.0 it's a bumper edge or shadow.
 MIN_ASPECT = 1.8
 MAX_ASPECT = 8.0
 IDEAL_ASPECT = 4.2
 
-# A plate occupies a small but not vanishing fraction of a vehicle crop. Below
-# the floor there are not enough pixels for OCR to read anyway; above the
-# ceiling the "plate" is really the whole vehicle face.
+# below the floor OCR can't read it anyway, above the ceiling it's the whole
+# front of the vehicle
 MIN_AREA_FRACTION = 0.004
 MAX_AREA_FRACTION = 0.30
 
-# Absolute pixel floor — OCR on a 20px-wide region returns noise, and passing it
-# on would burn OCR time to produce a read the quality gate then throws away.
+# OCR on a 20px-wide region is noise the gate throws away anyway
 MIN_PLATE_WIDTH_PX = 40
 MIN_PLATE_HEIGHT_PX = 12
 
-# How many candidate regions are ever returned. Bounded because each one the
-# caller actually reads costs a full OCR pass — the most expensive operation in
-# the camera loop.
+# each candidate the caller reads is a full OCR pass
 MAX_CANDIDATES = 3
 
 
 @dataclass(frozen=True)
 class PlateBox:
-    """One candidate plate region within a vehicle crop.
-
-    Coordinates are in the CROP's own space; the caller offsets them to
-    full-frame. `confidence` is only ever comparable to another box from the
-    same `source` — see the module docstring.
-    """
+    """Candidate plate region in crop coordinates (caller offsets to full
+    frame). confidence only compares with boxes of the same source."""
     x1: int
     y1: int
     x2: int
     y2: int
     confidence: float
     source: str  # "model" (a trained detector's probability) | "heuristic" (geometric score)
-    # Rotated corners, when the localizer recovered them. None from the model
-    # path, which reports axis-aligned boxes only.
+    # rotated corners if the localizer found them; the model path gives None
     quad: "list[list[float]] | None" = field(default=None)
 
     @property
@@ -109,23 +81,23 @@ class PlateBox:
         return [float(self.x1), float(self.y1), float(self.x2), float(self.y2)]
 
 
+# one plate model shared by every camera; the ultralytics predictor isn't
+# thread-safe, so predicts take turns
+_PLATE_MODEL_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=1)
 def get_plate_model():
-    """The optional dedicated plate detector.
-
-    Cached — and cached as None on every failure path — so a missing or broken
-    weights file costs one log line for the process lifetime rather than one per
-    frame per camera.
-    """
+    """Optional dedicated plate detector. Cached, and cached as None on any
+    failure, so a bad weights file costs one log line, not one per frame."""
     name = (settings.plate_model_name or "").strip()
     if not name:
         return None
-    # Resolved relative to the backend directory, matching how
-    # settings.model_name is resolved by ultralytics.
+    # relative to the backend dir, like model_name
     candidate = Path(name)
     if not candidate.is_absolute():
-        # BASE_DIR, not the database's folder: DB_PATH can live anywhere (the
-        # Docker volume, a test dir) and the weights are shipped with the backend.
+        # BASE_DIR not the DB folder: DB_PATH can be anywhere (docker volume,
+        # test dir), the weights ship with the backend
         candidate = BASE_DIR / name
     if not candidate.exists():
         logger.warning(
@@ -143,46 +115,37 @@ def get_plate_model():
 
 
 def heuristic_score(x: int, y: int, w: int, h: int, crop_w: int, crop_h: int) -> float:
-    """Geometric plausibility of a region being a plate, in 0..1.
+    """How plate-like a region looks, 0..1: aspect vs a real plate, how far
+    down the vehicle it sits, and size.
 
-    Combines three real, independent signals: how close the aspect ratio is to a
-    real plate, how far down the vehicle the region sits (plates are on the
-    bumper or boot, not the roof), and size (bigger reads better, up to the area
-    ceiling the caller already enforces).
-
-    This is a PLAUSIBILITY score, not a detection probability. It says "this
-    region is shaped and placed like a plate", which is a much weaker claim than
-    a trained detector's "this is a plate". `PlateBox.source` records which one
-    a caller is looking at so the two are never conflated.
+    Plausibility, not a detection probability ("shaped and placed like a
+    plate" is a much weaker claim than a trained detector's). PlateBox.source
+    keeps the two apart.
     """
     if h <= 0 or crop_h <= 0:
         return 0.0
     aspect = w / h
     aspect_score = 1.0 - min(1.0, abs(aspect - IDEAL_ASPECT) / IDEAL_ASPECT)
     vertical = (y + h / 2) / crop_h
-    # Peaks at 0.75 down the vehicle (typical plate height on a front/rear view)
-    # and falls off in both directions rather than hard-rejecting — a
-    # high-mounted plate on a truck should score lower, not be discarded.
+    # peaks 0.75 of the way down (usual plate height) and tapers both ways;
+    # a high-mounted truck plate scores lower instead of being rejected
     position_score = 1.0 - min(1.0, abs(vertical - 0.75) / 0.75)
     area_score = min(1.0, (w * h) / max(1.0, crop_w * crop_h * 0.06))
     return 0.5 * aspect_score + 0.3 * position_score + 0.2 * area_score
 
 
 def _detect_classical(crop: np.ndarray) -> list[PlateBox]:
-    """Edge-density + morphology plate finder. Returns candidates ranked by
-    geometric plausibility, highest first."""
+    """Edge density + morphology plate finder, best first."""
     crop_h, crop_w = crop.shape[:2]
     if crop_w < MIN_PLATE_WIDTH_PX or crop_h < MIN_PLATE_HEIGHT_PX:
         return []
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    # Bilateral filter smooths panel/paint noise while keeping the hard glyph
-    # and plate-border edges Canny needs.
+    # bilateral filter smooths paint noise but keeps glyph/border edges for Canny
     gray = cv2.bilateralFilter(gray, 11, 17, 17)
     edges = cv2.Canny(gray, 30, 200)
-    # A wide, short kernel joins the vertical strokes of adjacent characters into
-    # one horizontal blob — that blob is the plate. Sized relative to the crop so
-    # it works on both a distant small vehicle and a close large one.
+    # wide short kernel joins adjacent characters' vertical strokes into one
+    # blob, the plate. sized off the crop so near and far vehicles both work
     kernel_width = max(5, int(crop_w * 0.06) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 3))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
@@ -198,10 +161,8 @@ def _detect_classical(crop: np.ndarray) -> list[PlateBox]:
             continue
         if not (MIN_AREA_FRACTION <= (w * h) / crop_area <= MAX_AREA_FRACTION):
             continue
-        # The rotated rectangle recovers the plate's real orientation, which is
-        # what makes perspective correction possible downstream. Kept alongside
-        # the axis-aligned box rather than replacing it: the axis-aligned box is
-        # what gets stored and drawn on evidence.
+        # rotated rect gives the real orientation for perspective correction
+        # later. the axis-aligned box stays, that's what's stored and drawn
         quad = None
         try:
             rotated = cv2.minAreaRect(contour)
@@ -218,14 +179,14 @@ def _detect_classical(crop: np.ndarray) -> list[PlateBox]:
 
 
 def _detect_model(crop: np.ndarray) -> list[PlateBox]:
-    """Dedicated plate model inference. Empty list when no model is configured,
-    the weights are missing, or inference fails — every one of which falls
-    through to the classical path rather than failing the read."""
+    """Plate model inference. [] when there's no model, no weights, or it
+    fails; all of those fall through to the classical path."""
     model = get_plate_model()
     if model is None:
         return []
     try:
-        results = model.predict(crop, conf=settings.plate_detect_confidence, verbose=False)
+        with _PLATE_MODEL_LOCK:
+            results = model.predict(crop, conf=settings.plate_detect_confidence, verbose=False)
     except Exception:
         logger.exception("plate model inference failed — falling back to classical localization")
         return []
@@ -245,12 +206,11 @@ def _detect_model(crop: np.ndarray) -> list[PlateBox]:
 
 
 def detect_plates(vehicle_crop: np.ndarray) -> list[PlateBox]:
-    """Find candidate plate regions in a vehicle crop, best first.
+    """Candidate plate regions in a vehicle crop, best first.
 
-    The model path wins outright when it returns anything: mixing a trained
-    detector's boxes with geometric guesses would produce a candidate list whose
-    confidences mean two different things. Returns `[]` when no plausible region
-    exists, which the caller must treat as "read the whole crop", not "no plate".
+    If the model returns anything it wins outright; mixing its boxes with
+    geometric guesses would mix two meanings of confidence. [] means "read
+    the whole crop", not "no plate".
     """
     if vehicle_crop is None or vehicle_crop.size == 0:
         return []
@@ -258,12 +218,9 @@ def detect_plates(vehicle_crop: np.ndarray) -> list[PlateBox]:
 
 
 def crop_plate(vehicle_crop: np.ndarray, box: PlateBox) -> "np.ndarray | None":
-    """Cut a detected plate region out of the vehicle crop, with a small pad.
-
-    The pad exists because the localizer tends to hug the glyphs and clip the
-    first or last character's outer edge, which costs a real character in the
-    read. Padding is proportional so it scales with the plate's size in frame.
-    """
+    """Cut the plate out of the vehicle crop with a small proportional pad.
+    The localizer hugs the glyphs and tends to clip the first or last
+    character, which costs a character in the read."""
     if vehicle_crop is None or vehicle_crop.size == 0:
         return None
     crop_h, crop_w = vehicle_crop.shape[:2]
@@ -280,12 +237,8 @@ def crop_plate(vehicle_crop: np.ndarray, box: PlateBox) -> "np.ndarray | None":
 
 
 def quad_in_crop(box: PlateBox, vehicle_crop: np.ndarray) -> "list[list[float]] | None":
-    """Translate a box's quad into the padded plate crop's coordinate space.
-
-    `crop_plate` cuts the region out, so the quad's vehicle-crop coordinates no
-    longer describe it. Returns None when the box has no quad, so the caller
-    simply skips perspective correction.
-    """
+    """Box's quad in the padded plate crop's coordinates (crop_plate moved
+    the origin). None without a quad, then perspective correction is skipped."""
     if box.quad is None or vehicle_crop is None or vehicle_crop.size == 0:
         return None
     crop_h, crop_w = vehicle_crop.shape[:2]

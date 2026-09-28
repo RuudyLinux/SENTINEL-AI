@@ -16,14 +16,12 @@ def list_zones(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Active zones by default; `include_inactive=true` for the full history.
+    """Active zones by default, include_inactive=true for all.
 
-    DELETE /api/zones/{id} soft-deletes (sets active=False) and this returned
-    every row regardless, so a deleted zone stayed on the map and — worse —
-    stayed in the zone dropdown on the rules page. A rule attached to a
-    deleted zone never fires, because rules_engine only evaluates zones with
-    active=True, so the operator configures a control that silently does
-    nothing.
+    DELETE is a soft delete, and listing every row kept deleted zones on the
+    map and in the rules page dropdown. A rule on a deleted zone never fires
+    (rules_engine only looks at active zones), so it looked configured and
+    did nothing.
     """
     q = db.query(models.Zone)
     if not include_inactive:
@@ -37,16 +35,12 @@ def list_zones(
 def create_zone(payload: schemas.ZoneCreate, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Supervisor"))):
     """Create a zone on a camera.
 
-    Both checks below exist because the failures are silent or ugly:
+    Unknown camera_id: used to insert an orphan row, then with FKs on became
+    a 500 with a raw DB error. So 404.
 
-    * An unknown `camera_id` used to insert an orphan row; once SQLite foreign
-      keys were enforced it became an unhandled IntegrityError — a 500 with a
-      raw database error where the caller simply named a camera that is not
-      there.
-    * Coordinates are fractions of the frame, and `_bbox_center_in_zone` tests
-      `x1 <= cx <= x2`. An inverted or out-of-range box therefore matches
-      nothing at all: the zone is created, is listed, looks configured, and
-      can never fire.
+    Coordinates are frame fractions and _bbox_center_in_zone checks
+    x1 <= cx <= x2, so an inverted or out-of-range box matches nothing: the
+    zone exists, looks configured and can never fire. So 400.
     """
     if not db.query(models.Camera).filter(models.Camera.id == payload.camera_id).first():
         raise HTTPException(status_code=404, detail="Camera not found")

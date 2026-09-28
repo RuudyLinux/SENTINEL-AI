@@ -1,12 +1,10 @@
-"""Cameras near a point — PostGIS when the database has it, plain Python otherwise.
+"""Cameras near a point. PostGIS if available, plain Python otherwise.
 
-On PostgreSQL with PostGIS (the docker-compose deployment), migration
-20260928_0700 adds `cameras.geog`, a geography point generated from lat/lng
-with a GiST index, and the search is one indexed `ST_DWithin` query with
-distances from `ST_Distance` on the spheroid. SQLite (local development and the
-test suite) and PostgreSQL without the extension have no such column, and the
-same search runs as a haversine over the cameras that have a position. Both
-paths skip 0,0, which is how an unknown position is stored.
+On PostgreSQL + PostGIS (docker-compose) migration 20260928_0700 adds
+cameras.geog, a generated geography point with a GiST index, and the search
+is one ST_DWithin with ST_Distance on the spheroid. SQLite (dev, tests) and
+PostgreSQL without the extension do a haversine over cameras with a
+position. Both skip 0,0, the stored form of an unknown position.
 """
 import math
 
@@ -20,8 +18,8 @@ _postgis: "bool | None" = None
 
 
 def postgis_ready(db: Session) -> bool:
-    """Whether `cameras.geog` exists. Checked once per process: it only changes
-    with a migration, which needs a restart anyway."""
+    """Does cameras.geog exist. Checked once; it only changes with a
+    migration, which needs a restart anyway."""
     global _postgis
     if _postgis is None:
         bind = db.get_bind()

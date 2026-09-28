@@ -15,11 +15,9 @@ export default function WatchlistsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Rapid double-clicks used to fire the POST once per click. Measured against
-  // the running backend: three clicks on SAVE created three identical in-force
-  // watchlist entries for one plate. The backend now refuses the duplicate
-  // (409, see routers/watchlists.py) — this is the other half: the button
-  // reports that a submit is in flight instead of silently accepting more.
+  // Three clicks on SAVE made three identical in-force entries for one plate.
+  // The backend now 409s the duplicate (routers/watchlists.py); this shows a
+  // submit in flight instead of taking more clicks.
   async function create(e: React.FormEvent) {
     e.preventDefault();
     if (busy) return;

@@ -1,6 +1,5 @@
-"""Incident Investigator Summary (10/10 roadmap P10):
-GET /api/incidents/{id}/summary answers what/why/where/evidence/confidence
-in one call, from data the platform already computed elsewhere."""
+"""GET /api/incidents/{id}/summary: what/why/where/evidence/confidence in one
+call, from data already computed elsewhere."""
 import asyncio
 import uuid
 
@@ -75,7 +74,7 @@ class TestIncidentSummary:
         resp = client.get(f"/api/incidents/{incident.id}/summary", headers=auth)
         body = resp.json()
         assert len(body["evidence"]) >= 1
-        # Freshly captured, never verified yet — must not be claimed VERIFIED.
+        # just captured, never verified, so not VERIFIED
         assert body["evidence_fully_verified"] is False
 
     def test_unknown_incident_is_404(self, client, auth):

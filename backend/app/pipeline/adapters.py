@@ -1,26 +1,15 @@
-"""Camera/VMS adapter interface (Model 3 — VMS Federation/Middleware Layer).
+"""Camera/VMS adapters (Model 3, VMS federation layer).
 
-`CameraAdapter` is the common internal representation every camera/VMS source is
-normalized to before it ever reaches the AI pipeline (detector/ANPR/correlation/
-rules-engine code only ever talks to this interface, never to a specific vendor).
+Every source is wrapped in a CameraAdapter before the AI pipeline sees it, so
+detector/ANPR/rules code never deals with a vendor.
 
-Concrete adapters:
-- `WebcamAdapter` / `VideoFileAdapter` / `RTSPAdapter` — real, tested, used in
-  production by every camera in this build (logic moved verbatim from the old
-  monolithic `CameraSource`, see `source.py`'s backward-compat wrapper).
-- `MockVMSAdapter` — a real, working generic-VMS adapter that produces genuine
-  synthetic frames. Exists to prove the adapter boundary is actually pluggable
-  end-to-end (a "Generic VMS" can be wired in without touching detector/ANPR/
-  rules-engine code), not a stand-in for a specific vendor.
-- `ONVIFAdapter` — an honest interface stub. No real ONVIF device was available to
-  implement/test discovery, PTZ, or vendor-specific auth against in this build, so
-  `open()` fails loudly with `NotImplementedError` rather than pretending to work.
-  Per the project's own rule: never claim an integration that hasn't actually been
-  exercised against something real.
+- Webcam/VideoFile/RTSP: what every real camera here uses (source.py wraps them).
+- MockVMSAdapter: synthetic frames, to show a generic VMS plugs in end to end.
+- ONVIFAdapter: stub. No ONVIF device to test discovery, PTZ or auth against,
+  so open() raises NotImplementedError instead of pretending.
 
-Future vendor-specific VMS adapters (Milestone, Genetec, Hikvision CMS, ...) drop in
-here as additional `CameraAdapter` subclasses registered in `get_adapter()` — nothing
-elsewhere in the pipeline needs to change.
+A vendor VMS (Milestone, Genetec, Hikvision CMS...) would be another subclass
+registered in _ADAPTERS.
 """
 import os
 import time
@@ -32,15 +21,12 @@ import numpy as np
 
 from ..config import settings
 
-# Fail fast on a dead/unreachable RTSP endpoint instead of hanging the worker
-# thread indefinitely. No effect on webcam/video_file (ignored by those backends).
+# so a dead RTSP host doesn't hang the thread; webcam/file backends ignore it
 _OPEN_TIMEOUT_MS = 5000
 _READ_TIMEOUT_MS = 5000
 
 
 class CameraAdapter(ABC):
-    """Common interface every camera/VMS source is normalized to."""
-
     @abstractmethod
     def open(self) -> bool: ...
 
@@ -123,23 +109,50 @@ class VideoFileAdapter(CameraAdapter):
             self.cap = None
 
 
-class RTSPAdapter(CameraAdapter):
-    """RTSP transport (Phase 3): the official Gujarat sandbox requires TCP ("UDP
-    fails across NAT/firewalls" — its own resource docs). OpenCV's FFmpeg backend
-    has no per-VideoCapture-instance API for this; the documented mechanism is the
-    process-level `OPENCV_FFMPEG_CAPTURE_OPTIONS` environment variable, read by
-    FFmpeg's demuxer options parser on every `open()` call — set immediately before
-    each open, not once at import time."""
+class _GrabMixin:
+    """Live streams send frames faster than the camera loop uses them. grab()
+    decodes (unavoidable for H.264/HEVC), retrieve() converts to BGR, which is
+    about half the cost, so the reader only retrieves frames it will hand out."""
 
-    def __init__(self, source_uri: str):
+    def grab(self) -> bool:
+        return self.cap is not None and self.cap.grab()
+
+    def retrieve(self) -> "tuple[bool, np.ndarray | None]":
+        if self.cap is None:
+            return False, None
+        return self.cap.retrieve()
+
+
+class RTSPAdapter(_GrabMixin, CameraAdapter):
+    """transport: "tcp" or "udp", None = rtsp_force_tcp decides. The Gujarat
+    sandbox needs TCP ("UDP fails across NAT/firewalls"). OpenCV has no
+    per-capture option for it, only the process-wide
+    OPENCV_FFMPEG_CAPTURE_OPTIONS env var, read on each open(), so it's set
+    right before opening.
+
+    No lock around it: an open can hang for the whole open timeout, and a
+    lock made every other camera time out behind it (all 30 grid cameras
+    down). The race left is a UDP grid camera and a TCP camera opening at
+    the same instant, one of them getting the other's transport."""
+
+    def __init__(self, source_uri: str, transport: "str | None" = None):
         self.source_uri = source_uri
+        self.transport = transport
         self.cap: cv2.VideoCapture | None = None
         self.transport_forced_tcp = False
 
     def open(self) -> bool:
-        if settings.rtsp_force_tcp:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            self.transport_forced_tcp = True
+        transport = self.transport or ("tcp" if settings.rtsp_force_tcp else None)
+        options = []
+        if transport:
+            options.append(f"rtsp_transport;{transport}")
+        if transport == "udp":
+            # bigger socket buffer: fewer lost packets (grey smears in HEVC)
+            # when 30 streams arrive at once
+            options.append(f"buffer_size;{settings.rtsp_udp_buffer_bytes}")
+        if options:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(options)
+        self.transport_forced_tcp = transport == "tcp"
         self.cap = cv2.VideoCapture(self.source_uri, cv2.CAP_FFMPEG)
         try:
             self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, _OPEN_TIMEOUT_MS)
@@ -169,17 +182,12 @@ class RTSPAdapter(CameraAdapter):
 
 
 class SentinelGridAdapter(CameraAdapter):
-    """Real Sentinel Camera Grid RTSP adapter (final integration task). Delegates
-    actual capture to `RTSPAdapter` (same TCP-forcing, same timeouts) — one real
-    RTSP implementation, not two.
+    """Sentinel Camera Grid over RTSP, via RTSPAdapter.
 
-    `source_uri` here is the BARE grid camera id (e.g. "cam04"), never a URL —
-    the authenticated `rtsp://email:password@host:port/stream/<id>` URL is built
-    in memory, fresh, only inside `open()`, from `settings.sentinel_grid_*` (env
-    only). It is held only by the local `RTSPAdapter` instance for the lifetime
-    of the underlying `cv2.VideoCapture` — never stored on `self` beyond that,
-    never logged, never returned by any method here. The email is percent-encoded
-    (`@` -> `%40`) since it appears inside the URL's userinfo component."""
+    source_uri is the bare grid id (e.g. "cam04"). The credentialed
+    rtsp://email:password@host:port/stream/<id> URL is built from env settings
+    inside open() and only lives in the RTSPAdapter; never logged or returned.
+    Email is percent-encoded since it sits in the userinfo part."""
 
     def __init__(self, source_uri: str):
         self.grid_camera_id = source_uri
@@ -197,13 +205,21 @@ class SentinelGridAdapter(CameraAdapter):
             f"rtsp://{email}:{password}@{settings.sentinel_grid_rtsp_host}:"
             f"{settings.sentinel_grid_rtsp_port}/stream/{self.grid_camera_id}"
         )
-        self._rtsp = RTSPAdapter(url)
+        self._rtsp = RTSPAdapter(url, transport=settings.sentinel_grid_rtsp_transport or None)
         return self._rtsp.open()
 
     def read(self) -> "tuple[bool, np.ndarray | None]":
         if self._rtsp is None:
             return False, None
         return self._rtsp.read()
+
+    def grab(self) -> bool:
+        return self._rtsp is not None and self._rtsp.grab()
+
+    def retrieve(self) -> "tuple[bool, np.ndarray | None]":
+        if self._rtsp is None:
+            return False, None
+        return self._rtsp.retrieve()
 
     def pos_msec(self) -> "float | None":
         return self._rtsp.pos_msec() if self._rtsp else None
@@ -221,11 +237,9 @@ class SentinelGridAdapter(CameraAdapter):
 
 
 class MockVMSAdapter(CameraAdapter):
-    """Generic/dev VMS adapter — genuinely working, but synthetic. Proves a
-    "Generic VMS" can be plugged into the adapter boundary end-to-end (registered,
-    opened, read, fed through the real AI pipeline) without a real vendor backend.
-    Not a stand-in for any specific vendor's protocol; `source_uri` is unused beyond
-    optionally seeding the deterministic pattern."""
+    """Synthetic generic VMS: a moving box, fed through the real pipeline, to
+    show the adapter boundary works without a vendor backend. source_uri is
+    unused."""
 
     def __init__(self, source_uri: str):
         self.source_uri = source_uri
@@ -264,10 +278,7 @@ class MockVMSAdapter(CameraAdapter):
 
 
 class ONVIFAdapter(CameraAdapter):
-    """Interface stub only. No real ONVIF device (discovery, PTZ, vendor-specific
-    auth) was available to implement or test against in this build, so this fails
-    loudly rather than pretending to connect — never claim an integration that
-    hasn't actually been exercised against something real."""
+    """Stub. Nothing to test ONVIF against, so open() fails loudly."""
 
     def __init__(self, source_uri: str):
         self.source_uri = source_uri

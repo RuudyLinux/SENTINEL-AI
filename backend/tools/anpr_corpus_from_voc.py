@@ -1,42 +1,30 @@
-"""Convert Pascal VOC plate annotations into the ANPR benchmark's corpus layout.
+"""Convert Pascal VOC plate annotations into the ANPR benchmark corpus layout.
 
-`tools/anpr_bench.py` reads ground truth from the FILENAME (stem up to the
-first underscore). Real annotation tooling — CVAT, makesense.ai, LabelImg,
-and most published plate datasets — emits Pascal VOC XML instead, with the
-plate text in an `<attributes>` entry. This bridges the two, so labelled
-footage can be benchmarked without hand-renaming files.
+tools/anpr_bench.py takes ground truth from the filename (stem up to the
+first underscore). CVAT, makesense.ai, LabelImg and most plate datasets emit
+Pascal VOC XML with the text in <attributes>; this bridges them.
 
-Expected input layout (either directory naming works):
+Input (either naming works):
 
     <root>/images/*.jpg        or  <root>/JPEGImages/*.jpg
     <root>/annotations/*.xml   or  <root>/Annotations/*.xml
 
-Each XML `<object>` may carry the plate text as:
+Plate text per <object>:
 
     <attributes><attribute>
         <name>number_plate_text</name><value>GJ01DY6855</value>
     </attribute></attributes>
 
-Objects with no text attribute are skipped for the RECOGNITION corpus (they
-cannot score exact-match/CER without a label) but are still counted and
-reported, because "how many plates in this dataset are even transcribed" is
-itself something an honest benchmark has to state.
+Objects without text are skipped for the recognition corpus but counted and
+reported; how many plates are transcribed at all is part of the result.
 
-Why it crops rather than copying whole images
----------------------------------------------
-The live pipeline never hands OCR a full frame: `worker._run_anpr` passes a
-VEHICLE crop to `plate_detect.locate_plate`, which finds the plate inside it.
-Feeding a 2448x3264 phone photo straight in would measure something the
-system never does. So each labelled plate is exported as a region around the
-plate, expanded by `--context` (default 2.5x), which approximates the vehicle
-crop the localizer really receives — keeping BOTH stages under test.
+It crops instead of copying whole images because the live pipeline never
+gives OCR a full frame: worker._run_anpr passes a vehicle crop to
+plate_detect.locate_plate. Each plate is exported with --context (default
+2.5x) around it, roughly the vehicle crop the localizer gets, so both stages
+are tested. --tight exports just the plate box, OCR only; run both to tell
+"localizer missed" from "OCR misread".
 
-`--tight` instead exports the plate box alone, which isolates OCR by skipping
-localization. Running both and comparing is how you separate "the localizer
-missed it" from "the OCR misread it".
-
-Usage
------
     python tools/anpr_corpus_from_voc.py <root> --out tools/anpr_corpus
     python tools/anpr_corpus_from_voc.py <root> --out /tmp/tight --tight
 """
@@ -142,9 +130,8 @@ def main() -> int:
             if crop.size == 0:
                 continue
 
-            # A dataset can legitimately label the SAME plate in several
-            # images (or twice in one); each becomes its own corpus sample,
-            # disambiguated after the underscore so ground truth still parses.
+            # the same plate can be labelled in several images (or twice in
+            # one); each is its own sample, suffixed so ground truth parses
             seen[label] = seen.get(label, 0) + 1
             out_name = f"{label}_{stem}-{seen[label]}.jpg"
             cv2.imwrite(str(args.out / out_name), crop)

@@ -1,20 +1,12 @@
-"""Redis-backed runtime state, against a real Redis server.
+"""Redis-backed runtime state against a real Redis server.
 
-Everything test_runtime_state.py checks is the SHAPE of the interface using
-an in-process fake. This file exists because the shape was never the risky
-part — a dict with a clock is easy to get right. What actually needed
-proving is the property no in-process test can demonstrate at all: that two
-SEPARATE store instances, each with its own connection, pointed at the same
-Redis, genuinely share one claim table. That is simulated here with two
-Python-level instances (`store_a`, `store_b`) standing in for two OS
-processes — from Redis's point of view that is exactly what two processes
-talking to it look like, since nothing about `SET NX` cares which process
-issued the command.
+test_runtime_state.py covers the interface in-process. What needs a real
+server is that two separate store instances with their own connections share
+one claim table. store_a and store_b stand in for two processes; to Redis
+that's the same thing, SET NX doesn't care who sent it.
 
-Skipped, not failed, when no Redis is reachable: Redis is optional
-infrastructure (REDIS_URL empty is a fully supported deployment), so a
-checkout with no Redis running must still pass the ordinary suite. Run
-locally against a throwaway container:
+Skipped, not failed, without Redis (REDIS_URL empty is a supported setup).
+Locally:
 
     docker run -d --rm -p 6379:6379 redis:7-alpine
     pytest tests/test_runtime_state_redis.py -q
@@ -44,10 +36,8 @@ pytestmark = pytest.mark.skipif(not _reachable(), reason=f"no Redis reachable at
 
 @pytest.fixture
 def prefix():
-    """A fresh, unique key prefix per test — tests can run in any order or in
-    parallel against the same Redis without one test's keys colliding with
-    another's, and nothing needs cleaning up afterward beyond what TTLs
-    already handle."""
+    """Unique key prefix per test, so order and parallel runs don't collide
+    and TTLs handle cleanup."""
     return f"test:{uuid.uuid4().hex[:12]}"
 
 
@@ -59,9 +49,8 @@ def client():
 
 
 class TestClaimsAcrossTwoStoreInstances:
-    """Two instances standing in for two processes. If these disagree about
-    who holds a claim, a second worker would double-fire every alert — the
-    exact failure the in-process dict could not prevent."""
+    """Two instances as two processes. If they disagree on who holds a claim,
+    a second worker double-fires every alert."""
 
     def test_a_claim_made_by_one_instance_is_visible_to_the_other(self, client, prefix):
         store_a = RedisExpiringClaims(client, prefix)
@@ -105,9 +94,7 @@ class TestClaimsAcrossTwoStoreInstances:
             store_a.clear()
 
     def test_two_different_prefixes_never_collide(self, client, prefix):
-        """The alert cooldown and the self-heal dedup window share one Redis
-        in a real deployment; their prefixes are what keeps a key in one from
-        ever being read by the other."""
+        """Cooldown and self-heal dedup share one Redis; prefixes keep them apart."""
         store_alerts = RedisExpiringClaims(client, f"{prefix}:alerts")
         store_selfheal = RedisExpiringClaims(client, f"{prefix}:selfheal")
         try:
@@ -133,9 +120,8 @@ class TestClaimsAcrossTwoStoreInstances:
 
 
 class TestSlidingWindowAcrossTwoStoreInstances:
-    """The login rate limiter, proven the same way: two instances must agree
-    on the count, or an attacker routed to a different process never hits
-    the limit at all."""
+    """Login limiter: both instances agree on the count, or an attacker on
+    another process never hits the limit."""
 
     def test_events_recorded_by_one_instance_are_counted_by_the_other(self, client, prefix):
         window_a = RedisSlidingWindow(client, prefix)
@@ -185,16 +171,12 @@ class TestSlidingWindowAcrossTwoStoreInstances:
 
 
 class TestFailOpenOnRedisFailure:
-    """A store pointed at a port nothing is listening on — simulating Redis
-    being down mid-run, not merely unconfigured. The policy has to hold even
-    though nothing here mocks the client: a real connection attempt really
-    fails, exactly like production would see."""
+    """Pointed at a port with nothing listening, i.e. Redis down mid-run.
+    No mocking; a real connection really fails."""
 
     @pytest.fixture
     def unreachable_client(self):
-        # A real socket connect that will genuinely refuse/time out, not a
-        # mock standing in for one — the whole point is proving what happens
-        # against an actual failed connection.
+        # real refused/timed-out connect, not a mock
         return redis.Redis.from_url(
             "redis://localhost:1/0", socket_connect_timeout=0.3, socket_timeout=0.3,
         )
@@ -206,8 +188,8 @@ class TestFailOpenOnRedisFailure:
         )
 
     def test_a_repeated_claim_still_fails_open(self, unreachable_client, prefix):
-        """Nothing here should start raising after the first warning is
-        logged — the warning is one-shot, the fail-open behaviour is not."""
+        """Still no raising after the first warning; the warning is one-shot,
+        failing open isn't."""
         store = RedisExpiringClaims(unreachable_client, prefix)
         for _ in range(5):
             assert store.claim("k", 30.0) is True
@@ -228,8 +210,7 @@ class TestFailOpenOnRedisFailure:
 
 
 class TestBuildFactoriesAgainstARealServer:
-    """get_redis_client / build_claims_store, exercised against this real
-    Redis rather than only unit-tested with a fake settings object."""
+    """get_redis_client / build_claims_store against the real server."""
 
     def test_build_claims_store_returns_a_redis_backed_instance_when_reachable(self, monkeypatch):
         import app.runtime_state as rs

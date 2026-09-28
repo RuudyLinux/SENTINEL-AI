@@ -1,10 +1,6 @@
-"""10/10 debugging pass — active JWT attack-surface probing (not just the
-happy-path auth tests elsewhere). Every case here is a real attempt to break
-`security.get_user_from_token`/`get_current_user` with a specific, named
-attack, not a generic "auth works" smoke test. All six PASS against the
-existing implementation — recorded as "attacked, no bug found", per the
-debugging pass's own rule that a clean result must be demonstrated, not
-assumed.
+"""Trying to break get_user_from_token/get_current_user with specific JWT
+attacks, beyond the happy-path auth tests. All pass against the current
+code; kept so a clean result is shown, not assumed.
 """
 import base64
 import json
@@ -35,9 +31,8 @@ def test_malformed_token_is_rejected(client):
 
 
 def test_wrong_signature_is_rejected(client, admin_user):
-    """A token whose payload looks valid but was signed with a DIFFERENT
-    secret — the exact shape of a forged token an attacker without the real
-    JWT_SECRET would have to produce."""
+    """Valid-looking payload signed with a different secret, i.e. what a
+    forger without JWT_SECRET would produce."""
     forged = jwt.encode(
         {"sub": admin_user.id, "exp": datetime.utcnow() + timedelta(hours=1)},
         "attacker-guessed-secret", algorithm=settings.jwt_algorithm,
@@ -47,11 +42,8 @@ def test_wrong_signature_is_rejected(client, admin_user):
 
 
 def test_alg_none_token_is_rejected(client, admin_user):
-    """The classic `alg: none` JWT attack — a token that claims to require no
-    signature verification at all. `jose.jwt.encode` itself refuses to
-    produce one (`ALGORITHMS.SUPPORTED` excludes "none"), so it is built by
-    hand here to prove the VERIFY side rejects it too, not just that this
-    library's own signer is safe."""
+    """alg: none. jose won't encode one, so it's built by hand to show the
+    verify side rejects it too."""
     header = _b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
     payload = _b64url(json.dumps({
         "sub": admin_user.id, "exp": (datetime.utcnow() + timedelta(hours=1)).timestamp(),
@@ -62,10 +54,8 @@ def test_alg_none_token_is_rejected(client, admin_user):
 
 
 def test_wrong_algorithm_is_rejected(client, admin_user):
-    """A validly-signed token, but with HS512 instead of the configured
-    HS256 (`settings.jwt_algorithm`) — `jwt.decode`'s `algorithms=[...]`
-    allowlist must reject an otherwise-valid signature using an algorithm
-    the server never agreed to accept."""
+    """Validly signed with HS512 instead of the configured HS256; the
+    algorithms allowlist must reject it."""
     token = jwt.encode(
         {"sub": admin_user.id, "exp": datetime.utcnow() + timedelta(hours=1)},
         settings.jwt_secret, algorithm="HS512",
@@ -75,9 +65,7 @@ def test_wrong_algorithm_is_rejected(client, admin_user):
 
 
 def test_very_long_garbage_token_is_rejected_without_delay(client):
-    """Resource-exhaustion angle: an oversized, meaningless bearer value must
-    fail fast (decode error), not hang or consume unbounded resources trying
-    to parse it."""
+    """A huge junk bearer value fails fast, no hang."""
     import time
 
     huge = "A" * 200_000

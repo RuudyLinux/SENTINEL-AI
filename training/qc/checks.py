@@ -1,23 +1,17 @@
-"""Deterministic dataset quality-control checks.
+"""Deterministic dataset QC checks.
 
-Three severities, and the distinction between them is the whole design:
+Three severities:
+  ERROR    structurally invalid or fatal to an experiment, blocks the dataset
+  WARNING  suspicious, a human looks at it
+  INFO     worth noting, not a defect
 
-| severity  | meaning                                              | action |
-|-----------|------------------------------------------------------|--------|
-| `ERROR`   | structurally invalid or fatal to a valid experiment   | blocks the dataset |
-| `WARNING` | suspicious; a human must look                        | flagged for review |
-| `INFO`    | notable, not a defect                                 | recorded |
+Unusual plate strings are WARNING, never ERROR. Rejecting labels that fail
+the Indian format would drop the non-standard plates that were 5 of 10
+recognition failures in Phase 2 (handwritten, italic, bolt-obscured) and
+inflate every later accuracy number. KL34F and KL498262 in the current
+benchmark are real plates and stay.
 
-**Unusual plate strings are WARNING, never ERROR.** Auto-rejecting labels that
-fail the Indian registration format would delete exactly the non-standard plates
-Phase 2 measured as 5 of 10 recognition failures (handwritten, italic,
-bolt-obscured), and would quietly restrict the corpus to plates the system
-already reads — inflating every subsequent accuracy number. The two known
-non-conforming labels in the existing benchmark corpus (`KL34F`, `KL498262`) are
-real plates on real vehicles and belong in the data.
-
-Stdlib only: no numpy, no OpenCV, no backend imports. These checks must be
-runnable on an annotation workstation that has none of the inference stack.
+Stdlib only, runs on an annotation box without the inference stack.
 """
 from __future__ import annotations
 
@@ -35,17 +29,15 @@ from split import (
 
 ERROR, WARNING, INFO = "ERROR", "WARNING", "INFO"
 
-# Thresholds. Deliberately loose — these are review triggers, not truth.
+# thresholds, loose on purpose: they trigger review, they aren't truth
 MIN_PLATE_TEXT_LEN = 4
 MAX_PLATE_TEXT_LEN = 13
 MIN_GLYPH_PX = 8.0
 MIN_ASPECT, MAX_ASPECT = 1.2, 10.0
 
-# A well-formed Indian registration, used ONLY to raise a review flag. This is
-# intentionally a copy of the production pattern rather than an import: the
-# training tooling must not depend on the backend application, and — more
-# importantly — if the production grammar is ever tightened, a corpus must not
-# silently start failing QC because of a change made for a different purpose.
+# Well-formed Indian registration, only to raise a review flag. Copied, not
+# imported: training mustn't depend on the backend, and tightening the
+# production grammar for its own reasons shouldn't start failing corpus QC.
 _PLAUSIBLE_REGISTRATION = re.compile(r"^([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}|\d{2}BH\d{4}[A-Z]{1,2})$")
 
 
@@ -66,15 +58,14 @@ def _record_id(record: PlateRecord) -> str:
 
 
 def check_record(record: PlateRecord) -> list[Finding]:
-    """Per-record checks. Structural problems are ERROR; judgement calls are
-    WARNING."""
+    """Per-record checks: structural problems ERROR, judgement calls WARNING."""
     findings: list[Finding] = []
     rid = _record_id(record)
 
     def add(severity: str, code: str, message: str) -> None:
         findings.append(Finding(severity, code, message, rid))
 
-    # --- identifiers ---
+    # identifiers
     if not record.image_id.strip():
         add(ERROR, "missing_image_id", "image_id is empty")
     if not record.vehicle_id.strip():
@@ -84,13 +75,13 @@ def check_record(record: PlateRecord) -> list[Finding]:
         add(WARNING, "missing_camera_id",
             "camera_id is empty — per-camera evaluation and held-out-camera splits are impossible")
 
-    # --- timestamp ---
+    # timestamp
     if not record.timestamp.strip():
         add(WARNING, "missing_timestamp", "timestamp is empty")
     elif parse_timestamp(record.timestamp) is None:
         add(ERROR, "invalid_timestamp", f"timestamp is not ISO-8601: {record.timestamp!r}")
 
-    # --- bbox ---
+    # bbox
     x1, y1, x2, y2 = record.plate_bbox
     if x2 <= x1 or y2 <= y1:
         add(ERROR, "degenerate_bbox", f"plate_bbox has non-positive size: {record.plate_bbox}")
@@ -112,7 +103,7 @@ def check_record(record: PlateRecord) -> list[Finding]:
                 f"estimated glyph height {record.effective_glyph_px():.1f}px is below "
                 f"{MIN_GLYPH_PX}px — likely unreadable, keep only if deliberately sampled")
 
-    # --- plate text ---
+    # plate text
     text = record.plate_text
     if not ALLOWED_PLATE_CHARS.match(text):
         illegal = sorted({c for c in text if not c.isalnum() or c.islower()})
@@ -137,7 +128,7 @@ def check_record(record: PlateRecord) -> list[Finding]:
                 f"{text!r} is a valid ANNOTATION but not a well-formed Indian registration — "
                 "flag for human review; do NOT auto-correct or drop")
 
-    # --- enumerations ---
+    # enumerations
     if record.split and record.split not in VALID_SPLITS:
         add(ERROR, "unknown_split", f"split {record.split!r} not in {VALID_SPLITS}")
     if record.quality not in VALID_QUALITY:
@@ -148,7 +139,7 @@ def check_record(record: PlateRecord) -> list[Finding]:
         add(ERROR, "unknown_label_confidence",
             f"label_confidence {record.label_confidence!r} not in {VALID_LABEL_CONFIDENCE}")
 
-    # --- test-set hygiene ---
+    # test-set hygiene
     if record.split == "test" and record.label_confidence == "uncertain":
         add(ERROR, "uncertain_label_in_test",
             "an uncertain label cannot be ground truth — allowed in train, never in test")
@@ -167,7 +158,7 @@ def check_dataset(
     config = config or SplitConfig()
     findings: list[Finding] = []
 
-    # --- duplicate identifiers ---
+    # duplicate identifiers
     image_counts = Counter(r.image_id for r in records)
     for image_id, count in sorted(image_counts.items()):
         if count > 1:
@@ -191,12 +182,9 @@ def check_dataset(
                 ERROR, "duplicate_annotation",
                 f"{count} identical annotations for image {key[0]!r} vehicle {key[1]!r}"))
 
-    # --- near-duplicate frames within one vehicle ---
-    # Without pixels, "near-duplicate" is approximated by identical geometry at
-    # the same camera for the same vehicle: the same box, on the same camera, in
-    # several records is almost always consecutive frames of a stationary
-    # vehicle. Real perceptual hashing runs at crop-export time, where the
-    # images exist; this is the manifest-level tripwire.
+    # near-duplicate frames within one vehicle. Without pixels, same box on
+    # the same camera for the same vehicle is almost always consecutive frames
+    # of a stopped car. Real perceptual hashing happens at crop export.
     geometry: dict[tuple[str, str, tuple], list[str]] = defaultdict(list)
     for record in records:
         geometry[(record.vehicle_id, record.camera_id, tuple(record.plate_bbox))].append(record.image_id)
@@ -208,7 +196,7 @@ def check_dataset(
                 "identical bbox — likely near-duplicate frames; cap them so one stationary "
                 "vehicle does not dominate training"))
 
-    # --- leakage (the fatal class) ---
+    # leakage (the fatal class)
     for identity, splits in sorted(find_identity_leakage(records, config).items()):
         findings.append(Finding(
             ERROR, "cross_split_identity_leakage",
@@ -227,7 +215,7 @@ def check_dataset(
             f"({', '.join(sorted(vehicle_ids))}) — same vehicle labelled twice, or a genuine "
             "coincidence; a human must decide"))
 
-    # --- unassigned ---
+    # unassigned
     unassigned = [r for r in records if not r.split]
     if unassigned:
         findings.append(Finding(

@@ -1,9 +1,7 @@
 """Preprocessing variants and perspective correction.
 
-No GPU, no OCR engine, no camera: these operate on synthetic arrays and assert
-on shapes, invariants and configuration handling. What they cannot assert is
-whether a variant helps ACCURACY — that needs ground truth and lives in
-tools/anpr_bench.py.
+Synthetic arrays, no GPU/OCR/camera: shapes, invariants, config handling.
+Whether a variant helps accuracy needs ground truth (tools/anpr_bench.py).
 """
 import cv2
 import numpy as np
@@ -24,8 +22,7 @@ def _plate_crop(width: int = 200, height: int = 60) -> np.ndarray:
 
 class TestVariants:
     def test_the_default_configuration_produces_exactly_one_image(self, monkeypatch):
-        """The production default must cost ONE OCR pass. If this ever returns
-        more, every camera's OCR bill silently multiplies."""
+        """Default must cost ONE OCR pass, or every camera's OCR cost multiplies."""
         monkeypatch.setattr(settings, "plate_preprocess_variants", "clahe")
         variants = plate_preprocess.build_variants(_plate_crop())
         assert len(variants) == 1
@@ -42,8 +39,7 @@ class TestVariants:
     def test_the_original_variant_is_not_modified(self):
         crop = _plate_crop()
         (_, image), = plate_preprocess.build_variants(crop, variant_names=("original",))
-        # Upscaling may resize it, but the content must not be transformed —
-        # a 3-channel crop stays 3-channel.
+        # upscaling may resize it but a 3-channel crop stays 3-channel
         assert image.ndim == crop.ndim
 
     def test_thresholding_variants_are_binary(self):
@@ -56,8 +52,7 @@ class TestVariants:
         assert plate_preprocess.build_variants(np.zeros((0, 0, 3), dtype=np.uint8)) == []
 
     def test_variants_are_independent_images(self):
-        """A variant must not be a view onto another variant's buffer — an
-        in-place OCR preprocessing step would otherwise corrupt its siblings."""
+        """Variants don't share buffers; an in-place step would corrupt the others."""
         variants = plate_preprocess.build_variants(
             _plate_crop(), variant_names=("gray", "clahe", "otsu"),
         )
@@ -100,16 +95,15 @@ class TestUpscaling:
         assert upscaled.shape[1] == pytest.approx(120 * 3, abs=2)
 
     def test_a_crop_already_large_enough_is_untouched(self):
-        """Enlarging an already-readable crop costs time and adds no
-        information."""
+        """No point enlarging an already readable crop."""
         crop = _plate_crop(400, 120)
         assert plate_preprocess.upscale_for_ocr(crop, target_height=64) is crop
 
 
 class TestPerspectiveCorrection:
     def test_corners_are_ordered_clockwise_from_top_left(self):
-        """boxPoints returns corners in a rotation-dependent order; without
-        normalizing, some angles warp to a mirrored or rotated plate."""
+        """boxPoints order depends on rotation; unsorted corners warp to a
+        mirrored or turned plate."""
         scrambled = np.array([[100, 50], [0, 50], [100, 0], [0, 0]], dtype=np.float32)
         ordered = plate_preprocess.order_quad(scrambled)
         assert list(ordered[0]) == [0, 0]
@@ -124,14 +118,12 @@ class TestPerspectiveCorrection:
         assert warped is not None and warped.size > 0
 
     def test_a_degenerate_quad_returns_none_rather_than_a_smear(self):
-        """Collinear points cannot describe a plate; the caller must keep the
-        un-warped crop instead of handing OCR the result."""
+        """Collinear points aren't a plate; keep the unwarped crop."""
         collinear = [[0, 0], [1, 0], [2, 0], [3, 0]]
         assert plate_preprocess.four_point_transform(_plate_crop(), collinear) is None
 
     def test_a_square_on_axis_quad_is_not_worth_correcting(self):
-        """An axis-aligned box warps to approximately itself, so the transform
-        only costs resampling blur."""
+        """Near-axis-aligned boxes warp to themselves, only adding blur."""
         assert plate_preprocess.needs_perspective_correction(
             [[0, 0], [100, 0], [100, 40], [0, 40]]
         ) is False
@@ -145,8 +137,7 @@ class TestPerspectiveCorrection:
         assert plate_preprocess.needs_perspective_correction(None) is False
 
     def test_a_malformed_quad_is_refused_not_raised(self):
-        """A detector returning something unexpected must degrade the read, not
-        crash a camera worker."""
+        """Odd detector output degrades the read, no crash."""
         assert plate_preprocess.four_point_transform(_plate_crop(), [[0, 0], [1, 1]]) is None
         assert plate_preprocess.needs_perspective_correction("not a quad") is False
 

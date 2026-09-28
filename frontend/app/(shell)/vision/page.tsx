@@ -9,12 +9,9 @@ import SeverityBadge from "@/components/SeverityBadge";
 import EmptyState from "@/components/EmptyState";
 import ErrorState from "@/components/ErrorState";
 
-/** Live-stream status for the page header.
- *
- * Deliberately not `ConnectionBadge` — that reports a CAMERA's connection
- * lifecycle. This is the dashboard's own WebSocket, a different fact, and
- * conflating them would let a healthy-looking badge hide a dead feed.
- */
+/** Header status for the live stream. Not ConnectionBadge, that's a camera's
+ * connection; this is the dashboard's own websocket, and mixing them could
+ * let a healthy badge hide a dead feed. */
 function StreamStatus({ connected }: { connected: boolean }) {
   return (
     <span
@@ -28,7 +25,7 @@ function StreamStatus({ connected }: { connected: boolean }) {
   );
 }
 
-/** Operator-facing groupings, in the order they appear as filter chips. */
+/** Groupings, in filter chip order. */
 const FILTERS: { kind: FeedKind; label: string; icon: typeof Car }[] = [
   { kind: "sighting", label: "Plates", icon: ScanLine },
   { kind: "alert", label: "Alerts", icon: ShieldAlert },
@@ -43,12 +40,9 @@ function timeOf(item: FeedItem) {
   return Number.isNaN(date.getTime()) ? new Date(item.at) : date;
 }
 
-/** One row of the live stream.
- *
- * Alerts and watchlist hits are visually separated from routine detections
- * rather than merely coloured differently: an operator scanning a fast-moving
- * feed needs to find the actionable rows without reading them.
- */
+/** One row of the live stream. Alerts and watchlist hits are set apart, not
+ * just recoloured, so an operator scanning a fast feed finds them without
+ * reading every row. */
 function FeedRow({ item, onOpen }: { item: FeedItem; onOpen: (item: FeedItem) => void }) {
   const data = item.data ?? {};
   const isAlert = item.kind === "alert" || item.kind === "incident";
@@ -126,9 +120,8 @@ export default function LiveDetectionControlRoom() {
   const [active, setActive] = useState<FeedKind[]>(FILTERS.map((f) => f.kind));
   const { items, counts, connected, paused, setPaused, clear } = useLiveFeed();
 
-  // Camera state still comes from the API (it is state, not an event stream);
-  // the feed below is pure push. Polled slowly — the live stream carries the
-  // fast-moving part.
+  // camera state still comes from the API (state, not events), polled slowly;
+  // the feed below is pure push
   const { data: cameras, error: camerasError, reload } = useApiData<any[]>("/api/cameras", { pollMs: 15000 });
   const onlineCameras = (cameras || []).filter((c) => c.status === "online").length;
   const aiCameras = (cameras || []).filter((c) => c.grid_state === "PROCESSING").length;

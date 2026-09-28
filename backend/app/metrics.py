@@ -1,19 +1,12 @@
-"""Prometheus metrics for the detection pipeline and platform.
+"""Prometheus metrics for the pipeline and platform.
 
-Two sources, deliberately kept distinct:
+Counters/histograms are bumped where the thing happens (an OCR pass, a DB
+write). Gauges are sampled at scrape time from state that already exists
+(worker.CAMERA_STATS, worker.RUNNING, ws clients, psutil), so there's no
+second measurement path.
 
-**Counters/histograms** are incremented at the point the thing actually
-happens (an OCR pass returning a usable read, a DB write completing) — they
-measure events over time and only this module owns their definitions.
-
-**Gauges** are sampled at scrape time from state that already exists —
-`worker.CAMERA_STATS`, `worker.RUNNING`, the WebSocket manager's client list,
-psutil. Nothing new is computed or stored for them: the pipeline already tracks
-per-camera frame/inference latency for its own diagnostics endpoint, so mirroring
-it here costs a read, not a second measurement path.
-
-Registration is module-level and therefore process-global, matching how
-prometheus_client is designed to be used.
+Module-level registration, process-global, which is how prometheus_client
+expects it.
 """
 import logging
 
@@ -21,12 +14,10 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 
 logger = logging.getLogger("sentinel.metrics")
 
-# A dedicated registry rather than the global default: it keeps this app's
-# series separate from anything a library might register on its own, and makes
-# the exposition deterministic and testable.
+# own registry, so library metrics stay out and output is deterministic for tests
 REGISTRY = CollectorRegistry()
 
-# --- Pipeline throughput ---
+# pipeline throughput
 DETECTIONS_TOTAL = Counter(
     "sentinel_detections_total", "Object detections persisted.",
     ["camera_code", "cls"], registry=REGISTRY,
@@ -88,10 +79,8 @@ CAMERA_RECONNECTS = Counter(
     ["camera_code"], registry=REGISTRY,
 )
 
-# --- Latency ---
-# Buckets are chosen for what these operations really cost here: YOLO inference
-# on CPU lands in the hundreds of milliseconds, OCR similar, and a SQLite write
-# should be sub-10ms unless it is contending.
+# latency. buckets fit real costs here: CPU YOLO and OCR in the hundreds of
+# ms, a SQLite write under 10ms unless contended
 INFERENCE_SECONDS = Histogram(
     "sentinel_inference_seconds", "YOLO detection + tracking wall time per frame.",
     ["camera_code"], registry=REGISTRY,
@@ -109,13 +98,10 @@ PLATE_DETECT_SECONDS = Histogram(
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
 )
 
-# --- ANPR quality signals ---
-# Deliberately SEPARATE series. OCR confidence, plate-detection confidence and
-# cross-variant agreement measure different things, and a single blended "ANPR
-# score" would hide exactly the case this pipeline is built to catch: a
-# high-confidence read that nothing corroborates. None of these is an accuracy
-# measurement — accuracy requires ground truth, which only tools/anpr_bench.py
-# has.
+# ANPR quality. Separate series on purpose: OCR confidence, plate-detect
+# confidence and variant agreement are different things, and one blended
+# score would hide a confident read nothing backs up. None of these is
+# accuracy; that needs ground truth (tools/anpr_bench.py).
 OCR_CONFIDENCE = Histogram(
     "sentinel_ocr_confidence",
     "OCR confidence of gate-passing reads, as reported by the engine. NOT accuracy.",
@@ -147,7 +133,7 @@ DB_LOCK_RETRIES = Counter(
     registry=REGISTRY,
 )
 
-# --- Sampled gauges ---
+# sampled gauges
 CAMERAS_RUNNING = Gauge("sentinel_cameras_running", "Camera worker tasks currently running.", registry=REGISTRY)
 CAMERAS_BY_STATE = Gauge(
     "sentinel_cameras_by_state", "Cameras per connection-lifecycle state.", ["state"], registry=REGISTRY,
@@ -165,21 +151,15 @@ CAMERA_READ_MS = Gauge(
 PROCESS_CPU_PERCENT = Gauge("sentinel_process_cpu_percent", "Backend process CPU usage.", registry=REGISTRY)
 PROCESS_MEMORY_BYTES = Gauge("sentinel_process_memory_bytes", "Backend process resident memory.", registry=REGISTRY)
 
-# GPU memory is registered LAZILY, on the first scrape that finds a real CUDA
-# device — not at import. A prometheus_client Gauge starts exporting 0.0 the
-# moment it is registered, so declaring it up front would publish
-# `sentinel_gpu_memory_allocated_bytes 0.0` on every CPU-only host, which reads
-# as "a GPU that is idle" rather than "no GPU". Absence is the honest signal.
+# GPU memory is registered on the first scrape that finds CUDA, not at
+# import. A Gauge exports 0.0 as soon as it exists, and "gpu memory 0" on a
+# CPU-only host reads as an idle GPU instead of no GPU.
 _GPU_MEMORY_BYTES: "Gauge | None" = None
 
 
 def _sample_gauges() -> None:
-    """Refresh gauges from live state. Called at scrape time only.
-
-    Every failure here is contained: metrics must never be able to take down
-    the endpoint that reports on system health, and a partial scrape is far
-    more useful than a 500.
-    """
+    """Refresh gauges from live state, at scrape time. Every failure is
+    contained; a partial scrape beats a 500 from the health endpoint."""
     from .pipeline.worker import CAMERA_STATS, RUNNING
     from .ws import manager
 
@@ -201,9 +181,7 @@ def _sample_gauges() -> None:
         for stats in CAMERA_STATS.values():
             code = str(stats.get("camera_code") or "unknown")
             loop_gap = stats.get("loop_gap_ms_ema")
-            # FPS is derived from the real loop interval rather than the
-            # camera's advertised fps: what matters operationally is how fast
-            # frames are actually being processed, not what the source claims.
+            # fps from the real loop interval, not what the camera advertises
             if loop_gap:
                 CAMERA_FPS.labels(camera_code=code).set(1000.0 / loop_gap)
             if stats.get("inference_ms_ema") is not None:
@@ -235,8 +213,7 @@ def _sample_gauges() -> None:
                 )
             _GPU_MEMORY_BYTES.set(torch.cuda.memory_allocated())
     except Exception:
-        # No torch, no CUDA, or a driver problem — all mean "no GPU figure to
-        # report", which is exactly what never registering the series expresses.
+        # no torch/CUDA/driver: no series at all
         pass
 
 

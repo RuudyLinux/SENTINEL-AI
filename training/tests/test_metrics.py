@@ -1,12 +1,8 @@
-"""Recognition metrics, calibration, and paired comparison.
+"""Recognition metrics, calibration and paired comparison.
 
-`TestAgreementWithTheBackendBenchmark` is the important one: it pins this
-module's edit distance against the implementation that produced the 0.24 /
-0.3983 baseline, so the two definitions cannot drift apart unnoticed. Two
-definitions of CER is how a before/after comparison quietly stops being a
-comparison.
+TestAgreementWithTheBackendBenchmark matters most: it pins the edit distance
+to the one behind the 0.24 / 0.3983 baseline so the two can't drift.
 """
-import math
 
 import pytest
 
@@ -30,15 +26,12 @@ class TestEditDistance:
 
 
 class TestAgreementWithTheBackendBenchmark:
-    """The baseline 0.3983 CER was produced by `backend/tools/anpr_bench.py`. If
-    these two implementations ever disagree, every before/after comparison in
-    this project silently becomes invalid."""
+    """The 0.3983 baseline came from backend/tools/anpr_bench.py; if these
+    disagree every before/after comparison is invalid."""
 
     def _backend_levenshtein(self, a, b):
-        # Transcribed from backend/tools/anpr_bench.py::levenshtein. Copied
-        # rather than imported so this test does not drag the backend (and its
-        # torch/OpenCV import chain) into the training test run — the copy IS
-        # the thing under test.
+        # copied from backend/tools/anpr_bench.py::levenshtein, not imported,
+        # so this doesn't drag torch/OpenCV into the training tests
         if not a:
             return len(b)
         if not b:
@@ -89,8 +82,7 @@ class TestRecognitionMetrics:
         assert metrics.total_edits == 0
 
     def test_insertions_and_deletions_are_not_hidden(self):
-        """Phase 2's finding: 32 of 57 edits were insertions/deletions, which a
-        single CER number conceals entirely."""
+        """Phase 2: 32 of 57 edits were insertions/deletions, invisible in CER."""
         metrics = evaluate([("ABC", "AC"), ("AC", "ABC"), ("ABC", "ABD")])
         assert metrics.deletions == 1
         assert metrics.insertions == 1
@@ -103,8 +95,7 @@ class TestRecognitionMetrics:
         assert metrics.cer == 1.0
 
     def test_cer_can_exceed_one_for_an_over_long_read(self):
-        """Intended. A read that invents ten characters is worse than one that
-        reads nothing, and a metric capped at 1.0 would hide that."""
+        """Intended; ten invented characters is worse than nothing read."""
         metrics = evaluate([("AB", "ABCDEFGHIJ")])
         assert metrics.cer > 1.0
         assert metrics.character_accuracy == 0.0
@@ -176,8 +167,7 @@ class TestPairedComparison:
         assert result.significant
 
     def test_a_marginal_difference_is_not_significant(self):
-        """The case the acceptance rule exists for: a couple of extra correct
-        reads is not evidence of a better model."""
+        """A couple of extra correct reads isn't evidence of a better model."""
         truths = self._truths(50)
         baseline = {k: ("GJ05AB1234" if i < 12 else "WRONG") for i, k in enumerate(truths)}
         improved = {k: ("GJ05AB1234" if i < 14 else "WRONG") for i, k in enumerate(truths)}
@@ -185,9 +175,8 @@ class TestPairedComparison:
         assert not result.significant
 
     def test_mismatched_example_sets_are_refused(self):
-        """Comparing a model scored on 480 samples against one scored on 500 is
-        not a paired test, and silently intersecting them would produce a number
-        that looks valid and is not."""
+        """480 vs 500 samples isn't paired, and intersecting would give a
+        valid-looking wrong number."""
         truths = self._truths(10)
         a = {k: "X" for k in truths}
         b = {k: "X" for k in list(truths)[:8]}
@@ -216,8 +205,7 @@ class TestPairedComparison:
 
 class TestCalibration:
     def test_no_predictions_means_no_calibration_numbers(self):
-        """Refuses to invent a calibration result before real predictions
-        exist."""
+        """No calibration result before real predictions exist."""
         report = calibration([])
         assert report.bins == []
         assert report.samples == 0
@@ -233,9 +221,8 @@ class TestCalibration:
         assert calibration(outcomes).expected_calibration_error < 0.02
 
     def test_an_overconfident_system_is_detected(self):
-        """The failure mode that matters here: the production pipeline consumes
-        confidence to gate persistence and human review, so a model claiming 0.95
-        on reads that are right 50% of the time defeats both gates."""
+        """Production gates on confidence, so 0.95 claimed on reads right 50%
+        of the time defeats both gates."""
         outcomes = [(0.95, i % 2 == 0) for i in range(100)]
         report = calibration(outcomes)
         assert report.expected_calibration_error > 0.4
@@ -264,6 +251,5 @@ class TestNormalize:
         assert normalize(raw) == expected
 
     def test_normalization_does_not_repair_characters(self):
-        """The evaluator must measure what the model produced, not a tidied
-        version of it."""
+        """Measure what the model produced, not a tidied version."""
         assert normalize("GJO5AB1234") == "GJO5AB1234"

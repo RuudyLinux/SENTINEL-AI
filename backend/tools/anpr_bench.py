@@ -1,23 +1,19 @@
-"""ANPR benchmark harness — measure before replacing anything.
+"""ANPR benchmark: measure before replacing anything.
 
-The V2 brief asks whether EasyOCR should be replaced (e.g. by PaddleOCR). That
-question cannot be answered honestly without numbers on real frames, and the
-answer is very likely to change now that plate LOCALIZATION exists: pre-V2, OCR
-was handed a whole vehicle crop, so a large share of the failures were "the OCR
-engine was pointed at a car" rather than "the OCR engine is weak". Swapping
-engines before measuring that would attribute the localization win to the new
-engine.
+Should EasyOCR be swapped (e.g. for PaddleOCR)? Can't say without numbers on
+real frames, and plate localization changes the answer: pre-V2 OCR got a
+whole vehicle crop, so many failures were "OCR pointed at a car", not "weak
+OCR". Swapping engines first would credit the new engine with the
+localization win.
 
-This tool therefore compares CONFIGURATIONS, not just engines:
+So this compares configurations, not just engines:
 
     whole-crop + EasyOCR     (the pre-V2 pipeline)
     localized + EasyOCR      (V2 today)
     localized + <engine>     (a candidate, if installed)
 
-Usage
------
-Put labelled images in a corpus directory. The ground-truth plate is the
-filename stem, uppercase, non-alphanumerics stripped:
+Usage: put labelled images in a corpus dir. Ground truth is the filename stem,
+uppercased, non-alphanumerics stripped:
 
     corpus/
       GJ05AB1234.jpg          # a vehicle crop, or a full frame
@@ -26,17 +22,12 @@ filename stem, uppercase, non-alphanumerics stripped:
 
     python tools/anpr_bench.py corpus/ --json results.json
 
-What it reports
----------------
-Exact-match rate, character error rate, mean confidence, and wall time per
-image, per configuration. It deliberately does NOT print a verdict: a 3%
-accuracy gain that costs 4x the CPU is a different decision on a 30-camera
-box than on a workstation, and that trade is the operator's to make.
+Reports exact-match rate, character error rate, mean confidence and time per
+image, per configuration. No verdict: 3% more accuracy at 4x the CPU is a
+different call on a 30-camera box than on a workstation.
 
-Honesty note: with no corpus, this prints nothing and claims nothing. There is
-no bundled sample set — real Gujarat plate footage is not something this
-repository can ship, and synthetic images would produce a number that looks
-like evidence while measuring nothing.
+No corpus, no output. There's no bundled sample set; real Gujarat plates
+can't ship here and synthetic ones would give a number that measures nothing.
 """
 from __future__ import annotations
 
@@ -90,16 +81,14 @@ class Result:
     char_total: int = 0
     confidence_sum: float = 0.0
     seconds: float = 0.0
-    # Images in which plate LOCALIZATION found a region at all. Separate from
-    # whether the subsequent read was right: "the detector found nothing" and
-    # "the detector found it and OCR misread it" are different failures needing
-    # different fixes, and a single accuracy number hides which one you have.
+    # images where localization found any region. separate from whether the
+    # read was right: "found nothing" and "found it, misread it" need
+    # different fixes
     detected: int = 0
     detection_confidence_sum: float = 0.0
-    # Reads the QUALITY GATE accepted, and how many of those were wrong. The
-    # false-positive rate among accepted reads is the number that matters
-    # operationally: an accepted wrong read becomes a real Vehicle row and can
-    # raise a watchlist alert about a vehicle that was never there.
+    # reads the gate accepted, and how many were wrong. that's the number
+    # that matters: an accepted wrong read becomes a Vehicle row and can
+    # raise a watchlist alert for a car that was never there
     accepted: int = 0
     accepted_wrong: int = 0
     misses: list[tuple[str, str]] = field(default_factory=list)
@@ -137,23 +126,20 @@ class Result:
             # passes the quality gate and becomes a real vehicle record.
             "plausible_format_rate": round(self.plausible / n, 4),
             "character_error_rate": round(self.char_errors / max(1, self.char_total), 4),
-            # Character ACCURACY, stated explicitly so it is never confused with
-            # exact-match accuracy. 1 - CER, floored at 0 (CER can exceed 1 when
-            # a read is longer than the truth).
+            # character accuracy, 1 - CER floored at 0 (CER can go over 1 when
+            # the read is longer than the truth). not exact-match
             "character_accuracy": round(max(0.0, 1.0 - self.char_errors / max(1, self.char_total)), 4),
             "detection_success_rate": round(self.detected / n, 4),
             "mean_detection_confidence": round(self.detection_confidence_sum / max(1, self.detected), 4),
             # Of every image, how often a WRONG read was nonetheless accepted by
             # the quality gate.
             "false_positive_rate": round(self.accepted_wrong / n, 4),
-            # Of the reads the gate ACCEPTED, how many were wrong. The precision
-            # complement, and the honest answer to "if the system tells me it
-            # read a plate, how often is it right".
+            # of the reads the gate accepted, how many were wrong: "when it
+            # says it read a plate, how often is it right"
             "false_positive_rate_of_accepted": round(self.accepted_wrong / max(1, self.accepted), 4),
             "gate_acceptance_rate": round(self.accepted / n, 4),
-            # OCR confidence as the engine reported it. NOT accuracy, and not
-            # comparable to the rates above — kept adjacent precisely so the
-            # difference is visible.
+            # engine confidence, not accuracy; next to the rates so the
+            # difference is obvious
             "mean_ocr_confidence": round(self.confidence_sum / n, 4),
             "mean_seconds_per_image": round(self.seconds / n, 4),
         }
@@ -167,8 +153,7 @@ def _read_easyocr(image):
 
 
 def _read_paddleocr(image):
-    """Candidate engine. Returns None when PaddleOCR is not installed, so the
-    benchmark simply omits that row rather than failing or faking it."""
+    """Candidate engine, None without PaddleOCR so that row is just skipped."""
     try:
         from paddleocr import PaddleOCR
     except ImportError:
@@ -188,11 +173,9 @@ def _read_paddleocr(image):
 
 
 def _read_easyocr_with_fallback(image):
-    """The CURRENT pipeline strategy: read the localized region, and if that
-    read fails the quality gate, re-read the whole crop and keep the better of
-    the two (see anpr.better_read). Measured because "localized" alone was
-    found to REDUCE accuracy on real plates — this is the fix, so the
-    benchmark has to be able to score it."""
+    """Current pipeline: read the localized region and, if that fails the
+    gate, re-read the whole crop and keep the better (anpr.better_read).
+    Localized alone lost accuracy on real plates; this is the fix."""
     from app.pipeline.anpr import better_read, passes_anpr_gate, read_plate
     from app.pipeline import plate_detect
 
@@ -208,13 +191,10 @@ def _read_easyocr_with_fallback(image):
 
 
 def _read_multi_variant(image):
-    """The OPT-IN multi-variant recovery mode: read the crop through several
-    preprocessing variants and select by cross-variant agreement rather than by
-    confidence (see anpr.select_candidate).
-
-    Scored here so the trade is measurable rather than argued. It is NOT the
-    production default — each variant is a full extra OCR pass, and on this
-    corpus the exact-match difference is a single sample.
+    """Opt-in multi-variant mode: read several preprocessing variants and
+    pick by agreement, not confidence (anpr.select_candidate). Not the
+    default, each variant is a full OCR pass and on this corpus the exact
+    match moves by one sample.
     """
     variants = plate_preprocess.build_variants(
         image, quad=None, variant_names=plate_preprocess.RECOMMENDED_RECOVERY_VARIANTS,
@@ -229,10 +209,9 @@ CONFIGURATIONS = [
     # `localize=False` because this configuration does its OWN localization
     # internally (it needs the un-cropped image to fall back to).
     ("localized+fallback + easyocr", _read_easyocr_with_fallback, False),
-    # `localize=False`: multi-variant is a RECOVERY mode over the same image the
-    # production path reads, not a second localization strategy. Scoring it on a
-    # localized crop would measure localization's known weakness on this corpus
-    # (exact 0.08) rather than what the variants do.
+    # localize=False: multi-variant recovers on the same image production
+    # reads. on a localized crop it'd mostly measure localization's weakness
+    # here (exact 0.08)
     ("multi-variant (agreement) + easyocr", _read_multi_variant, False),
     ("localized + paddleocr", _read_paddleocr, True),
 ]
@@ -261,14 +240,10 @@ def run(corpus: Path) -> list[dict]:
                 print(f"skipping unreadable image {path.name}", file=sys.stderr)
                 continue
 
-            # Detection is measured for EVERY configuration, independently of
-            # whether that configuration reads the localized crop. "Did the
-            # detector find a plate region" and "did OCR then read it correctly"
-            # are different questions with different fixes, and a configuration
-            # that ignores localization still tells you the detector's hit rate
-            # on the same images. Measured OUTSIDE the timing window so a
-            # whole-crop configuration is not charged for localization it does
-            # not perform.
+            # Detection is measured for every config, whether or not it reads
+            # the localized crop: "found a region" and "read it right" are
+            # different questions. Outside the timing window so whole-crop
+            # configs aren't charged for localization they skip.
             boxes = plate_detector.detect_plates(frame)
             detected = bool(boxes)
             detection_confidence = boxes[0].confidence if boxes else 0.0
@@ -277,9 +252,7 @@ def run(corpus: Path) -> list[dict]:
             target = frame
             if localize:
                 located = plate_detect.locate_plate(frame)
-                # A localization miss falls back to the whole crop — exactly
-                # what the live pipeline does, so the measurement reflects real
-                # behavior rather than an idealized one.
+                # a miss falls back to the whole crop, same as live
                 if located is not None:
                     target = located[0]
             read, confidence = reader(target)

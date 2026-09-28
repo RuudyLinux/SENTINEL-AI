@@ -1,15 +1,9 @@
 """Prometheus scrape endpoint.
 
-Authenticated by default. Metrics here are operationally sensitive — how many
-cameras exist and are live, how many plates are being recognized, how many
-alerts are firing — so this is never open. Two accepted credentials:
-
-- **A scrape token** (`METRICS_TOKEN`), for Prometheus itself, which cannot
-  perform a JWT login. Compared in constant time.
-- **An Administrator JWT**, so an operator can read the same data from the app.
-
-With no token configured, only the Administrator JWT path works. There is no
-unauthenticated mode.
+Always authenticated, the numbers (live cameras, plate reads, alerts) are
+operationally sensitive. Either the METRICS_TOKEN scrape token (Prometheus
+can't do a JWT login; compared in constant time) or an Administrator JWT.
+No token configured = admin JWT only. No anonymous mode.
 """
 import hmac
 
@@ -30,9 +24,7 @@ def _token_matches(presented: str) -> bool:
     configured = (settings.metrics_token or "").strip()
     if not configured:
         return False
-    # Constant-time compare: a plain `==` on a secret leaks its length and a
-    # prefix through timing, and this endpoint is reachable by anyone who can
-    # reach the backend.
+    # constant time, == leaks length/prefix through timing
     return hmac.compare_digest(presented, configured)
 
 
@@ -43,9 +35,8 @@ def _authorize(authorization: str | None, db: Session) -> None:
     if _token_matches(presented):
         return
     user = get_user_from_token(presented, db) if presented else None
-    # Same role check `security.require_roles` performs; done inline because
-    # that helper is a FastAPI dependency and this endpoint must first give the
-    # scrape token a chance, which the dependency chain cannot express.
+    # same check as security.require_roles, inline because the scrape token
+    # has to get a chance first and a dependency can't express that
     if user is not None and (user.role.name if user.role else "") == "Administrator":
         return
     raise HTTPException(

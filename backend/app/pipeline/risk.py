@@ -1,13 +1,9 @@
 """Explainable 0-100 risk score.
 
-Deliberately NOT a machine-learned score. There is no trained risk model behind
-this system and inventing an opaque number would be exactly the kind of
-unfalsifiable AI claim the rest of this codebase refuses to make (see the
-appearance-similarity and ANPR-confidence handling for the same stance). This
-is a transparent weighted sum over signals the platform genuinely observed:
-every point in the total is attributable to a named factor with the real
-evidence behind it, so an operator — or a court — can ask "why 87?" and get a
-complete answer.
+Not machine-learned; there's no trained risk model, and an opaque number
+would be a claim nobody could check. It's a weighted sum over things the
+platform actually observed, and every point traces to a named factor with
+its evidence, so "why 87?" has a full answer:
 
     Risk 87/100 — HIGH
       +45  Watchlist match        plate GJ05AB1234, CRITICAL priority entry
@@ -16,17 +12,14 @@ complete answer.
       + 8  Multi-camera activity  observed by 4 cameras
       + 5  Night-time activity    02:41
 
-The weights below are a documented policing-priority judgement, not a measured
-quantity — they are stated openly here rather than hidden in a model file, and
-are the one thing to tune if an operator says the scores feel wrong.
+The weights are a policing-priority judgement, not a measurement. They're
+here in the open and are the thing to tune if scores feel off.
 """
 from dataclasses import dataclass
 from datetime import datetime
 
-# Maximum contribution of each factor. A factor never exceeds its cap and never
-# contributes negative points: the score answers "how much reason for concern
-# has accumulated", so a weak signal adds little, it does not subtract evidence
-# that genuinely exists.
+# Cap per factor. Never negative: the score is how much concern has built up,
+# so a weak signal adds a little rather than subtracting evidence that exists.
 WATCHLIST_POINTS = {"CRITICAL": 45, "HIGH": 40, "MEDIUM": 30, "LOW": 20}
 ZONE_POINTS = {"CRITICAL": 25, "HIGH": 20, "MEDIUM": 12, "LOW": 6}
 LOITERING_POINTS = 15
@@ -37,9 +30,8 @@ NIGHT_POINTS = 5
 PRIOR_INCIDENT_POINTS = 10
 RELATED_ALERTS_MAX = 10
 
-# Local clock hours treated as night-time. Offence rates and the operational
-# significance of an unexplained vehicle both rise outside working hours; this
-# is a policing judgement, stated rather than buried.
+# local hours counted as night. unexplained vehicles matter more outside
+# working hours; a judgement call, stated here
 NIGHT_START_HOUR = 22
 NIGHT_END_HOUR = 5
 
@@ -51,7 +43,7 @@ class RiskFactor:
     factor: str   # stable machine key, safe to filter/aggregate on
     label: str    # short human label for the UI
     points: int
-    detail: str   # the actual evidence — never a generic sentence
+    detail: str   # the actual evidence, never a generic sentence
 
     def as_dict(self) -> dict:
         return {"factor": self.factor, "label": self.label, "points": self.points, "detail": self.detail}
@@ -67,15 +59,15 @@ class RiskAssessment:
         return [f.as_dict() for f in self.factors]
 
     def explain(self) -> list[str]:
-        """Plain-text lines, in the same shape as the existing `Alert.reasons`
-        list, so the score can be shown anywhere reasons already are."""
+        """Plain-text lines shaped like Alert.reasons, so the score can go
+        wherever reasons are shown."""
         return [f"+{f.points} {f.label}: {f.detail}" for f in self.factors]
 
 
 @dataclass
 class RiskSignals:
-    """Everything the score is computed from. A signal left at its default is
-    genuinely absent — never a stand-in for 'unknown'."""
+    """Everything the score uses. A default value means the signal is
+    absent, not unknown."""
     watchlist_priority: str | None = None      # entry priority if this vehicle is watchlisted
     plate_text: str = ""
     zone_severity: str | None = None           # severity of a restricted zone actually entered
@@ -83,12 +75,10 @@ class RiskSignals:
     camera_code: str = ""
     loitering_seconds: float | None = None     # dwell that breached a loitering rule
     plate_confidence: float = 0.0
-    # Whether the plate read was corroborated across frames. Recorded separately
-    # from `plate_confidence` and never blended into it: measured on the labelled
-    # benchmark, OCR confidence does not separate correct reads from wrong ones
-    # (six of seven wrong reads sit at or above the lowest correct read's
-    # confidence), so corroboration is independent evidence rather than more of
-    # the same. Defaults False — unknown provenance is not corroboration.
+    # Corroborated across frames. Kept apart from plate_confidence: on the
+    # benchmark 6 of 7 wrong reads sit at or above the lowest correct read's
+    # confidence, so this is independent evidence. False by default, unknown
+    # isn't corroboration.
     plate_corroborated: bool = False
     plate_reads: int = 0
     cameras_visited: int = 0
@@ -110,9 +100,8 @@ def _is_night(at: datetime) -> bool:
 
 
 def assess(signals: RiskSignals) -> RiskAssessment:
-    """Score one event or one vehicle. Pure — no DB, no clock, no I/O — so the
-    arithmetic is directly testable and the same inputs always give the same
-    answer, which is what makes the score defensible."""
+    """Score one event or vehicle. Pure (no DB, clock or I/O), so it's easy
+    to test and the same inputs always give the same answer."""
     factors: list[RiskFactor] = []
 
     if signals.watchlist_priority:
@@ -135,9 +124,8 @@ def assess(signals: RiskSignals) -> RiskAssessment:
             f"remained in the zone for {int(signals.loitering_seconds)}s",
         ))
 
-    # Read quality raises the score because a confidently-identified vehicle is
-    # a more actionable lead than an uncertain one — it is a measure of how much
-    # the rest of the score can be trusted, and is reported as such.
+    # a confidently identified vehicle is a better lead, and it says how far
+    # the rest of the score can be trusted
     if signals.plate_confidence > 0:
         points = int(round(min(1.0, signals.plate_confidence) * PLATE_QUALITY_MAX))
         if points:
@@ -148,8 +136,8 @@ def assess(signals: RiskSignals) -> RiskAssessment:
             ))
 
     if signals.cameras_visited > 1:
-        # Saturates at 5 cameras: beyond that, "seen on many cameras" stops
-        # adding information about how unusual the movement is.
+        # caps at 5 cameras, past that it says nothing more about how odd the
+        # movement is
         points = int(round(min(1.0, (signals.cameras_visited - 1) / 4) * MULTI_CAMERA_MAX))
         factors.append(RiskFactor(
             "multi_camera", "Multi-camera activity", points,

@@ -23,9 +23,8 @@ export default function EvidenceDetailPage() {
     return () => { cancelled = true; };
   }, [evidence?.file_path, evidenceId]);
 
-  // A fresh token per click: the preview URL above was minted when the page
-  // loaded and its token lives 5 minutes, so a page left open during a
-  // briefing handed the download link a dead token (raw 401 in a new tab).
+  // fresh token per click: the preview's token only lives 5 minutes, and a
+  // page left open during a briefing gave the download a dead token (raw 401)
   async function download() {
     setActionError(null);
     try {

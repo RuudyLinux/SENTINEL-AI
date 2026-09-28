@@ -1,30 +1,25 @@
 """Dataset reports: QC summary, character coverage, plate-size distribution.
 
-The character-coverage report exists because of a specific measured failure. The
-current n=25 benchmark corpus contains **zero** instances of `I O Q V Z`, and
-twelve more classes appear at most twice — a fact that was invisible until it
-was counted, and that silently caps what any recogniser trained on such a corpus
-could learn. This report makes that visible on day one of the next dataset
-rather than after a training run.
+Coverage exists because the n=25 benchmark has zero I O Q V Z and twelve more
+classes at most twice, which nobody saw until it was counted and which caps
+what a recogniser could learn. This shows it on day one of a dataset.
 
-All output is Markdown, so a report can be committed next to the dataset card
-and diffed between dataset versions.
+Markdown output, so reports can sit next to the dataset card and be diffed.
 """
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 
-from schema import DEFAULT_SIZE_BUCKETS, PlateRecord, VALID_SPLITS, bucket_for
+from schema import DEFAULT_SIZE_BUCKETS, PlateRecord, bucket_for
 from qc.checks import ERROR, INFO, WARNING, Finding
 
 DIGITS = "0123456789"
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 ALPHABET = DIGITS + LETTERS
 
-# Characters known to be rare in Indian registrations. `I` and `O` are avoided
-# by design in many series precisely because they collide with `1` and `0`, so
-# they will stay rare in any naturally collected corpus and need deliberate
-# attention (synthetic top-up) rather than being assumed to arrive on their own.
+# Rare in Indian registrations. I and O are avoided in many series because
+# they look like 1 and 0, so they'll stay rare in collected data and need a
+# synthetic top-up.
 KNOWN_RARE = ("I", "O", "Q", "V", "Z", "F", "X")
 
 # Coverage targets from docs/ANPR_M0_DATA_ACQUISITION.md §9 (pilot tier).
@@ -125,11 +120,9 @@ def size_distribution(
     predictions: dict[str, str] | None = None,
     buckets=DEFAULT_SIZE_BUCKETS,
 ) -> dict[str, dict]:
-    """Count, percentage and — when predictions exist — exact match per bucket.
-
-    `predictions` maps `image_id/vehicle_id` to the predicted string. Absent, the
-    accuracy columns are simply not produced: this reports what is measured and
-    nothing else.
+    """Count, percentage and, with predictions, exact match per bucket.
+    predictions maps image_id/vehicle_id to the predicted string; without it
+    there are no accuracy columns.
     """
     per_bucket: dict[str, dict] = {
         name: {"count": 0, "correct": 0, "scored": 0} for name, _, _ in buckets

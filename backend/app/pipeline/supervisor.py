@@ -1,43 +1,22 @@
-"""24/7 real Sentinel Camera Grid connection supervisor.
+"""24/7 Sentinel Camera Grid connection supervisor.
 
-Keeps eligible REAL Sentinel Grid cameras' RTSP connection alive automatically
-— discovers the catalogue at startup, connects eligible cameras up to
-settings.sentinel_grid_max_autoconnect (now sized to cover the whole
-catalog — every registered camera stays connected, all the time, as the
-standard operating posture), and reconnects any that drop, on a periodic
-sweep.
+Discovers the catalogue at startup, connects eligible grid cameras (up to
+sentinel_grid_max_autoconnect, which covers the whole catalog) and
+reconnects drops on a periodic sweep. Only source_type == "sentinel_grid".
 
-This module still never writes ai_person/ai_vehicle/ai_anpr: "connected/
-LIVE" and "AI processing" remain two SEPARATE fields (see
-worker.py._process_frame's ai_enabled gate) — a camera this supervisor
-connects runs with whatever those three flags already say. What changed is
-the STARTING VALUE a freshly discovered camera gets them set to
-(sentinel_grid.upsert_grid_cameras: True by default now, matching
-Camera.model's own column default and every other camera-creation path,
-rather than the prior deliberate False-on-discovery exception) — so in
-practice every camera this supervisor connects now also runs AI, without
-this module's own connect-only behavior needing to change at all. An
-operator can still turn AI off per camera via PATCH /api/cameras/{id}.
+Never writes ai_person/ai_vehicle/ai_anpr. Connected and AI are separate
+(worker._process_frame gates on the flags); discovery sets them True by
+default (sentinel_grid.upsert_grid_cameras), and PATCH /api/cameras/{id}
+turns AI off per camera.
 
-Concurrency optimization finding (staged real-camera testing): starting N
-eligible cameras' workers back-to-back in one sweep opens N simultaneous new
-RTSP TCP handshakes against the external grid at once — measured as
-meaningfully less reliable than the same N cameras brought up one at a time.
-Local CPU/RAM were NOT the limiting factor at 10 concurrent; the external
-grid's tolerance for a simultaneous connection burst was. `_connect_eligible`
-below therefore staggers successive worker starts within one sweep by
-`settings.sentinel_grid_stagger_seconds`, real backend restarts included
-(there is no separate "burst" code path to disable) — see README.md →
-"Real Sentinel Camera Grid — verified concurrency limits" for the staged
-5/8/... test results this is based on.
+Starts are staggered by sentinel_grid_stagger_seconds within a sweep.
+Opening N RTSP handshakes at once was measurably less reliable than one at a
+time; at 10 cameras the grid's tolerance for bursts was the limit, not local
+CPU/RAM. README "Real Sentinel Camera Grid — verified concurrency limits" has
+the numbers.
 
-Deliberately reuses the existing worker lifecycle (`worker.start_worker`/
-`stop_worker`/`RUNNING`/`CAMERA_STATS`) rather than a second parallel worker
-system — this module only decides *when* to call those, one thin layer above
-the tested per-camera loop, backoff, and diagnostics that already exist.
-
-Never applies to any future simulated/logical-scale camera source — only
-`source_type == "sentinel_grid"` rows are ever touched here.
+Just decides when to call worker.start_worker/stop_worker; no second worker
+system.
 """
 import asyncio
 import logging
@@ -53,59 +32,47 @@ from .sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGrid
 
 logger = logging.getLogger("sentinel.supervisor")
 
-# camera_ids the supervisor is responsible for keeping connected. Populated at
-# startup for every eligible real grid camera, and updated by an operator's
-# explicit connect()/disconnect() (see below) — so a manual Disconnect isn't
-# immediately undone by the next sweep. In-memory only: a full backend
-# restart re-derives this from the DB (every eligible camera again), which is
-# the documented "reconnect automatically after a restart" behavior — a
-# pre-restart manual Disconnect does not survive a restart.
+# Cameras the supervisor keeps connected: every eligible grid camera at
+# startup, then changed by operator connect()/disconnect(). In memory only, so
+# a restart reconnects everything eligible and a manual Disconnect doesn't
+# survive it.
 AUTO_MANAGED: set[str] = set()
 
-# camera_ids an operator explicitly disconnected — excluded from the sweep's
-# blanket re-add of every eligible camera into AUTO_MANAGED (see
-# _connect_eligible) until the operator explicitly connects it again. Without
-# this, a manual Disconnect was undone by the very next sweep: the sweep
-# unconditionally re-added every eligible camera to AUTO_MANAGED regardless of
-# operator intent, so "stopped, then immediately reconnected" instead of
-# staying DISCONNECTED — found via the real browser test of the Disconnect
-# button, contradicting disconnect()'s own docstring below. In-memory only,
-# same lifetime as AUTO_MANAGED: a full restart re-derives eligibility fresh.
+# Cameras an operator disconnected. The sweep re-adds every eligible camera to
+# AUTO_MANAGED, and without this a manual Disconnect got undone on the next
+# sweep. Same lifetime as AUTO_MANAGED.
 OPERATOR_DISCONNECTED: set[str] = set()
 
 _last_restart_attempt: dict[str, float] = {}
-# Floor between the supervisor's OWN restart attempts for a given camera —
-# independent of and in addition to worker.py's per-connection-attempt
-# backoff (2/4/8/16/30s) inside a single _camera_loop run. This is what turns
-# "gives up after its own retry budget" into "24/7, reconnect eventually"
-# without making the low-level loop itself infinite.
+# Min gap between the supervisor's own restarts of a camera, on top of the
+# worker's own backoff (2/4/8/16/30s) inside one _camera_loop. This is what
+# makes it "reconnect eventually, 24/7" without an infinite low-level loop.
 _MIN_RESTART_INTERVAL_S = 20.0
 
-# Grid-wide circuit breaker. Real finding, not a hypothetical: cv2's FFmpeg
-# backend swallows RTSP's actual response entirely -- `VideoCapture.open()`
-# returns a plain bool, and a real "401 Unauthorized" from the grid (the
-# credentials are rejected, not merely unconfigured) is indistinguishable
-# from a network blip at the Python level. Only "credentials not configured"
-# (a blank env var, checked before cv2 is ever touched -- see
-# camera_connection.py's _open_with_timeout) sets grid_state=AUTH_ERROR and
-# gets the long sentinel_grid_auth_cooldown_seconds backoff below; a live
-# rejection falls through to the generic _MIN_RESTART_INTERVAL_S floor
-# instead, which every camera clears on every ~30s sweep. With the
-# always-connected policy (max_autoconnect=100) that is up to 30 real
-# cameras retrying a rejected shared login every ~30 seconds, forever --
-# exactly the sustained load that gets (or keeps) the account blocked, and
-# exactly what a real run of this produced.
+# Grid-wide circuit breaker. cv2's FFmpeg backend hides the RTSP response:
+# open() is just a bool, so a real 401 from the grid looks like a network
+# blip. Only blank credentials (checked before cv2, see
+# camera_connection._open_with_timeout) get AUTH_ERROR and the long cooldown;
+# a live rejection only hits the 20s floor, which every camera clears each
+# ~30s sweep. With everything always connected that's up to 30 cameras
+# retrying a rejected shared login every 30s forever, which is how accounts
+# get blocked (and did, in a real run).
 #
-# The fix does not try to make cv2 surface the 401 (that needs capturing
-# FFmpeg's own stderr, a materially bigger and more fragile change). Instead
-# it detects the SHAPE the failure has when it's the shared login, not
-# individual cameras: many distinct grid cameras attempted, and NONE of them
-# actually connected. That is the same "one shared account, so retrying
-# per-camera hammers the same login for no new information" reasoning the
-# AUTH_ERROR cooldown comment already states -- applied at the level that
-# can actually detect a live rejection, not only a blank credential.
+# Getting cv2 to surface the 401 would mean capturing FFmpeg's stderr, too
+# fragile. Instead spot the shape of a shared-login failure: lots of distinct
+# grid cameras tried, none connected. Then back off everything at once.
 _GRID_WIDE_FAILURE_THRESHOLD = 5
 _grid_wide_cooldown_until = 0.0
+# Consecutive grid-wide trips. Each one doubles the pause (up to
+# _MAX_GRID_COOLDOWN_S), and after a pause a single camera probes the login
+# before the fleet comes back: a blocked account got blocked for longer by
+# every camera retrying the moment each pause ended.
+_grid_trips = 0
+_MAX_GRID_COOLDOWN_S = 3600.0
+_probe_camera: "str | None" = None
+_probe_started = 0.0
+# a probe that hasn't connected within this long counts as failed
+_PROBE_TIMEOUT_S = 90.0
 
 _supervisor_task: "asyncio.Task[None] | None" = None
 
@@ -115,10 +82,9 @@ def _grid_credentials_configured() -> bool:
 
 
 async def discover_and_register() -> None:
-    """Startup discovery: fetch the real catalogue, upsert into the registry
-    (register-only, same contract as the manual sync endpoint — never starts
-    a worker). A missing/misconfigured/unreachable grid is logged, never
-    raised, so it can't prevent the rest of the application from starting."""
+    """Fetch the catalogue and register it (no workers started, same as the
+    sync endpoint). Grid problems are logged, never raised, so startup
+    carries on."""
     if not _grid_credentials_configured():
         logger.info("Sentinel Grid credentials not configured — skipping catalogue discovery at startup")
         return
@@ -153,16 +119,12 @@ def _is_running(camera_id: str) -> bool:
 
 
 def _grid_wide_rejection_detected() -> "int | None":
-    """Returns how many distinct grid cameras were attempted if this sweep's
-    state has the SHAPE of a shared-login rejection (many attempted, zero
-    actually connected) — None otherwise. Synchronous and cheap: reads
-    CAMERA_STATS, the same in-memory dict every other diagnostic here already
-    reads, no query, no I/O.
+    """Number of grid cameras attempted if it looks like a shared-login
+    rejection (enough attempted, none connected), else None. Just reads
+    CAMERA_STATS.
 
-    "Attempted" means a worker has run for it at least once (started_at is
-    set) — a camera the supervisor has never gotten to yet must not count
-    toward "everyone is failing", or the very first sweep after a restart
-    would trip this before a single connection was even tried."""
+    Attempted = a worker has run for it (started_at set). Cameras not tried
+    yet mustn't count, or the first sweep after a restart would trip this."""
     attempted = [
         cid for cid in AUTO_MANAGED
         if worker.CAMERA_STATS.get(cid, {}).get("started_at") is not None
@@ -176,16 +138,35 @@ def _grid_wide_rejection_detected() -> "int | None":
     return len(attempted) if connected == 0 else None
 
 
+def _is_connected(camera_id: str) -> bool:
+    return worker.CAMERA_STATS.get(camera_id, {}).get("grid_state") in ("CONNECTED", "PROCESSING")
+
+
+def _trip(now: float, reason: str) -> None:
+    """Pause every grid connect attempt, longer each time, and stop the
+    workers still trying so they don't keep hitting the login meanwhile."""
+    global _grid_wide_cooldown_until, _grid_trips, _probe_camera
+    _grid_trips += 1
+    pause = min(_MAX_GRID_COOLDOWN_S, settings.sentinel_grid_auth_cooldown_seconds * 2 ** (_grid_trips - 1))
+    _grid_wide_cooldown_until = now + pause
+    _probe_camera = None
+    for cid in list(AUTO_MANAGED):
+        if _is_running(cid) and not _is_connected(cid):
+            worker.stop_worker(cid)
+    logger.warning(
+        "Sentinel Grid supervisor: %s. Treating it as a shared-login rejection, stopping the "
+        "cameras still trying, and pausing ALL grid connects for %.0fs (trip %d); after that one "
+        "camera tests the login before the rest reconnect.",
+        reason, pause, _grid_trips,
+    )
+
+
 async def _connect_eligible(db: Session) -> int:
-    """One sweep: (re)connect eligible, not-currently-running, auto-managed
-    cameras, up to settings.sentinel_grid_max_autoconnect concurrent
-    connections — started one at a time with a real delay between each
-    (settings.sentinel_grid_stagger_seconds), not all at once. Returns how
-    many connect attempts were started. This coroutine can run for a while
-    at a high cap (N cameras * stagger seconds) — that's the staggering
-    working as intended, not a bug; the caller (_sweep_loop) awaits it fully
-    before its own next-sweep sleep, same as before."""
-    global _grid_wide_cooldown_until
+    """One sweep: start eligible cameras that aren't running, up to the cap,
+    one at a time with sentinel_grid_stagger_seconds between them. Returns
+    how many were started. Can take N * stagger seconds; _sweep_loop waits
+    for it before sleeping."""
+    global _grid_trips, _probe_camera, _probe_started
     if not settings.sentinel_grid_autoconnect or not _grid_credentials_configured():
         return 0
 
@@ -193,27 +174,35 @@ async def _connect_eligible(db: Session) -> int:
     if now < _grid_wide_cooldown_until:
         return 0
 
-    rejected_count = _grid_wide_rejection_detected()
-    if rejected_count is not None:
-        _grid_wide_cooldown_until = now + settings.sentinel_grid_auth_cooldown_seconds
-        logger.warning(
-            "Sentinel Grid supervisor: %d distinct grid camera(s) attempted, "
-            "none connected — treating this as a shared-credential rejection "
-            "rather than %d independent camera problems, and pausing ALL grid "
-            "connect attempts for %.0fs instead of continuing to retry each "
-            "one individually.",
-            rejected_count, rejected_count, settings.sentinel_grid_auth_cooldown_seconds,
-        )
-        return 0
-
-    # Excludes anything the operator explicitly disconnected from BOTH the
-    # AUTO_MANAGED bookkeeping and the actual (re)connect loop below — an
-    # earlier version of this fix only filtered the bookkeeping line, while
-    # the loop still iterated the raw, unfiltered `eligible` list and started
-    # a worker for any not-currently-running eligible camera regardless,
-    # silently reconnecting a manually disconnected camera on the very next
-    # sweep. Found via the live browser test of the Disconnect button.
     eligible = [cid for cid in _eligible_camera_ids(db) if cid not in OPERATOR_DISCONNECTED]
+
+    if _grid_trips:
+        # after a pause: one camera probes the login first
+        if _probe_camera is None:
+            if not eligible:
+                return 0
+            _probe_camera, _probe_started = eligible[0], now
+            AUTO_MANAGED.add(_probe_camera)
+            _last_restart_attempt[_probe_camera] = now
+            worker.start_worker(_probe_camera)
+            logger.info("Sentinel Grid supervisor: probing the grid login with one camera")
+            return 1
+        if _is_connected(_probe_camera):
+            logger.info("Sentinel Grid supervisor: probe connected, bringing every camera back")
+            _grid_trips, _probe_camera = 0, None
+        elif not _is_running(_probe_camera) or now - _probe_started > _PROBE_TIMEOUT_S:
+            _trip(now, "the probe camera could not connect")
+            return 0
+        else:
+            return 0
+    else:
+        rejected_count = _grid_wide_rejection_detected()
+        if rejected_count is not None:
+            _trip(now, f"{rejected_count} distinct grid cameras attempted, none connected")
+            return 0
+
+    # operator-disconnected cameras are left out of both the bookkeeping and
+    # the connect loop below (filtering only one still reconnected them)
     AUTO_MANAGED.update(eligible)
 
     running_count = sum(1 for cid in AUTO_MANAGED if _is_running(cid))
@@ -227,10 +216,8 @@ async def _connect_eligible(db: Session) -> int:
             break
         if _is_running(camera_id):
             continue
-        # A real, rejected credential fails identically for every camera
-        # (one shared grid login) — back off far longer than a plain
-        # transient-failure retry so we don't hammer the login endpoint once
-        # per camera per sweep.
+        # rejected credentials fail the same for every camera (one shared
+        # login), so back off much longer than for a transient failure
         stats = worker.CAMERA_STATS.get(camera_id, {})
         floor = (
             settings.sentinel_grid_auth_cooldown_seconds
@@ -238,21 +225,13 @@ async def _connect_eligible(db: Session) -> int:
             else _MIN_RESTART_INTERVAL_S
         )
         last_attempt = _last_restart_attempt.get(camera_id, 0.0)
-        # `now` is a single timestamp taken once at the top of this sweep —
-        # every camera the stagger below actually waited real seconds for
-        # would otherwise still be compared against that same stale `now`,
-        # letting the floor under-count real elapsed time. Re-read per
-        # candidate instead; cheap (time.monotonic() is not a syscall).
+        # not `now`: the stagger sleeps between cameras, so that's stale
         if time.monotonic() - last_attempt < floor:
             continue
         _last_restart_attempt[camera_id] = time.monotonic()
         worker.start_worker(camera_id)
         started += 1
-        # Staggered startup: real delay between successive connection starts
-        # within this sweep, not just between sweeps — this is what actually
-        # spreads N simultaneous RTSP handshakes into a rollout. Skipped
-        # after the last camera started (nothing left to space out) and
-        # skipped entirely for a single-camera sweep.
+        # spread the handshakes out; no sleep after the last one
         if started < slots:
             await asyncio.sleep(settings.sentinel_grid_stagger_seconds)
 
@@ -280,7 +259,7 @@ async def _sweep_loop() -> None:
 
 
 def start_supervisor() -> None:
-    """Call once at application startup, after discover_and_register()."""
+    """Call once at startup, after discover_and_register()."""
     global _supervisor_task
     if _supervisor_task is not None and not _supervisor_task.done():
         return
@@ -288,9 +267,8 @@ def start_supervisor() -> None:
 
 
 async def stop_supervisor() -> None:
-    """Call at application shutdown — cancels the sweep loop and stops every
-    auto-managed worker cleanly, so no camera task or its underlying
-    RTSP/cv2 resource is left orphaned at process exit."""
+    """Shutdown: cancel the sweep and stop every auto-managed worker so no
+    task or capture is left behind."""
     global _supervisor_task
     if _supervisor_task is not None:
         _supervisor_task.cancel()
@@ -301,12 +279,8 @@ async def stop_supervisor() -> None:
         except Exception:
             logger.exception("Sentinel Grid supervisor sweep task raised on shutdown")
         _supervisor_task = None
-    # Audit finding: stop_worker() only REQUESTS cancellation — the task's
-    # own cleanup (source.release() in _camera_loop's `finally`) only runs
-    # once it's next scheduled, which is not guaranteed before the ASGI
-    # server tears down the event loop unless something here actually
-    # awaits it. Collect + gather so this function returns only once every
-    # camera's real cleanup has actually run, not merely been requested.
+    # stop_worker only requests cancellation; await the tasks so their
+    # release actually runs before the loop goes away
     tasks = [t for t in (worker.stop_worker(camera_id) for camera_id in list(AUTO_MANAGED)) if t is not None]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -315,8 +289,7 @@ async def stop_supervisor() -> None:
 
 
 def connect(camera_id: str) -> None:
-    """Explicit operator Connect: marks the camera auto-managed (so the
-    supervisor keeps it alive/reconnects it going forward) and starts it."""
+    """Operator Connect: auto-managed from now on, and started."""
     OPERATOR_DISCONNECTED.discard(camera_id)
     AUTO_MANAGED.add(camera_id)
     _last_restart_attempt[camera_id] = time.monotonic()
@@ -324,53 +297,24 @@ def connect(camera_id: str) -> None:
 
 
 def disconnect(camera_id: str) -> None:
-    """Explicit operator Disconnect: removed from the auto-managed set FIRST
-    and marked operator-disconnected, so the next sweep does not immediately
-    reconnect it, then the worker is actually stopped."""
+    """Operator Disconnect. Out of AUTO_MANAGED and marked disconnected
+    first, so the next sweep leaves it alone, then stopped."""
     AUTO_MANAGED.discard(camera_id)
     OPERATOR_DISCONNECTED.add(camera_id)
     worker.stop_worker(camera_id)
 
 
 async def restart(camera_id: str, source_type: str) -> None:
-    """Explicit operator Restart — single source of truth for BOTH the
-    single-camera restart endpoint (routers/cameras.py) and the bulk
-    Camera Control Center restart action (routers/camera_control.py), so
-    the two never drift.
+    """Operator Restart, shared by the single-camera and bulk restart
+    endpoints so they can't drift.
 
-    Audit finding (PR #1 review): both call sites used to do a raw
-    `worker.stop_worker(camera_id); worker.start_worker(camera_id)` even
-    for a real Sentinel Grid camera — that bypasses this module's
-    AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping entirely, so a restarted
-    grid camera that drops again later was silently NOT picked back up by
-    the 24/7 auto-reconnect sweep (never added to AUTO_MANAGED by a raw
-    start_worker call), regardless of whether the operator had ever
-    explicitly disconnected it. Fixed by reusing connect() (exactly as an
-    explicit Connect does) after the stop, for a sentinel_grid camera —
-    real state transition, not just cosmetic: OPERATOR_DISCONNECTED is
-    cleared and AUTO_MANAGED gains the camera, same as a fresh Connect.
+    Grid cameras go back through connect(), so they're auto-managed again
+    and the sweep picks them up if they drop later; a raw stop/start skipped
+    that bookkeeping.
 
-    10/10 debugging pass finding (BUG-3 investigation): this used to be a
-    plain `def` on the reasoning that "`worker.stop_worker` is a plain
-    function, so calling it is synchronous, so it's effectively awaited" —
-    that conflates two different things. `stop_worker`'s own BODY running to
-    completion is not the same as the CANCELLED TASK's cleanup having run:
-    `task.cancel()` only requests cancellation, delivered whenever the event
-    loop next gets a chance to schedule that task (see `stop_worker`'s own
-    docstring, which returns the task for exactly this reason — "a caller
-    that needs a DETERMINISTIC guarantee... can await asyncio.gather(...) on
-    it"). Without awaiting it, `start_worker`'s dedup guard
-    (`existing and not existing.done()`) races the old task's own
-    cancellation delivery on unspecified event-loop scheduling order rather
-    than a guarantee — harmless in practice under CPython's typical FIFO-ish
-    callback ordering (investigated: normal asyncio cancellation semantics
-    mean the old task cannot execute any of its OWN further code once
-    cancelled, only run its `except`/`finally` cleanup, so no plate_tracker/
-    DB write from the old task can land using a stale camera generation), but
-    an IMPLICIT scheduling-order dependency where an EXPLICIT one is free —
-    the mechanism `stop_worker` already exposes for this. Now actually used,
-    mirroring main.py's own shutdown-path idiom
-    (`await asyncio.gather(*pending_tasks, return_exceptions=True)`).
+    The old task is awaited before starting: cancel() only requests it, and
+    start_worker's "already running" check would otherwise depend on
+    scheduling order rather than the old task actually having finished.
     """
     task = worker.stop_worker(camera_id)
     if task is not None:

@@ -2,9 +2,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 
-/** Fetches real data from the backend and tracks loading/error state honestly:
- * a failed request surfaces as `error`, never as a silently-empty result that
- * could be mistaken for "there is genuinely no data yet".
+/** Fetches backend data and tracks loading/error. A failed request is
+ * `error`, never an empty result that looks like "no data yet".
  */
 export function useApiData<T>(
   path: string | null,
@@ -40,20 +39,13 @@ export function useApiData<T>(
     load();
     if (!opts?.pollMs) return;
 
-    // Polling stops while the tab is hidden, and refreshes once as soon as it
-    // is shown again.
+    // Polling pauses while the tab is hidden and refreshes once when shown.
     //
-    // Measured on the running system before this: /dashboard issued exactly
-    // the same 7 API requests per 30 seconds whether it was the visible tab or
-    // buried behind another one. A control-room workstation leaves these
-    // screens open all shift, so the polling that nobody can see was real
-    // load — database queries on a host already running YOLO inference for
-    // every camera, for a render no one was looking at.
-    //
-    // The immediate re-fetch on becoming visible is the part that keeps this a
-    // pure optimisation: the operator never looks at a screen that quietly
-    // stopped updating while it was hidden. Anything genuinely live while
-    // hidden (alerts) arrives over the WebSocket, which this does not touch.
+    // /dashboard made the same 7 requests every 30s visible or not, and
+    // control-room screens stay open all shift, so that was real DB load on a
+    // box already running YOLO for every camera. The refetch on becoming
+    // visible means nobody looks at a screen that stopped updating; live
+    // things (alerts) come over the websocket anyway.
     let timer: ReturnType<typeof setInterval> | null = null;
 
     function start() {

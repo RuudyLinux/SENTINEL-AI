@@ -1,4 +1,4 @@
-"""7. Upload validation — P0-F."""
+"""Upload validation."""
 import io
 
 from app.config import settings

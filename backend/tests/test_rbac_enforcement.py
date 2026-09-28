@@ -1,8 +1,6 @@
-"""Hardening pass: RBAC must actually reject a lower-privileged role at the
-API layer, not just hide buttons in the frontend. No existing test proved
-this — every prior test used the Administrator role, which passes every
-require_roles() check by construction and would never have caught a
-missing or wrong role list."""
+"""RBAC rejects lower roles at the API, not just by hiding buttons. Every
+earlier test used Administrator, which passes every require_roles() and
+would never catch a wrong role list."""
 import pytest
 
 from app import models
@@ -11,9 +9,8 @@ from app.security import hash_password, create_access_token
 
 @pytest.fixture
 def auditor_user(db_session):
-    """Auditor: "Audit-log and compliance visibility" only, per seed.py's
-    role description — the lowest-privilege role for every write action
-    exercised below."""
+    """Auditor: audit and compliance visibility only (seed.py), the lowest
+    role for every write below."""
     role = db_session.query(models.Role).filter(models.Role.name == "Auditor").first()
     if role is None:
         role = models.Role(name="Auditor", description="test")
@@ -93,17 +90,13 @@ def test_only_administrator_can_create_a_user(client, auditor_token):
 
 
 def test_unauthenticated_request_is_rejected_not_treated_as_empty_data(client):
-    # The reliability-phase distinction (SUCCESS WITH ZERO RESULTS vs API
-    # FAILURE) starts here: a request with no token at all must 401, never
-    # silently return an empty list that a client could mistake for "there
-    # are genuinely no cameras."
+    # no token must be a 401, never an empty list a client could read as
+    # "no cameras"
     resp = client.get("/api/cameras")
     assert resp.status_code == 401
 
 
 def test_auditor_can_still_read_cameras(client, auditor_token):
-    # RBAC restricts writes, not all reads — every role can view the camera
-    # list (matches the documented role descriptions; Auditor needs
-    # visibility, just not control).
+    # RBAC limits writes, not reads; every role can list cameras
     resp = client.get("/api/cameras", headers=_auth(auditor_token))
     assert resp.status_code == 200

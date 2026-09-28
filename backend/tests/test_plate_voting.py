@@ -1,9 +1,8 @@
-"""V2 Phase 1 — temporal aggregation / confidence voting for plate reads.
+"""Plate voting across frames.
 
-The behavior these lock down is the fix for "one bad OCR frame overwrites a
-reliable plate result": reads accumulate per (camera, ByteTrack track), vote,
-and the winner is decided by summed confidence while the REPORTED confidence is
-the peak actually observed.
+One bad OCR frame used to overwrite a good result. Reads now accumulate per
+(camera, track) and vote by summed confidence; the reported confidence is
+the peak seen.
 """
 import pytest
 
@@ -13,16 +12,15 @@ from app.pipeline import plate_tracker
 
 @pytest.fixture(autouse=True)
 def _isolate():
-    # Module state is process-global by design (same convention as
-    # rules_engine's cooldown dicts) — reset around every test.
+    # module state is process-global, reset around every test
     plate_tracker.reset()
     yield
     plate_tracker.reset()
 
 
 def test_repeated_reads_converge_on_the_peak_confidence():
-    """The worked example from the V2 brief: four agreeing reads report the
-    plate at its best observed confidence, not the latest or the mean."""
+    """Four agreeing reads report the best confidence seen, not the latest
+    or the mean."""
     for confidence in (0.72, 0.91, 0.94, 0.89):
         plate_tracker.record_read("cam1", "284", "GJ05AB1234", confidence)
 
@@ -33,8 +31,7 @@ def test_repeated_reads_converge_on_the_peak_confidence():
 
 
 def test_one_bad_frame_does_not_overwrite_an_established_plate():
-    """A single high-confidence misread must not beat three corroborating
-    reads — this is exactly what voting buys over last-write-wins."""
+    """One confident misread doesn't beat three agreeing reads."""
     for confidence in (0.72, 0.91, 0.94):
         plate_tracker.record_read("cam1", "284", "GJ05AB1234", confidence)
     plate_tracker.record_read("cam1", "284", "GJ05AB1284", 0.95)
@@ -44,9 +41,8 @@ def test_one_bad_frame_does_not_overwrite_an_established_plate():
 
 
 def test_a_persistent_alternative_can_still_win():
-    """Voting must not be a ratchet. If the early reads were wrong and the
-    vehicle is subsequently read consistently as something else, the winner
-    changes — otherwise a bad start would permanently mislabel the vehicle."""
+    """Not a ratchet: if early reads were wrong and later ones agree on
+    something else, the winner changes."""
     plate_tracker.record_read("cam1", "284", "GJ05AB1284", 0.55)
     for confidence in (0.88, 0.91, 0.93):
         plate_tracker.record_read("cam1", "284", "GJ05AB1234", confidence)
@@ -56,8 +52,7 @@ def test_a_persistent_alternative_can_still_win():
 
 
 def test_tracks_are_scoped_per_camera():
-    """ByteTrack ids are only unique per predictor instance and detector.py
-    keeps one per camera, so track 284 on two cameras is two vehicles."""
+    """Track 284 on two cameras is two vehicles."""
     plate_tracker.record_read("cam1", "284", "GJ05AB1234", 0.9)
     plate_tracker.record_read("cam2", "284", "GJ01XY7788", 0.9)
 
@@ -71,8 +66,8 @@ def test_no_reads_means_no_result_never_a_guess():
 
 
 class TestOcrGating:
-    """`should_ocr` is the pipeline's main CPU saving — previously every vehicle
-    detection ran a full OCR pass on every inference cycle."""
+    """should_ocr is the main CPU saving; every detection used to get OCR
+    every cycle."""
 
     def test_unread_track_is_always_ocred(self):
         plate_tracker.touch("cam1", "284")
@@ -88,8 +83,7 @@ class TestOcrGating:
         assert plate_tracker.should_ocr("cam1", "284") is False
 
     def test_low_confidence_reads_never_become_stable(self):
-        """Consistency alone is not trust: a plate read five times at 0.36 is
-        still a bad read and must keep being re-checked."""
+        """Five reads at 0.36 are consistent but still bad; keep checking."""
         for _ in range(5):
             plate_tracker.record_read("cam1", "284", "GJ05AB1234", 0.36)
         assert plate_tracker.get("cam1", "284").is_stable() is False
@@ -102,12 +96,11 @@ class TestOcrGating:
         assert plate_tracker.should_ocr("cam1", "284") is True
 
     def test_unreadable_track_is_throttled_not_hammered(self, monkeypatch):
-        """A vehicle whose plate genuinely cannot be read never becomes stable,
-        so without mark_ocr_attempt it would be re-OCR'd every single cycle
-        forever. It is retried, but on the reverify interval."""
+        """An unreadable plate never gets stable; without mark_ocr_attempt it'd
+        be OCR'd every cycle forever. Retried on the reverify interval."""
         monkeypatch.setattr(settings, "plate_reverify_seconds", 60.0)
         plate_tracker.mark_ocr_attempt("cam1", "284")
-        # Not stable — no read ever passed the gate — but recently attempted.
+        # not stable (nothing passed), but attempted recently
         assert plate_tracker.get("cam1", "284").is_stable() is False
         assert plate_tracker.should_ocr("cam1", "284") is True, (
             "an unread track must stay eligible; the interval throttles the "
@@ -116,8 +109,7 @@ class TestOcrGating:
 
 
 class TestPersistGating:
-    """`should_persist` is what stops the sighting row being rewritten every
-    frame for as long as a vehicle stays in view."""
+    """should_persist keeps the sighting row from being rewritten every frame."""
 
     def test_first_read_persists(self):
         plate_tracker.record_read("cam1", "284", "GJ05AB1234", 0.9)
@@ -136,8 +128,7 @@ class TestPersistGating:
         assert plate_tracker.should_persist("cam1", "284", new_read=True) is True
 
     def test_a_changed_vote_winner_persists(self, monkeypatch):
-        """If the winner flips after the row was written, the row is wrong and
-        must be rewritten even though no refresh interval has elapsed."""
+        """Winner flipped after the write: rewrite now, refresh interval or not."""
         monkeypatch.setattr(settings, "plate_sighting_refresh_seconds", 60.0)
         plate_tracker.record_read("cam1", "284", "GJ05AB1284", 0.55)
         plate_tracker.bind_plate_row("cam1", "284", "plt_1", "veh_1", "GJ05AB1284")
@@ -157,13 +148,10 @@ class TestPersistGating:
 
 class TestLifecycle:
     def test_stale_tracks_are_pruned(self):
-        """ByteTrack never announces that a track id retired, so the TTL is the
-        only thing bounding this dict on a camera running for days."""
+        """ByteTrack never says a track ended; the TTL bounds this dict."""
         plate_tracker.record_read("cam1", "284", "GJ05AB1234", 0.9)
-        # The track is aged directly rather than by sleeping past a shortened
-        # TTL: time.monotonic() has ~15.6ms granularity on Windows, so a short
-        # real sleep can measure as exactly zero elapsed and fail this test for
-        # a reason that has nothing to do with pruning.
+        # aged directly instead of sleeping past a short TTL, monotonic is
+        # ~15.6ms granular on Windows and a short sleep can read as zero
         state = plate_tracker.get("cam1", "284")
         state.last_seen_mono -= settings.plate_track_ttl_seconds + 1.0
 

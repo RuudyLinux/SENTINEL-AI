@@ -1,12 +1,10 @@
-"""Cross-camera correlation: same normalized plate text seen on any camera is
-the same Vehicle. This is the real mechanism behind the doc's
-'C-014 -> C-019 -> C-027' cross-camera route (§18, §60) — driven by actual
-OCR reads persisted in the Plate/Vehicle tables, not scripted data.
+"""Cross-camera correlation: the same normalized plate on any camera is the same
+Vehicle. That's what builds the C-014 -> C-019 -> C-027 route (doc §18, §60),
+from real OCR reads in the Plate/Vehicle tables.
 
-Also: cross-camera PERSON correlation by appearance-similarity signature (Phase
-5) — see `find_similar_person_detections` and pipeline/appearance.py. Explicitly
-not face recognition or identity resolution: a ranked visual-similarity candidate
-list only, for an investigator to review manually.
+Also person similarity across cameras via appearance signatures
+(find_similar_person_detections, pipeline/appearance.py). Not face
+recognition or identity: a ranked list of lookalikes for an investigator.
 """
 import asyncio
 import logging
@@ -25,12 +23,9 @@ logger = logging.getLogger("sentinel.correlate")
 
 
 async def _merge_into_winner(db: Session, normalized_plate: str, confidence: float, now: datetime) -> "models.Vehicle | None":
-    """BUG-1 recovery path: another session's Vehicle row for this exact
-    plate already won the race and committed between our read and our write.
-    Fold this read's confidence/last_seen into THAT row instead of leaving
-    our own insert attempt as a rejected no-op. Returns None if no such row
-    can be found after all (see caller — that means the conflict was NOT a
-    plate_text collision, and must not be silently absorbed)."""
+    """Another session committed a Vehicle for this plate between our read and
+    our insert. Fold this read into that row. None if there's no such row,
+    meaning the conflict wasn't a plate_text collision (caller re-raises)."""
     winner = db.query(models.Vehicle).filter(models.Vehicle.plate_text == normalized_plate).first()
     if winner is None:
         return None
@@ -51,43 +46,26 @@ async def _merge_into_winner(db: Session, normalized_plate: str, confidence: flo
 async def upsert_vehicle_for_plate(
     db: Session, normalized_plate: str, confidence: float, corroborated: bool = False,
 ) -> models.Vehicle:
-    """Final-demo-readiness-phase finding: this function's own `db.flush()`
-    was unguarded against SQLite lock contention — the same root-cause class
-    PR #1 fixed in worker.py's detection insert, just in a different, shared
-    call site (both worker.py's real live pipeline AND demo_scenario.py call
-    this). Now retried with the same bounded rollback -> reapply -> backoff
-    contract as every other write in the pipeline (db_retry.safe_flush).
+    """Get or create the Vehicle for a plate (used by the live worker and
+    demo_scenario.py). Updates go through safe_flush like every other write.
 
-    BUG-1 fix (10/10 debugging pass): the read-then-insert below is a classic
-    TOCTOU race across TWO DIFFERENT sessions — each camera worker holds its
-    own session for its stream's whole lifetime (worker.py), so two cameras
-    seeing the same never-before-seen plate within the same race window could
-    each see "nothing yet" and each insert, silently splitting one real
-    vehicle across two rows (see models.py::Vehicle.plate_text for the DB-
-    level half of this fix). The CREATE path below now commits directly
-    (locked_commit — no retry, so IntegrityError reaches here rather than
-    being swallowed by safe_flush's generic retry/give-up handling, and
-    committed rather than merely flushed so a competing session's insert
-    resolves fast instead of blocking on an open transaction — see that
-    call's own comment) and, on a unique-constraint conflict, folds this
-    read into whichever row actually won instead of leaving a rejected,
-    wasted write.
+    Read-then-insert races across sessions: each camera worker has its own
+    session, so two cameras seeing a new plate at once could both insert and
+    split one vehicle over two rows (models.Vehicle.plate_text is unique for
+    that reason). The create path commits directly and, on a unique conflict,
+    merges into whichever row won.
     """
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == normalized_plate).first()
     now = datetime.utcnow()
     if vehicle:
         target_last_seen = now
         target_confidence = max(confidence, vehicle.plate_confidence)
-        # The cached flag is refreshed at every sighting of an existing
-        # vehicle, which is the moment it matters and the only event that
-        # reliably follows a time-based expiry (nothing runs at the instant an
-        # entry's `valid_until` passes). Deactivation and creation refresh it
-        # directly through the watchlist router.
+        # Refresh the cached flag on every sighting; nothing runs at the moment
+        # an entry's valid_until passes, so this is where expiry lands. Create
+        # and deactivate update it directly in the watchlist router.
         target_watchlist_flag = watchlist.plate_entry_in_force(db, normalized_plate) is not None
-        # Corroboration only ever RATCHETS UP, exactly as confidence does: once
-        # this vehicle's plate has been confirmed across frames, a later
-        # single-frame sighting does not un-confirm it. A vehicle identified
-        # well at one camera must not be downgraded by a glimpse at the next.
+        # only ratchets up like confidence: a glimpse at the next camera
+        # doesn't un-confirm a plate confirmed earlier
         target_corroborated = bool(vehicle.plate_corroborated) or bool(corroborated)
         vehicle.last_seen = target_last_seen
         vehicle.plate_confidence = target_confidence
@@ -95,11 +73,7 @@ async def upsert_vehicle_for_plate(
         vehicle.plate_corroborated = target_corroborated
 
         def reapply():
-            # `vehicle` is already PERSISTENT here — a rollback expires its
-            # mutated attributes back to their last-committed value, so
-            # reapply must reassign from these captured locals, never from
-            # re-reading vehicle.* (same reasoning as db_retry.py's module
-            # docstring / worker.py's own reapply callbacks).
+            # persistent row, rollback expires these; reassign from the locals
             db.add(vehicle)
             vehicle.last_seen = target_last_seen
             vehicle.plate_confidence = target_confidence
@@ -119,39 +93,24 @@ async def upsert_vehicle_for_plate(
         plate_corroborated=bool(corroborated),
     )
     db.add(vehicle)
-    # Committed immediately, not just flushed, deliberately: a genuinely NEW
-    # Vehicle has nothing else in this transaction depending on it yet (the
-    # Plate/Detection rows that reference it are added AFTER this call
-    # returns, by the caller), so nothing is lost by making it durable right
-    # away — and a competing session's conflicting insert needs this row to
-    # actually COMMIT to resolve as a fast IntegrityError. Left merely
-    # flushed (uncommitted), a concurrent camera worker's competing insert
-    # would instead BLOCK on SQLite's write lock for the full busy_timeout
-    # (up to 30s) waiting on a transaction this session has no reason to
-    # commit until it finishes the REST of its own frame's processing —
-    # turning a race this fix is supposed to resolve in milliseconds into a
-    # real multi-second stall on an unrelated camera's pipeline. Found via
-    # tests/test_vehicle_upsert_race.py's real concurrent-asyncio-tasks case,
-    # not by inspection alone.
+    # Commit now, not just flush. Nothing else in this transaction depends on
+    # the new row yet (the caller adds Plate/Detection after), and a competing
+    # insert only fails fast with IntegrityError once this row is committed.
+    # Left flushed, the other camera's insert blocks on SQLite's write lock for
+    # up to busy_timeout (30s) while we finish our frame. Caught by
+    # tests/test_vehicle_upsert_race.py.
     #
-    # A dedicated retry loop, not safe_commit/safe_flush: those two share one
-    # contract (retry ONLY OperationalError, swallow everything else into a
-    # single "attempt failed" outcome with no way for the caller to tell
-    # WHICH exception it was) that is exactly wrong here — an IntegrityError
-    # is a definitive answer needing zero retries and different recovery
-    # (merge into the winner), while OperationalError is the transient
-    # condition needing the retry/backoff. Same attempt count/backoff shape
-    # as db_retry._attempt_loop, so this path is not less resilient to lock
-    # contention than every other write in the pipeline.
+    # Own retry loop instead of safe_commit/safe_flush: those retry
+    # OperationalError and fold everything else into one "failed" result, but
+    # here IntegrityError needs no retry and a different recovery (merge into
+    # the winner). Same attempts/backoff as db_retry._attempt_loop.
     max_attempts = 4
     for attempt in range(1, max_attempts + 1):
         try:
             await locked_commit(db)
             return vehicle
         except IntegrityError:
-            # Not a lock — a real unique-constraint hit. The DB itself just
-            # proved another session's row for this exact plate already
-            # exists; roll back OUR failed insert and merge into that row.
+            # a real unique-constraint hit, another session's row exists
             await locked_rollback(db)
             winner = await _merge_into_winner(db, normalized_plate, confidence, now)
             if winner is not None:
@@ -161,17 +120,12 @@ async def upsert_vehicle_for_plate(
                     normalized_plate,
                 )
                 return winner
-            # A conflict happened but no row exists for this plate —
-            # genuinely unexpected (some OTHER constraint, not the one this
-            # fix targets). Must not be silently absorbed as if it were the
-            # race this function understands.
+            # conflict but no row for this plate, so some other constraint.
+            # don't swallow it
             raise
         except OperationalError:
-            # Genuine lock contention, not a constraint conflict. A failed
-            # commit leaves the Session's transaction unusable (SQLAlchemy
-            # raises PendingRollbackError on the next call otherwise) — roll
-            # back before any further use, same requirement db_retry.py's
-            # own module docstring documents for every other retry path.
+            # lock contention. a failed commit leaves the transaction unusable
+            # (PendingRollbackError next time), so roll back first
             await locked_rollback(db)
             if attempt >= max_attempts:
                 logger.warning(
@@ -188,14 +142,12 @@ async def upsert_track(
     db: Session, camera_id: str, yolo_track_id: int, cls: str, at: datetime,
     vehicle_id: str | None = None, plate_reads: int = 0,
 ) -> models.Track:
-    """Get-or-create the Track row for one ByteTrack id on one camera.
+    """Get or create the Track row for one ByteTrack id on one camera.
 
-    Track ids are only unique per predictor instance, and detector.py keeps one
-    instance per camera, so (camera_id, yolo_track_id) is the real identity —
-    never yolo_track_id alone. A long-running camera eventually recycles ids;
-    that is accepted here (the row's last_seen moves forward) because the
-    alternative — a new Track row per id reuse — would fragment a vehicle's
-    history for no operational gain.
+    Ids are unique per predictor and detector.py keeps one per camera, so the
+    identity is (camera_id, yolo_track_id). Ids get recycled eventually on a
+    long-running camera; we just move last_seen forward rather than split a
+    vehicle's history over new rows.
     """
     track = (
         db.query(models.Track)
@@ -205,9 +157,8 @@ async def upsert_track(
     if track is not None:
         target_last_seen = at
         target_count = (track.detection_count or 0) + 1
-        # Identity only ever gets ADDED to a track, never cleared: a frame in
-        # which the plate happened not to read must not un-identify a vehicle
-        # we already recognized on this same track.
+        # identity only gets added, a frame where the plate didn't read
+        # mustn't un-identify the vehicle
         target_vehicle_id = vehicle_id or track.vehicle_id
         target_plate_reads = max(plate_reads, track.plate_reads or 0)
         track.last_seen = target_last_seen
@@ -216,9 +167,7 @@ async def upsert_track(
         track.plate_reads = target_plate_reads
 
         def reapply():
-            # Persistent row: a rollback expires these mutations back to their
-            # last-committed values, so reapply must reassign from the captured
-            # locals rather than re-reading track.* (see db_retry.py).
+            # persistent row, reassign from the locals (db_retry.py)
             db.add(track)
             track.last_seen = target_last_seen
             track.detection_count = target_count
@@ -233,8 +182,7 @@ async def upsert_track(
         db.add(track)
 
         def reapply():
-            # Transient row: rollback only detaches it, its attributes
-            # (including the client-generated PK) survive, so re-add restores it.
+            # new row, rollback just detaches it
             db.add(track)
 
     await safe_flush(db, "upsert_track", reapply=reapply)
@@ -264,19 +212,15 @@ async def upsert_plate_sighting(
     variants_agreeing: int = 1,
     plate_crop_path: str | None = None,
 ) -> models.Plate:
-    """Create — or update — the single Plate sighting row for this vehicle's
-    presence on this camera.
+    """Create or update the one Plate sighting row for this vehicle's stay on
+    this camera.
 
-    `existing_plate_id` comes from pipeline/plate_tracker.py: it is the row this
-    track already owns. When set, the same tracked vehicle is still in frame and
-    the row is UPDATED (better confidence, more corroborating reads, extended
-    last_seen) instead of inserting another route hop for a vehicle that never
-    moved. When None, this is a genuinely new sighting.
+    existing_plate_id is the row this track already owns (plate_tracker.py).
+    Set means the same car is still in frame, so the row is updated instead of
+    adding another route hop for a car that never moved.
 
-    Confidence only ever moves UP. A later, worse read of a plate we have
-    already read well must not degrade the recorded quality of the sighting —
-    the peak is the honest answer to "how well was this ever read", and the
-    voting in plate_tracker has already decided WHICH text is correct.
+    Confidence only goes up; the peak is the honest answer to "how well was
+    this ever read", and plate_tracker's voting already chose the text.
     """
     now = datetime.utcnow()
     plate = None
@@ -346,17 +290,12 @@ async def upsert_plate_sighting(
 
 
 def get_route(db: Session, vehicle_id: str):
-    """Ordered cross-camera sightings for a vehicle, built from real Plate rows.
+    """A vehicle's sightings across cameras, in order, from Plate rows.
 
-    V2: consecutive rows on the SAME camera are collapsed into one hop carrying
-    `first_seen`/`last_seen`/`dwell_seconds`, so a vehicle that was recognized
-    repeatedly at one junction reads as "seen at C-014 for 40s", not as forty
-    hops between C-014 and itself. Non-consecutive returns to the same camera
-    stay separate hops — a vehicle that genuinely came back IS a second
-    sighting, and collapsing those would erase real movement.
-
-    Camera coordinates are included so the map/journey UI does not have to
-    cross-reference a separate /api/cameras fetch per hop.
+    Consecutive rows on the same camera collapse into one hop with
+    first_seen/last_seen/dwell_seconds ("at C-014 for 40s", not forty hops).
+    Coming back to a camera later is a separate hop, that's real movement.
+    Camera coordinates are included so the map doesn't need another fetch.
     """
     plates = (
         db.query(models.Plate)
@@ -364,7 +303,6 @@ def get_route(db: Session, vehicle_id: str):
         .order_by(models.Plate.timestamp.asc())
         .all()
     )
-    # One lookup for every camera involved, rather than a query per sighting.
     camera_ids = {p.camera_id for p in plates}
     cameras = {
         c.id: c for c in db.query(models.Camera).filter(models.Camera.id.in_(camera_ids)).all()
@@ -378,9 +316,8 @@ def get_route(db: Session, vehicle_id: str):
         last_seen = p.last_seen or p.timestamp
         previous = sightings[-1] if sightings else None
         if previous is not None and previous["camera_id"] == cam.id:
-            # Same camera as the previous hop — extend it rather than adding a
-            # duplicate. Keeps the highest confidence actually achieved and any
-            # snapshot we managed to capture.
+            # same camera as last hop, extend it. keep best confidence and
+            # any snapshot we got
             previous["last_seen"] = max(previous["last_seen"], last_seen)
             previous["dwell_seconds"] = max(
                 0.0, (previous["last_seen"] - previous["first_seen"]).total_seconds()
@@ -396,9 +333,7 @@ def get_route(db: Session, vehicle_id: str):
             "location": cam.location or "",
             "lat": cam.lat or 0.0,
             "lng": cam.lng or 0.0,
-            # `timestamp` stays the first-seen instant — the existing API
-            # contract (schemas.SightingOut) and every current caller depend on
-            # this field, so it is preserved, not renamed.
+            # first-seen instant; schemas.SightingOut and callers use this name
             "timestamp": p.timestamp,
             "first_seen": p.timestamp,
             "last_seen": last_seen,
@@ -415,13 +350,9 @@ def get_route(db: Session, vehicle_id: str):
 
 
 def get_vehicle_summary(db: Session, vehicle_id: str, live_window_seconds: float = 120.0) -> dict | None:
-    """Aggregate investigation header for one vehicle: where it is now (or was
-    last), how much we have on it, and an explainable risk score.
-
-    Every number here is counted from real rows. `is_live` in particular is
-    derived from how recently the vehicle was actually seen — the UI must be
-    able to distinguish "on camera now" from "last known position", and a stale
-    row must never be presented as a live one.
+    """Investigation header for one vehicle: where it is (or was last), how
+    much we have on it, and a risk score. Counted from real rows. is_live
+    comes from how recently it was seen, so a stale row never shows as live.
     """
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.id == vehicle_id).first()
     if vehicle is None:
@@ -465,9 +396,7 @@ def get_vehicle_summary(db: Session, vehicle_id: str, live_window_seconds: float
     return {
         "vehicle": vehicle,
         "total_sightings": len(route),
-        # Raw Plate row count is kept separate from the collapsed hop count:
-        # they legitimately differ once consecutive same-camera rows merge, and
-        # conflating them would misreport one of them.
+        # raw row count vs collapsed hops, they differ once same-camera rows merge
         "sighting_records": sighting_rows,
         "cameras_visited": cameras_visited,
         "first_seen": route[0]["first_seen"] if route else vehicle.first_seen,
@@ -497,12 +426,9 @@ def find_similar_person_detections(
     before: datetime | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Ranked candidate list of other person Detection rows whose stored
-    appearance_signature is visually similar to the reference detection's — NOT an
-    identity match, a lead-generation ranking only (see pipeline/appearance.py).
-    Detections without a stored signature (never computed, or the crop was too
-    small) are skipped, never guessed. Returns [] if the reference detection
-    itself has no signature to compare against."""
+    """Other person detections that look like the reference one, ranked. A lead
+    list, not an identity match (pipeline/appearance.py). Detections with no
+    stored signature are skipped; [] if the reference has none."""
     reference = db.query(models.Detection).filter(models.Detection.id == reference_detection_id).first()
     if reference is None or reference.cls != "person" or not reference.appearance_signature:
         return []

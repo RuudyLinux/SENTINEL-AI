@@ -1,14 +1,9 @@
-"""SENTINEL SELF-HEAL — read API for the recovery event log + derived system/
-camera health (see app/self_heal/engine.py for what actually writes these
-events: real recovery code in pipeline/db_retry.py, pipeline/worker.py,
-pipeline/catalog.py — this router only reads/aggregates what those already
-recorded, it performs no recovery itself).
+"""Self-Heal read API: the recovery event log plus derived system/camera
+health. The events are written by app/self_heal/engine.py from the real
+recovery code; this router only reads and aggregates.
 
-All endpoints are authenticated read access (get_current_user) — viewing
-Self-Heal is not a control action (see Part 17: operational recovery only,
-and Part 7's RBAC split reserves CONTROL actions, not visibility, for
-Administrator/Control Room Operator — see routers/cameras.py's bulk
-endpoints for those).
+Any logged-in user can read it. Viewing isn't a control action; the control
+actions (bulk camera ops) need Administrator or Control Room Operator.
 """
 from datetime import datetime, timedelta
 
@@ -36,14 +31,13 @@ def _camera_code_map(db: Session, camera_ids: set[str]) -> dict[str, str]:
     if not camera_ids:
         return {}
     rows = db.query(models.Camera.id, models.Camera.camera_code).filter(models.Camera.id.in_(camera_ids)).all()
-    return {cid: code for cid, code in rows}
+    return dict(rows)
 
 
 @router.get("/health")
 def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """SYSTEM HEALTH panel — every value is a real, live check, not a
-    hardcoded string (same principle as routers/system.py's system_status,
-    which this reuses/extends with the recovery-engine's own view)."""
+    """System health panel. Every value is a live check (like
+    routers/system.py's system_status) plus the recovery engine's view."""
     try:
         db.execute(text("SELECT 1"))
         db_ok = True
@@ -69,10 +63,8 @@ def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(
         .count()
     )
 
-    # A recent (last 5 min) FAILED database event means SQLite contention is
-    # an ongoing, not merely historical, problem — degrades the DATABASE
-    # line even though the plain `SELECT 1` above (run on an otherwise-idle
-    # connection) would itself still succeed.
+    # a FAILED database event in the last 5 min means contention is ongoing,
+    # so degrade DATABASE even though SELECT 1 on an idle connection passes
     recent_db_failure = any(
         p.component == "database" and p.status == "FAILED" and p.timestamp >= datetime.utcnow() - timedelta(minutes=5)
         for p in problems
@@ -83,22 +75,12 @@ def self_heal_health(db: Session = Depends(get_db), user: models.User = Depends(
         "subsystems": {
             "api": "HEALTHY",
             "database": "DEGRADED" if (not db_ok or recent_db_failure) else "HEALTHY",
-            # Final-review audit finding: this used to be a tautological
-            # `len(...) >= 0` (always true) — there is no real "the WS
-            # manager is broken" signal to check (it's an in-process list,
-            # not a connection this process could lose), so honestly this
-            # line is a live check the SAME way "api": "HEALTHY" above is —
-            # this response returning at all proves the process (and
-            # therefore the WS manager module) is up. Not a fake hardcode
-            # dressed as a conditional.
+            # There's nothing that can break about the WS manager (in-process
+            # list), so like "api" above, answering at all is the check.
             "websocket": "CONNECTED",
             "websocket_clients": len(manager.active),
-            # Final-review audit finding: this used to be a dead ternary
-            # (`"IDLE" if total_cameras else "IDLE"` — both branches
-            # identical, total_cameras never actually consulted). There is
-            # no genuine third state to distinguish here yet (a camera-less
-            # deployment and one with cameras but AI off both really are
-            # just "not running"), so simplified to say only what's true.
+            # no real third state yet: no cameras and cameras with AI off
+            # are both just not running
             "ai_engine": "RUNNING" if ai_running else "IDLE",
             "self_heal": "ACTIVE",
         },
@@ -122,10 +104,9 @@ def self_heal_problems(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Every (component, camera) currently NOT resolved — see
-    self_heal.engine.open_problems. Optional filters narrow by component
-    (database | camera | worker | camera_catalog | sentinel_grid) or
-    severity (info | warning | critical)."""
+    """Every (component, camera) not resolved (engine.open_problems).
+    Filter by component (database | camera | worker | camera_catalog |
+    sentinel_grid) or severity (info | warning | critical)."""
     problems = self_heal.open_problems()
     if component:
         problems = [p for p in problems if p.component == component]
@@ -143,17 +124,14 @@ def self_heal_events(
     status: str | None = None,
     severity: str | None = None,
     q: str | None = None,
-    # `ge=1` is not decoration: SQLite reads `LIMIT -1` as NO LIMIT, so an
-    # upper bound alone let `?limit=-1` return the whole self-heal event table
-    # to any authenticated user. Same reasoning, and the same fix, as
-    # detections and review/queue already carry (tests/test_list_limits.py).
+    # ge=1 matters: SQLite reads LIMIT -1 as no limit, and ?limit=-1 handed
+    # any logged-in user the whole table (tests/test_list_limits.py)
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = 0,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """SELF-HEAL → ERROR LOGS / RECOVERY ACTIVITY: searchable, filterable
-    event history, newest first."""
+    """Error logs / recovery activity: searchable event history, newest first."""
     query = db.query(models.SelfHealEvent)
     if component:
         query = query.filter(models.SelfHealEvent.component == component)
@@ -173,10 +151,9 @@ def self_heal_events(
 
 @router.get("/events/{event_id}")
 def self_heal_event_detail(event_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """SELF-HEAL → PROBLEM DETAILS. The timeline shown by the UI is derived
-    from this one real recorded row (detected-at = timestamp - duration,
-    attempts made, recovered/failed-at = timestamp) rather than fabricated
-    per-retry rows we never actually persisted individually."""
+    """Problem details. The UI's timeline is derived from this one row
+    (detected = timestamp - duration, attempts, recovered/failed = timestamp)
+    instead of per-retry rows we never stored."""
     row = db.query(models.SelfHealEvent).filter(models.SelfHealEvent.id == event_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Self-heal event not found")

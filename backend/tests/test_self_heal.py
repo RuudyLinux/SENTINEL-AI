@@ -1,7 +1,5 @@
-"""Self-Heal engine: real DB-backed event recording + open-problem index,
-and the read API that exposes them. Verifies the engine records genuine
-recovery events (not fabricated), that RECOVERED events don't linger as
-"open problems", and that FAILED/CONFIG_REQUIRED ones do."""
+"""Self-Heal engine and read API: real events recorded, RECOVERED ones don't
+stay open problems, FAILED/CONFIG_REQUIRED ones do."""
 import pytest
 
 from app import models
@@ -14,16 +12,10 @@ def _auth(token: str) -> dict:
 
 @pytest.fixture
 def real_cameras(db_session):
-    """SelfHealEvent.camera_id is a real FOREIGN KEY to cameras.id. These
-    tests used to invent ids ("cam_test_bad", "cam_dedup") that no camera row
-    ever had — which only worked while SQLite silently ignored foreign keys.
-    With `PRAGMA foreign_keys=ON` (app/db.py, matching what PostgreSQL has
-    always enforced) those inserts are rejected, and `record_event_sync` —
-    correctly, being best-effort and never-raising — swallowed the failure,
-    so the events simply vanished and the assertions saw an empty set.
-
-    Creating the cameras for real is what production actually does: a
-    self-heal event is always recorded against a camera that exists.
+    """camera_id is a real FK. These tests used made-up ids ("cam_test_bad",
+    "cam_dedup") that only worked while SQLite ignored FKs; with them on the
+    insert fails, record_event_sync swallows it (best effort) and the events
+    just vanished. Real cameras, like production.
     """
     created = []
     for camera_id in ("cam_test_ok", "cam_test_bad", "cam_flap", "cam_dedup"):
@@ -45,12 +37,9 @@ def real_cameras(db_session):
 
 
 def test_record_event_sync_persists_a_real_row(db_session):
-    # `_recovered_claims` is module-global dedup state: a RECOVERED event for
-    # the same (component, camera_id, error_type) recorded recently by ANY
-    # earlier test suppresses this one, and record_event_sync then correctly
-    # returns None. The concurrency tests genuinely produce
-    # ("database", None, "SQLITE_LOCK") events, which is exactly this key.
-    # Caught by the --random-order gate; invisible under alphabetical order.
+    # _recovered_claims is module-global dedup: a RECOVERED event for the same
+    # key from an earlier test suppresses this one. The concurrency tests
+    # produce ("database", None, "SQLITE_LOCK") for real. --random-order found it.
     self_heal._recovered_claims.clear()
     row = self_heal.record_event_sync(
         component="database", error_type="SQLITE_LOCK", severity="warning",
@@ -126,12 +115,9 @@ def test_self_heal_event_detail_404_for_unknown_id(client, admin_token):
 
 
 def test_repeated_recovered_events_for_the_same_condition_are_deduped(real_cameras):
-    """Audit finding: sustained-but-transient contention on one camera can
-    hit-and-recover a lock on nearly every heartbeat — logging every single
-    one would drown the Error Log. A repeat RECOVERED for the identical
-    (component, camera_id, error_type) within the dedup window is suppressed
-    (returns None, no new row); a still-real FAILED for the same key is
-    never suppressed."""
+    """A camera under steady contention can recover a lock on almost every
+    heartbeat. Repeat RECOVERED events for the same key inside the window
+    are suppressed (None, no row); FAILED for the same key never is."""
     self_heal._recovered_claims.clear()
     first = self_heal.record_event_sync(
         component="database", camera_id="cam_dedup", error_type="SQLITE_LOCK",

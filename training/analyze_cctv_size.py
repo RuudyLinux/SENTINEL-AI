@@ -2,22 +2,17 @@
 
     python analyze_cctv_size.py <footage...> --camera C-014 --out report.md
 
-**Authorization is a precondition, not a formality.** This tool reads whatever
-path it is given; it cannot tell an authorized recording from an unauthorized
-one. Running it against camera footage without the written data-use agreement
-described in `docs/ANPR_M0_DATA_ACQUISITION.md` §2C is not a technical error
-this program can catch, and is exactly what M0 blocks.
+Authorization comes first. This reads whatever path you give it and can't
+tell authorized footage from unauthorized; running it without the data-use
+agreement in docs/ANPR_M0_DATA_ACQUISITION.md §2C is exactly what M0 blocks.
 
-What it does NOT do, by construction: no network access, no cloud vision API, no
-external OCR service, no upload, and no OCR at all. It measures geometry. Plate
-TEXT is never read, never stored and never logged — the question here is how
-many pixels a plate has, and answering it does not require knowing which vehicle
-it is. That keeps this tool usable at a lower privacy tier than annotation.
+No network, no cloud vision API, no OCR at all: it measures geometry. Plate
+text is never read, stored or logged, which keeps this at a lower privacy
+tier than annotation.
 
-Design note: OpenCV and the plate detector are imported LAZILY, inside the
-functions that need them. The statistics core (`sizing.py`) is stdlib-only and
-fully tested without them, so the whole measurement can be verified on synthetic
-observations before any footage exists.
+OpenCV and the plate detector are imported lazily. The statistics core
+(sizing.py) is stdlib-only and tested without them, so the whole measurement
+can be checked on synthetic data before any footage exists.
 """
 from __future__ import annotations
 
@@ -36,11 +31,9 @@ VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".m4v", ".ts"}
 
 
 def _load_detector():
-    """Import the repository's plate detector on demand.
-
-    Kept lazy and behind a clear failure message: the training tooling must not
-    require the inference stack to be installed, and someone running only the
-    synthetic tests should never need torch.
+    """Import the repo's plate detector on demand, with a clear error. The
+    training tooling mustn't need the inference stack; the synthetic tests
+    never need torch.
     """
     backend = Path(__file__).resolve().parent.parent / "backend"
     if str(backend) not in sys.path:
@@ -61,10 +54,10 @@ def observations_from_annotations(
 ) -> list[PlateObservation]:
     """Read human-drawn boxes from a JSONL manifest.
 
-    The preferred input: these are ground truth, so the resulting statistics are
-    not subject to the detector's measured unreliability. Accepts the M1 record
-    shape, and also a minimal `{camera_id, frame_index, frame_width,
-    frame_height, plate_bbox}` form for a quick manual calibration sample.
+    Preferred: they're ground truth, so the stats don't inherit the
+    detector's unreliability. Takes the M1 record shape, or a minimal
+    {camera_id, frame_index, frame_width, frame_height, plate_bbox} for a
+    quick manual calibration sample.
     """
     observations: list[PlateObservation] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -95,11 +88,9 @@ def observations_from_annotations(
 
 
 def _detect_in_frame(plate_detector, frame, camera_id, frame_index, time_of_day):
-    """Every plate region in one frame — all of them, not just the best.
-
-    A frame legitimately contains several vehicles, and measuring only the
-    top-scoring box would bias the distribution toward whichever plate happens
-    to be largest or most central.
+    """Every plate region in one frame, not just the best. Frames have
+    several vehicles, and only the top box would bias toward the largest or
+    most central plate.
     """
     height, width = frame.shape[:2]
     observations = []
@@ -111,10 +102,8 @@ def _detect_in_frame(plate_detector, frame, camera_id, frame_index, time_of_day)
             frame_height=height,
             bbox=(float(box.x1), float(box.y1), float(box.x2), float(box.y2)),
             source=SOURCE_DETECTOR,
-            # No tracker is run here, so each detection is its own "track".
-            # Frame-weighted and vehicle-weighted figures will therefore
-            # coincide, and the report says so rather than implying a vehicle
-            # count it does not have.
+            # no tracker here, each detection is its own "track", so frame- and
+            # vehicle-weighted figures coincide (the report says so)
             track_id=f"{camera_id}_f{frame_index}_{box.x1}_{box.y1}",
             detector_confidence=float(box.confidence),
             time_of_day=time_of_day,
@@ -147,7 +136,7 @@ def analyze_video(
             _detect_in_frame(plate_detector, frame, camera_id, index, time_of_day)
         )
     capture.release()
-    # Deliberately reports counts only — never a filename with a plate in it.
+    # counts only, never a filename with a plate in it
     print(f"  {path.name}: {len(wanted)} frames sampled, {len(observations)} plate regions",
           file=sys.stderr)
     return observations

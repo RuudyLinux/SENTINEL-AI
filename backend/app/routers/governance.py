@@ -1,10 +1,9 @@
-"""Privacy / governance controls (10/10 roadmap P13).
+"""Privacy / governance controls.
 
-This module provides MECHANISM (configurable retention, an audited purge
-workflow, operator accountability), never POLICY. `settings.evidence_retention_days`
-is not a legal claim — this platform cannot know which retention period
-applies to a given deployment's jurisdiction, agency policy, or an active
-investigation. See docs/PRIVACY_GOVERNANCE.md.
+Mechanism only (configurable retention, an audited purge, accountability),
+never policy. evidence_retention_days isn't a legal claim; the platform can't
+know what period applies to a jurisdiction, agency or open investigation.
+See docs/PRIVACY_GOVERNANCE.md.
 """
 from datetime import datetime, timedelta
 
@@ -29,9 +28,8 @@ def _expired_evidence_query(db: Session):
 
 @router.get("/retention-policy")
 def retention_policy(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Auditor"))):
-    """What is configured, and how many evidence rows are currently eligible
-    for purge under it — read-only, safe for an Auditor to check at any time
-    without the ability to trigger deletion (that requires Administrator)."""
+    """What's configured and how many evidence rows are eligible for purge.
+    Read-only, fine for an Auditor; purging needs Administrator."""
     q = _expired_evidence_query(db)
     return {
         "evidence_retention_days": settings.evidence_retention_days,
@@ -50,13 +48,10 @@ def purge_expired(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator")),
 ):
-    """Purge evidence older than `evidence_retention_days`. Dry-run by
-    default: `dry_run=True` (or omitted) lists what WOULD be purged without
-    touching anything. Real deletion requires BOTH `dry_run=False` AND
-    `confirm=True` in the same request. Every real purge is fully audited —
-    which evidence ids, by whom, when — because an unaudited deletion of
-    evidence is exactly the kind of action a chain-of-custody system must
-    never allow silently."""
+    """Purge evidence older than evidence_retention_days. Dry run by default,
+    only lists what would go. Actually deleting needs dry_run=False AND
+    confirm=True. Every real purge is audited (which ids, who, when); evidence
+    must never disappear silently."""
     if settings.evidence_retention_days is None:
         raise HTTPException(
             status_code=400,
@@ -86,9 +81,7 @@ def purge_expired(
                 if os.path.exists(evidence.file_path):
                     os.remove(evidence.file_path)
             except OSError:
-                # A file that cannot be removed must not silently pretend to
-                # have been purged — its DB row is left in place so the
-                # discrepancy is visible, not swallowed.
+                # couldn't remove the file: keep the DB row so the mismatch shows
                 continue
         db.delete(evidence)
         deleted_ids.append(evidence.id)
@@ -105,9 +98,8 @@ def purge_expired(
 
 
 def _purgeable_detections_query(db: Session):
-    """Old detections nothing else points at. A detection that fired an alert,
-    identified a plate read, or is linked from an evidence item is part of the
-    record of an event and is never eligible, whatever its age."""
+    """Old detections nothing points at. One that fired an alert, has a plate
+    read or is linked from evidence is part of an event and never eligible."""
     if settings.detection_retention_days is None:
         return None
     cutoff = datetime.utcnow() - timedelta(days=settings.detection_retention_days)
@@ -128,12 +120,11 @@ def purge_detections(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator")),
 ):
-    """Purge raw detection rows older than `detection_retention_days`.
+    """Purge raw detections older than detection_retention_days.
 
-    Same contract as /purge-expired: dry-run unless BOTH `dry_run=False` and
-    `confirm=True`, and every call is audited. Alerts, incidents, evidence,
-    plate reads, tracks and the audit log are never touched, and neither is any
-    detection they reference.
+    Same rules as /purge-expired (dry run unless dry_run=False and
+    confirm=True, always audited). Alerts, incidents, evidence, plate reads,
+    tracks, the audit log and any detection they reference are untouched.
     """
     if settings.detection_retention_days is None:
         raise HTTPException(

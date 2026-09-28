@@ -152,7 +152,9 @@ claim from going stale between real runs — it is not a substitute for one.
 
 **Demo procedure (real grid cameras).**
 
-1. Keep `SENTINEL_GRID_AUTOCONNECT=false` so no camera connects by itself.
+1. With `SENTINEL_GRID_AUTOCONNECT=true` (the default) every grid camera
+   connects at startup and reconnects on its own; AI rotates across them (see
+   *AI capacity guard*). Set it to `false` to connect cameras by hand.
 2. Run `start.bat`. It starts the backend on the GPU environment
    (`backend/.venv-gpu`) when CUDA works there and on the CPU environment
    (`backend/.venv`) otherwise, and prints which. It builds and serves the
@@ -573,16 +575,37 @@ Superseded by **`docs/AI_ACCURACY.md`** (2026-09-28): a reproducible benchmark o
 `MAX_AI_CAMERAS` caps how many cameras run AI at once. Unset, it is 1 on CPU
 and 2 when CUDA is available; `DETECT_EVERY_N_FRAMES` likewise defaults to 3 on
 CPU and 1 with CUDA. An explicit value in the environment always wins. Connecting
-more cameras is allowed. They stream live video without AI, and the camera card
-shows **AI WAITING**. Starting AI beyond the limit is refused with *"AI capacity
-limit reached (N AI camera(s) on this machine). Stop AI on another camera
-first, or run the GPU runtime (see README)."* The worker enforces the same slot
-check, so no path (bulk action, PATCH, restart, supervisor) can exceed it. A
-worker that stops on its own (crash, source that cannot be opened) frees its
-slot. Before this was fixed, such a camera kept the only slot until someone
-pressed disconnect.
-`GET /api/cameras/diagnostics/system` reports `ai_device`, `ai_cameras` and
-`max_ai_cameras`.
+more cameras is allowed. They stream live video without AI while they wait,
+and the camera card shows **AI WAITING**.
+
+The slots rotate: a camera that has had one for `AI_ROTATION_SECONDS` (default
+60) hands it to the camera that has waited longest, so with every camera
+connected each gets AI in turn (30 cameras on 2 slots: 60s of AI about every
+15 minutes). A camera that loses its turn frees its model, since a 4 GB GPU
+can't hold one per camera. `AI_ROTATION_SECONDS=0` gives fixed slots, where
+starting AI on a full machine is refused with *"AI capacity limit reached"*.
+The worker enforces the slot check, so no path (bulk action, PATCH, restart,
+supervisor) can exceed it. A worker that stops or stalls frees its slot.
+`GET /api/cameras/diagnostics/system` reports `ai_device`, `ai_cameras`,
+`ai_waiting` and `max_ai_cameras`.
+
+### Recording (REC)
+
+The **REC** button on a camera's live page records the view with AI boxes to
+an H.264 MP4 at `RECORDING_FPS` (10). It stops when pressed again, after
+`RECORDING_MAX_SECONDS` (30 min), when the camera stops, or when frames stop
+arriving for 15s, and is then saved as SHA-256-hashed evidence
+(`evidence_type="recording"`). At most `RECORDING_MAX_CONCURRENT` (4) run at
+once. Administrator and Control Room Operator only; starts, stops and saves are
+audited.
+
+### Zone alert thresholds
+
+Zone alerts need a detection confidence of `ZONE_ALERT_MIN_CONFIDENCE` (0.40)
+and, for a tracked object, `ZONE_ENTRY_MIN_FRAMES` (2) inference frames inside
+the zone, so a one-frame ghost box doesn't raise an alert. Lower-confidence
+boxes are still tracked, stored and drawn. `ZONE_ENTRY_MIN_FRAMES=1` restores
+the old behaviour. Not yet measured on labelled footage.
 
 ### GPU runtime (optional, measured 2026-09-28)
 

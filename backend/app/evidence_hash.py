@@ -1,33 +1,23 @@
-"""SHA-256 hashing for evidence files.
+"""SHA-256 for evidence files.
 
-Lives in its own module because the hash must be taken at CAPTURE time, by the
-pipeline that writes the file, while the comparison happens later in the
-evidence API — and the two must use identical bytes-to-digest logic or every
-comparison would be a false mismatch.
-
-Why capture-time: the digest is only evidence of integrity if it was recorded
-before anyone could alter the file. Hashing on first inspection instead — which
-is what this system did — records whatever the file contains at that moment and
-proves nothing about what was originally captured.
+Taken at capture by the pipeline and compared later by the evidence API, so
+both have to use the same logic. Capture time because a digest only proves
+integrity if it was recorded before anyone could change the file; hashing on
+first inspection (what we used to do) proves nothing.
 """
 import hashlib
 import logging
 
 logger = logging.getLogger("sentinel.evidence")
 
-# Files are read in chunks rather than whole: an event clip is a real MP4, and
-# reading one fully into memory to hash it would spike a process that is
-# simultaneously decoding several camera streams.
+# chunked, clips are real MP4s and this process is decoding several streams
 _CHUNK_BYTES = 1024 * 1024
 
 
 def sha256_file(path: str | None) -> str:
-    """Digest of the file at `path`, or "" if it cannot be read.
-
-    Never raises. Hashing is an integrity aid, not the operation itself — a
-    snapshot that was genuinely captured must still be recorded as evidence
-    even if hashing it fails, with an empty digest honestly showing that no
-    baseline exists rather than a fabricated one.
+    """Digest of the file, or "" if unreadable. Never raises: a snapshot that
+    was really captured still gets recorded, with an empty digest showing
+    there's no baseline.
     """
     if not path:
         return ""

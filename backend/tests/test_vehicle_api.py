@@ -1,9 +1,6 @@
-"""V2 Phase 2 — the vehicle investigation API.
-
-Covers the endpoints the plate-first investigation flow depends on:
-plate -> vehicle, vehicle -> summary, vehicle -> journey, vehicle -> raw
-sightings. The flow starts from a plate an officer types, so resolving that
-plate correctly (and refusing to guess when it does not exist) is the contract.
+"""The vehicle investigation API: plate -> vehicle, summary, journey, raw
+sightings. It starts from a plate an officer types, so resolving that
+correctly (and not guessing when it doesn't exist) is the main contract.
 """
 import uuid
 from datetime import datetime, timedelta
@@ -21,8 +18,8 @@ def auth(admin_token):
 
 @pytest.fixture
 def seeded_vehicle():
-    """A vehicle with a real three-camera journey, written directly so the test
-    exercises the API rather than the detection pipeline."""
+    """A vehicle with a three-camera journey, written directly so the test
+    is about the API, not detection."""
     suffix = uuid.uuid4().hex[:4].upper()
     plate = f"GJ05VA{suffix}"
     db = SessionLocal()
@@ -66,16 +63,15 @@ class TestResolveByPlate:
         assert resp.json()["id"] == seeded_vehicle["vehicle_id"]
 
     def test_normalizes_the_input_the_same_way_the_pipeline_does(self, client, auth, seeded_vehicle):
-        """An officer types 'GJ 05 AB 1234'; OCR stored 'GJ05AB1234'. Both must
-        resolve, or the search silently fails on correct input."""
+        """'GJ 05 AB 1234' typed, 'GJ05AB1234' stored; both resolve."""
         spaced = seeded_vehicle["plate"][:2] + " " + seeded_vehicle["plate"][2:4] + " " + seeded_vehicle["plate"][4:]
         resp = client.get(f"/api/vehicles/by-plate/{spaced.lower()}", headers=auth)
         assert resp.status_code == 200
         assert resp.json()["id"] == seeded_vehicle["vehicle_id"]
 
     def test_an_unknown_plate_is_a_404_not_an_arbitrary_match(self, client, auth):
-        """The pre-V2 frontend list-searched and took the first result, which
-        quietly returned an unrelated vehicle on a substring hit."""
+        """The old frontend took the first list-search hit, an unrelated
+        vehicle on a substring match."""
         resp = client.get("/api/vehicles/by-plate/GJ99ZZ0000", headers=auth)
         assert resp.status_code == 404
         assert "GJ99ZZ0000" in resp.json()["detail"]
@@ -96,8 +92,7 @@ class TestVehicleSummary:
         assert body["vehicle"]["plate_text"] == seeded_vehicle["plate"]
 
     def test_a_vehicle_last_seen_hours_ago_is_not_reported_as_live(self, client, auth, seeded_vehicle):
-        """The UI must be able to say 'last known position' rather than
-        implying the vehicle is on camera right now."""
+        """The UI can say "last known position" instead of "on camera now"."""
         body = client.get(f"/api/vehicles/{seeded_vehicle['vehicle_id']}/summary", headers=auth).json()
         assert body["is_live"] is False
         assert body["current_seen_at"] is not None
@@ -132,8 +127,7 @@ class TestVehicleRoute:
 
 class TestVehicleSightings:
     def test_returns_the_raw_uncollapsed_records(self, client, auth, seeded_vehicle):
-        """`/route` collapses consecutive same-camera hops for readability; an
-        investigator still needs the underlying evidence unmodified."""
+        """/route collapses same-camera hops; this is the raw evidence."""
         resp = client.get(f"/api/vehicles/{seeded_vehicle['vehicle_id']}/sightings", headers=auth)
         assert resp.status_code == 200
         rows = resp.json()

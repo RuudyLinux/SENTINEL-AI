@@ -1,10 +1,8 @@
-"""Confidence-aware intelligence (10/10 roadmap P5): a watchlist match must not
-carry the same alert severity when the underlying plate read is uncertain.
-Before this, `rules_engine.evaluate` set severity=CRITICAL for ANY
-`vehicle.watchlist_flag`, regardless of `vehicle.plate_confidence` — a 48%
-guess produced an identical alert to a 94% confident read. The match itself
-must still fire (never silence a real watchlist hit for being uncertain);
-only its severity and reason string change.
+"""Watchlist alert severity follows how sure the plate read is.
+
+rules_engine used to make every watchlist_flag hit CRITICAL, so a 48% read
+alerted the same as a 94% one. The match still fires; only severity and
+reason text change.
 """
 import asyncio
 import uuid
@@ -14,6 +12,14 @@ import pytest
 from app import models
 from app.config import settings
 from app.pipeline import rules_engine
+
+
+@pytest.fixture(autouse=True)
+def _one_frame_zone_entry(monkeypatch):
+    # these tests fire a zone alert from one tracked frame; the multi-frame
+    # confirmation has its own tests in test_zone_alert_accuracy.py
+    from app.config import settings as _settings
+    monkeypatch.setattr(_settings, "zone_entry_min_frames", 1)
 
 
 @pytest.fixture(autouse=True)
@@ -38,9 +44,8 @@ def _camera(db) -> models.Camera:
 def _watchlisted_vehicle(
     db, plate: str, plate_confidence: float, corroborated: bool = True,
 ) -> models.Vehicle:
-    """`corroborated` defaults True so the tests below isolate the CONFIDENCE
-    dimension, which is what this module is about. Corroboration is a second,
-    independent gate with its own tests in `TestCorroborationGate`."""
+    """corroborated defaults True so these isolate confidence; corroboration
+    has its own tests in TestCorroborationGate."""
     db.add(models.WatchlistEntry(
         entity_type="plate", identifier=plate, priority="CRITICAL", active=True, reason="test",
     ))
@@ -76,11 +81,11 @@ def test_high_confidence_watchlist_match_is_critical(db_session):
 def test_low_confidence_watchlist_match_is_capped_at_high_but_still_fires(db_session):
     camera = _camera(db_session)
     low_confidence = settings.watchlist_high_confidence_floor - 0.10
-    assert low_confidence > settings.plate_min_confidence  # still a real, gate-passing read — not garbage
+    assert low_confidence > settings.plate_min_confidence  # still a real passing read
     vehicle = _watchlisted_vehicle(db_session, f"GJ05LC{uuid.uuid4().hex[:4].upper()}", plate_confidence=low_confidence)
     alerts = asyncio.run(rules_engine.evaluate(db_session, camera, _detection(db_session, camera), 100, 100, vehicle))
 
-    # Never silenced — a real watchlist hit still produces an alert.
+    # still alerts
     assert len(alerts) == 1
     assert alerts[0].severity == "HIGH"
     assert "LOW CONFIDENCE" in alerts[0].reasons[0]
@@ -88,10 +93,8 @@ def test_low_confidence_watchlist_match_is_capped_at_high_but_still_fires(db_ses
 
 
 def test_low_confidence_match_still_escalates_to_critical_via_other_signals(db_session):
-    """The confidence cap only limits the WATCHLIST rule's own contribution.
-    A separately-earned CRITICAL (e.g. a restricted zone entered in the same
-    evaluation) must still be able to raise the final severity — the risk
-    score is a floor-raising mechanism, never suppressed by this cap."""
+    """The cap only limits the watchlist rule. A CRITICAL earned elsewhere in
+    the same evaluation (say a restricted zone) still counts."""
     camera = _camera(db_session)
     zone = models.Zone(
         name="Secure Yard", camera_id=camera.id, x1=0.0, y1=0.0, x2=1.0, y2=1.0,
@@ -111,26 +114,19 @@ def test_low_confidence_match_still_escalates_to_critical_via_other_signals(db_s
 
 
 class TestCorroborationGate:
-    """A1 precision hardening (2026-09-12): a watchlist match may only reach
-    CRITICAL if the plate read was corroborated ACROSS FRAMES, not merely
-    confident.
+    """CRITICAL needs the read corroborated across frames, not just confident.
 
-    Why this gate exists, measured rather than assumed (docs/ANPR_ACCURACY.md,
-    "A1"): on the labelled benchmark, OCR confidence does NOT separate correct
-    reads from wrong ones. Correct reads span 0.262-0.990; wrong plate-shaped
-    reads span 0.260-0.956, and SIX OF SEVEN wrong reads sit at or above the
-    lowest correct read's confidence. No confidence threshold on that corpus
-    reaches precision above 0.5.
+    On the benchmark (docs/ANPR_ACCURACY.md, "A1") confidence doesn't
+    separate right from wrong: correct 0.262-0.990, wrong plate-shaped
+    0.260-0.956, 6 of 7 wrong reads at or above the lowest correct one, no
+    threshold above 0.5 precision.
 
-    The concrete failure: `UP84AE9889` was misread as `UP81AE9889` at 0.956.
-    Under a confidence-only gate that single frame clears the 0.60 floor, raises
-    a CRITICAL alert and auto-opens an incident naming a vehicle that was never
-    there.
+    UP84AE9889 read as UP81AE9889 at 0.956 would clear the 0.60 floor, raise
+    CRITICAL and open an incident about a car that was never there.
     """
 
     def test_a_confident_but_uncorroborated_match_is_capped_at_high(self, db_session):
-        """The regression test for the defect. 0.956 is the real confidence of a
-        real misread in the benchmark corpus."""
+        """0.956 is the real confidence of a real misread in the corpus."""
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(
             db_session, f"UP81AE{uuid.uuid4().hex[:4].upper()}",
@@ -163,8 +159,8 @@ class TestCorroborationGate:
         assert alerts[0].severity == "CRITICAL"
 
     def test_corroboration_does_not_rescue_a_low_confidence_read(self, db_session):
-        """The two gates are independent and BOTH must pass. Corroborating a
-        read the engine barely made does not make it confident."""
+        """Both gates apply; corroborating a barely-made read doesn't make it
+        confident."""
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(
             db_session, f"GJ05LC{uuid.uuid4().hex[:4].upper()}",
@@ -177,9 +173,8 @@ class TestCorroborationGate:
         assert any("LOW CONFIDENCE" in reason for reason in alert_reasons(alerts[0]))
 
     def test_a_null_corroboration_flag_is_treated_as_not_corroborated(self, db_session):
-        """Rows predating the column, and the legacy single-frame ANPR path, have
-        genuinely unknown provenance. The safe default for a missing safety
-        signal is 'not satisfied' — unknown must not buy CRITICAL."""
+        """Old rows and the legacy single-frame path have unknown provenance;
+        unknown doesn't get CRITICAL."""
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(
             db_session, f"GJ05NU{uuid.uuid4().hex[:4].upper()}", plate_confidence=0.99,
@@ -192,8 +187,8 @@ class TestCorroborationGate:
         assert alerts[0].severity == "HIGH"
 
     def test_the_escape_hatch_restores_the_previous_behaviour(self, db_session, monkeypatch):
-        """WATCHLIST_REQUIRE_CORROBORATION=false is a real revert, not
-        decoration: one env var returns confidence-only escalation."""
+        """WATCHLIST_REQUIRE_CORROBORATION=false really goes back to
+        confidence-only escalation."""
         monkeypatch.setattr(settings, "watchlist_require_corroboration", False)
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(
@@ -206,8 +201,7 @@ class TestCorroborationGate:
         assert alerts[0].severity == "CRITICAL"
 
     def test_an_uncorroborated_match_does_not_auto_open_an_incident(self, db_session):
-        """The operational point of the whole change. An incident is a real
-        investigative artefact; one unconfirmed frame must not create one."""
+        """One unconfirmed frame mustn't open an incident."""
         camera = _camera(db_session)
         vehicle = _watchlisted_vehicle(
             db_session, f"GJ05NI{uuid.uuid4().hex[:4].upper()}",

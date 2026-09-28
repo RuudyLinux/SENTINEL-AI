@@ -1,20 +1,19 @@
-"""Synthetic dataset fixtures for testing the tooling.
+"""Synthetic fixtures for testing the tooling.
 
-**No real plate images, no real registrations, no network, no model weights.**
-Every record here is invented. Plate strings use the Indian *format* because the
-tooling's behaviour depends on the shape, but the registrations themselves are
-fabricated and correspond to no vehicle.
+No real plate images, registrations, network or weights. Plates use the Indian
+format because the tooling cares about shape, but the registrations are made
+up and match no vehicle.
 
-These fixtures exist so the entire M1 pipeline — schema, split, QC, leakage
-gate, reports, metrics — is testable before any authorized data exists, which is
-the whole point of doing M1 while M0 is blocked.
+They make the whole M1 pipeline (schema, split, QC, leakage gate, reports,
+metrics) testable before any authorized data exists, which is the point of
+doing M1 while M0 is blocked.
 """
 from __future__ import annotations
 
 from schema import PlateRecord
 
-# Fabricated. Deliberately mixes well-formed registrations with legitimately
-# unusual ones, so tests can assert that unusual != invalid.
+# made up. mixes normal registrations with odd but legit ones so tests can
+# check unusual != invalid
 _STATES = ("GJ", "MH", "KA", "KL", "TN", "UP", "RJ", "WB", "DL", "MP")
 
 
@@ -43,11 +42,9 @@ def make_record(
 
 
 def clean_dataset(vehicles: int = 30, frames_per_vehicle: int = 3) -> list[PlateRecord]:
-    """A well-formed corpus: several frames per vehicle, several cameras.
-
-    Each frame of a vehicle gets a slightly different bbox, mirroring a real
-    tracked vehicle moving through frame — and avoiding the identical-geometry
-    near-duplicate warning, which is itself tested separately.
+    """Well-formed corpus: several frames per vehicle, several cameras. Each
+    frame's bbox shifts a little like a real track, which also avoids the
+    identical-geometry near-duplicate warning (tested separately).
     """
     records: list[PlateRecord] = []
     for index in range(vehicles):
@@ -65,8 +62,7 @@ def clean_dataset(vehicles: int = 30, frames_per_vehicle: int = 3) -> list[Plate
 
 
 def dataset_with_leakage() -> list[PlateRecord]:
-    """One vehicle deliberately placed in both train and test — the fatal case
-    the CI gate must catch."""
+    """One vehicle in both train and test, the case the CI gate must catch."""
     return [
         make_record("vehicle_001", 0, "GJ05AB1234", split="train"),
         make_record("vehicle_001", 1, "GJ05AB1234", split="test"),
@@ -96,11 +92,9 @@ def malformed_records() -> dict[str, dict]:
 
 
 def qc_problem_records() -> dict[str, PlateRecord]:
-    """Records that PARSE but that QC must flag, keyed by the expected code.
-
-    These are the semantic problems — a record can be structurally fine and
-    still be unusable, or fine and merely unusual. Keeping the two apart is the
-    design this exercises.
+    """Records that parse but QC must flag, keyed by expected code. A record
+    can be structurally fine and still unusable, or fine and just unusual;
+    this keeps those apart.
     """
     return {
         "degenerate_bbox": make_record("v_deg", plate_bbox=[100.0, 200.0, 100.0, 200.0]),
@@ -123,9 +117,8 @@ def qc_problem_records() -> dict[str, PlateRecord]:
 
 
 def rare_character_dataset() -> list[PlateRecord]:
-    """A corpus whose plates deliberately omit `I O Q V Z` — reproducing the
-    exact gap measured in the current n=25 benchmark corpus, so the coverage
-    report can be asserted to surface it."""
+    """Plates without I O Q V Z, the same gap as the current n=25 benchmark,
+    so the coverage report can be checked to show it."""
     return [
         make_record(f"vehicle_{i:03d}", 0, text, split="train")
         for i, text in enumerate(("GJ05AB1234", "MH12CD5678", "KA03EF9012", "TN07GH3456"))
@@ -133,10 +126,8 @@ def rare_character_dataset() -> list[PlateRecord]:
 
 
 def size_bucket_dataset() -> list[PlateRecord]:
-    """One record per plate-size bucket, for testing the size report.
-
-    Heights are chosen so that `glyph_px = height * 0.55` lands inside each
-    bucket: 30 -> 16.5px, 90 -> 49.5px... and so on.
+    """One record per plate-size bucket. Heights put glyph_px = height * 0.55
+    inside each bucket: 30 -> 16.5px, 90 -> 49.5px, and so on.
     """
     heights = {"<20px": 30, "20-30px": 50, "30-50px": 80, "50-75px": 120,
                "75-100px": 170, ">100px": 400}

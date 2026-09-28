@@ -16,16 +16,17 @@ export default function AnprPage() {
     e.preventDefault();
     setError(null);
     try {
-      // An exact plate goes straight to that vehicle's investigation page —
-      // the officer typed a specific plate, so landing on a result list they
-      // then have to click through is a wasted step. A partial/near match
-      // still falls back to the list below.
-      try {
-        const exact = await api.get<any>(`/api/vehicles/by-plate/${encodeURIComponent(plate)}`);
-        router.push(`/vehicles/${exact.id}`);
-        return;
-      } catch (err) {
-        if (!(err instanceof ApiError) || err.status !== 404) throw err;
+      // exact plate goes straight to that vehicle, no point making the officer
+      // click through a one-result list. partial matches still get the list
+      // empty box lists everything; /by-plate/ with no plate is always a 404
+      if (plate.trim()) {
+        try {
+          const exact = await api.get<any>(`/api/vehicles/by-plate/${encodeURIComponent(plate.trim())}`);
+          router.push(`/vehicles/${exact.id}`);
+          return;
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 404) throw err;
+        }
       }
       const vehicles = await api.get<any[]>(`/api/vehicles?plate=${encodeURIComponent(plate)}`);
       setResults(vehicles);

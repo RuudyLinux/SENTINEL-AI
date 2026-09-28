@@ -1,9 +1,8 @@
 """Make the training tooling importable as top-level modules.
 
-`training/` is deliberately NOT a package and NOT importable from `backend/`:
-the dataset tooling must never pull in the inference stack (torch, OpenCV,
-ultralytics), and the backend image must never carry the training code. Keeping
-them as two independent roots is what enforces that separation.
+training/ isn't a package and can't be imported from backend/: dataset
+tooling must never pull in torch/OpenCV/ultralytics, and the backend image
+must never carry training code. Two separate roots keep it that way.
 """
 import sys
 from pathlib import Path

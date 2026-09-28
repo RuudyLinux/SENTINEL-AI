@@ -1,24 +1,17 @@
-"""`Camera.status` (the legacy 3-value DB column) and `grid_state` (the real
-9-state runtime lifecycle) used to be two independently-written literals at
-8 call sites in worker.py — two of them ("degraded" next to `_set_grid_state
-(..., "DEGRADED")`) already paired by hand, six of them not paired at all.
-Nothing stopped an edit to one from silently leaving the other stale, which
-is exactly the audit finding: 33 workers running while 31 cameras reported
-`status: degraded` with `last_error: none`.
+"""Camera.status (3-value DB column) and grid_state (9-state lifecycle) used
+to be written separately at 8 sites in worker.py, 2 paired by hand and 6 not
+at all. That's how 33 workers were running while 31 cameras said "degraded"
+with no last_error.
 
-_DB_STATUS_FOR_GRID_STATE (worker.py) is now the one place that decision is
-made; every one of those 8 sites derives `camera.status` from the SAME local
-variable it passes to `_set_grid_state`. This file locks down the table
-itself — that it only ever produces a value the DB column actually accepts,
-and that its coverage matches which grid_state transitions historically
-wrote to the DB and which deliberately did not (see the ERROR case below).
+Now every site derives status from the same variable it passes to
+_set_grid_state via _DB_STATUS_FOR_GRID_STATE. This pins the table: only
+values the column accepts, and coverage matching which transitions
+historically wrote status and which deliberately didn't (ERROR, below).
 """
 from app.pipeline import worker
 
-#: The only three values `Camera.status` has ever been documented to hold —
-#: see the comment worker.py itself quotes at `_stats()`'s definition of
-#: `grid_state`. A table entry producing anything else would be silently
-#: writing a status no other code in this application expects.
+# the only three values Camera.status has ever held; anything else would be
+# a status no other code expects
 _VALID_DB_STATUSES = {"online", "offline", "degraded"}
 
 
@@ -32,10 +25,8 @@ class TestTableProducesOnlyRealStatuses:
 
 
 class TestCoverageMatchesHistoricalBehaviour:
-    """Which grid_state transitions wrote to `Camera.status` at all, verified
-    by reading every one of the 8 sites before this table existed. A state
-    silently gaining or losing an entry here is a real behaviour change to
-    catch, not a detail to let drift."""
+    """Which transitions wrote Camera.status, from reading all 8 sites
+    before the table existed. Gaining or losing an entry is a behaviour change."""
 
     def test_every_settled_running_state_has_a_mapping(self):
         for state in ("CONNECTED", "PROCESSING", "DEGRADED", "RECONNECTING",
@@ -43,11 +34,9 @@ class TestCoverageMatchesHistoricalBehaviour:
             assert state in worker._DB_STATUS_FOR_GRID_STATE, state
 
     def test_in_flight_and_transient_states_have_no_mapping(self):
-        """CONNECTING/DISCOVERING: no site ever wrote camera.status while a
-        connection attempt was merely in progress — only once it resolved.
-        ERROR: the generic per-iteration exception handler, a genuine hot
-        path — forcing a DB write on every transient blip would be a real,
-        unmeasured cost this refactor must not introduce."""
+        """CONNECTING/DISCOVERING never wrote status mid-attempt, only once it
+        resolved. ERROR is the per-iteration catch-all, a hot path; a DB write
+        per blip would be a new cost."""
         for state in ("CONNECTING", "DISCOVERING", "ERROR"):
             assert state not in worker._DB_STATUS_FOR_GRID_STATE, (
                 f"{state} gained a DB-status mapping — if that is deliberate, "
@@ -56,25 +45,22 @@ class TestCoverageMatchesHistoricalBehaviour:
             )
 
     def test_the_table_covers_every_state_that_is_neither_in_flight_nor_error(self):
-        """Inverse of the two tests above, so a NINTH grid_state added later
-        can't silently fall into neither bucket."""
+        """So a ninth state added later can't land in neither bucket."""
         transient = {"CONNECTING", "DISCOVERING", "ERROR"}
         settled = worker.GRID_STATES - transient
         assert set(worker._DB_STATUS_FOR_GRID_STATE) == settled
 
 
 class TestTheMappingMatchesWhatTheDocumentedLifecycleMeans:
-    """The specific values, not just their presence — this is where a typo
-    (mapping DEGRADED to "online", say) would actually be caught."""
+    """The actual values, where a typo (DEGRADED -> "online") would show."""
 
     def test_a_live_stream_reads_online_whether_or_not_ai_is_running(self):
         assert worker._DB_STATUS_FOR_GRID_STATE["CONNECTED"] == "online"
         assert worker._DB_STATUS_FOR_GRID_STATE["PROCESSING"] == "online"
 
     def test_a_degraded_or_reconnecting_stream_reads_degraded_not_offline(self):
-        """A camera mid-backoff is not yet given up on — offline would tell
-        an operator to restart something that is already trying to recover
-        on its own."""
+        """Mid-backoff isn't given up; offline would tell an operator to
+        restart something already recovering."""
         assert worker._DB_STATUS_FOR_GRID_STATE["DEGRADED"] == "degraded"
         assert worker._DB_STATUS_FOR_GRID_STATE["RECONNECTING"] == "degraded"
 

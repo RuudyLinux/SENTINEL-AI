@@ -1,63 +1,47 @@
-"""Plate-crop preprocessing variants and perspective correction.
+"""Plate crop preprocessing variants and perspective correction.
 
-The seam between "we found a plate region" (`plate_detector`) and "read it"
-(`anpr`). Two jobs:
+Sits between plate_detector (found a region) and anpr (read it):
+- perspective correction: an off-axis plate is a quad; when the detector
+  gives one (the classical localizer does, via minAreaRect) a four-point
+  warp straightens it before OCR
+- variants: the same crop as grayscale, CLAHE, denoise, sharpen,
+  adaptive/Otsu threshold, so OCR can read several and
+  anpr.select_candidate can compare them
 
-1. **Perspective correction.** A plate photographed off-axis is a
-   quadrilateral, not a rectangle. When the detector supplies a rotated quad
-   (the classical localizer does, via `cv2.minAreaRect`), a four-point warp
-   rectifies it before OCR sees it.
+Variants are off by default. On the 25-plate corpus (docs/ANPR_ACCURACY.md),
+selecting by agreement:
 
-2. **Preprocessing variants.** The same crop rendered several ways — grayscale,
-   CLAHE, denoise, sharpen, adaptive/Otsu threshold — so OCR can be run over
-   more than one and the candidates compared. `anpr.select_candidate` does the
-   comparing; this module only produces the images.
+    clahe alone (production)     exact 0.24  CER 0.3896  FP 0.28  1 OCR call
+    original+sharpen+adaptive    exact 0.28  CER 0.3030  FP 0.28  3 calls
+    all seven                    exact 0.28  CER 0.2814  FP 0.32  7 calls
 
-Why variants are NOT on by default
-----------------------------------
-Measured on the 25-plate labelled corpus (docs/ANPR_ACCURACY.md), running every
-variant and selecting by agreement:
+The exact-match change is one sample in 25, inside the noise, so it isn't an
+accuracy gain. The CER gain is real (~250 characters, not 25 yes/no) but costs
+3-7x the OCR time, the most expensive thing in the camera loop. That's the
+operator's call, so PLATE_PREPROCESS_VARIANTS defaults to the one variant
+that matches the old behaviour, and multi-variant is opt-in.
 
-| strategy | exact | CER | false-pos | OCR calls/plate |
-|---|---|---|---|---|
-| `clahe` alone (production) | 0.24 | 0.3896 | 0.28 | 1 |
-| `original+sharpen+adaptive` | 0.28 | 0.3030 | 0.28 | 3 |
-| all seven | 0.28 | 0.2814 | 0.32 | 7 |
-
-The exact-match move is ONE sample out of 25 — inside the documented noise band
-for this corpus, so it is not an accuracy improvement and is not claimed as
-one. The CER gain is real (it aggregates over ~250 characters rather than 25
-binary outcomes) but costs 3-7x the OCR time, which is the single most
-expensive operation in the camera loop. For a CCTV deployment that trade is the
-operator's to make, not a default to impose — so `PLATE_PREPROCESS_VARIANTS`
-ships as the single variant that reproduces today's behavior exactly, and the
-multi-variant path is an opt-in recovery/diagnostic mode.
-
-Escalation (run variants only when the cheap read fails the gate) was measured
-and REJECTED: it fires only when the first read fails, but the crops variants
-actually rescue are ones where the first read PASSES with a wrong answer. Exact
-match stayed at 0.24 and false positives rose. The numbers are in
-docs/ANPR_ACCURACY.md so nobody re-derives them.
+Escalating (variants only when the cheap read fails the gate) was tried and
+dropped: variants rescue crops where the first read passes with the wrong
+text, and escalation never fires on those. Exact stayed 0.24, false positives
+went up. Numbers in docs/ANPR_ACCURACY.md.
 """
 import cv2
 import numpy as np
 
 from ..config import settings
 
-# Every variant a deployment may name in PLATE_PREPROCESS_VARIANTS. The value
-# is a callable taking an ALREADY-UPSCALED crop and returning an OCR-ready
-# image; upscaling is done once up front rather than per variant because it is
-# the same work for all of them and it dominates their cost.
+# Names allowed in PLATE_PREPROCESS_VARIANTS. Each takes an already-upscaled
+# crop; upscaling happens once up front since it's the same for all of them
+# and dominates their cost.
 #
-# "clahe" is the production default because it is literally what the pipeline
-# already did before this module existed (plate_detect._preprocess_for_ocr =
-# upscale -> gray -> CLAHE). Naming it as a variant rather than reimplementing
-# it is what makes "variants disabled" mean "byte-for-byte the old behavior".
+# "clahe" is the default because it's exactly what the pipeline did before
+# (plate_detect._preprocess_for_ocr: upscale -> gray -> CLAHE), so variants
+# off means byte-for-byte the old behaviour.
 VARIANT_NAMES = ("original", "gray", "clahe", "denoise", "sharpen", "adaptive", "otsu")
 
-# The variant set measured as the best cost/benefit point if a deployment does
-# enable multi-variant reading. Not a default — exported so operators and the
-# benchmark refer to the same measured set instead of each picking their own.
+# best measured cost/benefit set if someone turns multi-variant on. exported
+# so operators and the benchmark use the same one
 RECOMMENDED_RECOVERY_VARIANTS = ("original", "sharpen", "adaptive")
 
 
@@ -66,39 +50,33 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def _clahe(image: np.ndarray) -> np.ndarray:
-    """Contrast-limited adaptive histogram equalization.
-
-    CLAHE rather than a global equalizeHist: plates are frequently half in
-    shadow (overhang, headlight glare), and a global histogram stretch blows out
-    the lit half in order to read the dark one.
-    """
+    """CLAHE, not global equalizeHist: plates are often half in shadow
+    (overhang, headlight glare) and a global stretch blows out the lit half."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(_to_gray(image))
 
 
 def _denoise(image: np.ndarray) -> np.ndarray:
-    """Bilateral filter: smooths sensor/compression noise while keeping the hard
-    glyph edges OCR segments on. A Gaussian blur would soften both."""
+    """Bilateral filter: smooths sensor/compression noise but keeps the hard
+    glyph edges OCR needs. Gaussian would soften both."""
     return cv2.bilateralFilter(_clahe(image), 7, 50, 50)
 
 
 def _sharpen(image: np.ndarray) -> np.ndarray:
-    """Unsharp mask — recovers glyph edges softened by motion blur or upscaling."""
+    """Unsharp mask, gets glyph edges back after motion blur or upscaling."""
     base = _clahe(image)
     return cv2.addWeighted(base, 1.6, cv2.GaussianBlur(base, (0, 0), 3), -0.6, 0)
 
 
 def _adaptive(image: np.ndarray) -> np.ndarray:
-    """Per-region thresholding. Handles a plate lit unevenly across its width,
-    where any single global threshold loses one end or the other."""
+    """Per-region threshold, for plates lit unevenly across their width."""
     return cv2.adaptiveThreshold(
         _clahe(image), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 11,
     )
 
 
 def _otsu(image: np.ndarray) -> np.ndarray:
-    """Global threshold at the automatically-chosen optimum. Complements
-    `_adaptive`: better on an evenly-lit plate, worse on an uneven one."""
+    """Otsu. Better than _adaptive on an evenly lit plate, worse on an uneven one."""
     _, thresholded = cv2.threshold(_clahe(image), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresholded
 
@@ -115,14 +93,12 @@ _VARIANT_FUNCTIONS = {
 
 
 def upscale_for_ocr(image: np.ndarray, target_height: int | None = None) -> np.ndarray:
-    """Scale a small plate crop up to a comfortable glyph height.
+    """Upscale a small crop to a readable glyph height.
 
-    OCR accuracy on real CCTV crops is dominated by effective glyph height: a
-    plate 18px tall in the source frame is at the edge of what EasyOCR
-    resolves. Upscaling costs a few milliseconds and, unlike changing the OCR
-    engine, cannot regress reads that already work. Crops already at or above
-    the target are returned untouched — enlarging them adds cost and no
-    information.
+    Glyph height is what decides OCR accuracy on real CCTV; an 18px plate is
+    at the edge of what EasyOCR resolves. A few ms, and unlike swapping the
+    OCR engine it can't break reads that already work. Crops already tall
+    enough are returned as is.
     """
     if image is None or image.size == 0:
         return image
@@ -137,13 +113,11 @@ def upscale_for_ocr(image: np.ndarray, target_height: int | None = None) -> np.n
 
 
 def order_quad(points: np.ndarray) -> np.ndarray:
-    """Order four corners as top-left, top-right, bottom-right, bottom-left.
+    """Order corners top-left, top-right, bottom-right, bottom-left.
 
-    `cv2.minAreaRect`/`boxPoints` return corners in an order that depends on the
-    rectangle's rotation, so warping without normalizing the order produces a
-    mirrored or 90°-rotated plate for some angles. Ordered by the standard
-    coordinate-sum/difference trick: the top-left has the smallest x+y, the
-    bottom-right the largest; the top-right has the smallest y-x.
+    boxPoints' order depends on rotation, and warping unordered corners gives
+    a mirrored or 90°-turned plate at some angles. Top-left has the smallest
+    x+y, bottom-right the largest, top-right the smallest y-x.
     """
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
     ordered = np.zeros((4, 2), dtype=np.float32)
@@ -157,12 +131,9 @@ def order_quad(points: np.ndarray) -> np.ndarray:
 
 
 def four_point_transform(image: np.ndarray, quad) -> "np.ndarray | None":
-    """Warp a quadrilateral plate region to a front-on rectangle.
-
-    Returns None when the quad is degenerate (collinear points, or an output
-    smaller than a readable plate), so the caller keeps the un-warped crop
-    rather than handing OCR a smear.
-    """
+    """Warp a quad plate region to a front-on rectangle. None for a
+    degenerate quad (collinear, or smaller than a readable plate), and the
+    caller keeps the unwarped crop."""
     if image is None or image.size == 0 or quad is None:
         return None
     try:
@@ -185,12 +156,9 @@ def four_point_transform(image: np.ndarray, quad) -> "np.ndarray | None":
 
 
 def needs_perspective_correction(quad, tolerance: float = 0.08) -> bool:
-    """Whether a quad is skewed enough that warping is worth the pixels.
-
-    An axis-aligned (or near-axis-aligned) box warps to approximately itself,
-    so the transform costs time and introduces resampling blur for no gain.
-    `tolerance` is the fraction of the region's own size by which opposite
-    edges may differ before it counts as skewed.
+    """Is the quad skewed enough to be worth warping? A near-axis-aligned box
+    warps to about itself, so it's just time and resampling blur.
+    `tolerance` is how much opposite edges may differ, as a fraction of size.
     """
     if quad is None:
         return False
@@ -211,12 +179,9 @@ def needs_perspective_correction(quad, tolerance: float = 0.08) -> bool:
 
 
 def configured_variants() -> tuple[str, ...]:
-    """The variant names this deployment has enabled, validated.
-
-    Unknown names are dropped with the rest kept rather than raising: a typo in
-    an env var must not take a camera worker down. An empty/all-invalid setting
-    falls back to the production default so OCR always has exactly one image to
-    read.
+    """Enabled variant names. Unknown ones are dropped, not raised: a typo in
+    an env var shouldn't kill a camera worker. Empty/all invalid falls back
+    to the default so OCR always gets one image.
     """
     raw = (settings.plate_preprocess_variants or "").strip()
     if not raw:
@@ -232,16 +197,11 @@ def build_variants(
     quad=None,
     variant_names: "tuple[str, ...] | None" = None,
 ) -> list[tuple[str, np.ndarray]]:
-    """Render a plate crop as `[(variant_name, image), ...]`, ready for OCR.
+    """Plate crop as [(variant_name, image), ...] for OCR.
 
-    Perspective correction (when `quad` is supplied and actually skewed) and
-    upscaling are applied ONCE, before the variants branch — they are identical
-    work for every variant, and doing them per-variant would multiply the cost
-    of the expensive part for no benefit.
-
-    With the default single-variant configuration this returns exactly one
-    image, produced by exactly the operations the pipeline already performed,
-    so enabling this module changes nothing until an operator opts in.
+    Perspective correction (given a skewed quad) and upscaling happen once
+    before branching, same work for every variant. With the default single
+    variant this is exactly the old pipeline's one image.
     """
     if plate_crop is None or plate_crop.size == 0:
         return []
@@ -261,9 +221,8 @@ def build_variants(
         try:
             image = function(prepared)
         except cv2.error:
-            # A variant that cannot be produced for this particular crop (e.g.
-            # a threshold on a degenerate single-row image) is skipped, not
-            # fatal — the others still give OCR something to read.
+            # a variant that can't be made for this crop (threshold on a
+            # degenerate one-row image) is skipped, the rest still work
             continue
         if image is not None and image.size > 0:
             variants.append((name, image))

@@ -1,19 +1,19 @@
-"""Indexes for the list sort keys and the per-alert incident lookup.
+"""Indexes for list sort keys and the per-alert incident lookup.
 
-Chosen from the queries the app actually runs, measured with EXPLAIN QUERY PLAN
-on a copy of the real database (2026-09-28):
+Picked from the queries the app runs, EXPLAIN QUERY PLAN on a copy of the
+real DB (2026-09-28):
 
-- detections(camera_id, timestamp): the live camera page's "newest 50 for this
-  camera" read every detection that camera had and sorted them (27 ms on 22k
-  rows, growing ~780 MB/day at one AI camera). Now 0.12 ms.
+- detections(camera_id, timestamp): the live page's newest-50 read scanned
+  and sorted all of a camera's detections (27 ms at 22k rows, and the table
+  grows ~780 MB/day per AI camera). Now 0.12 ms.
 - alerts.timestamp, audit_logs.timestamp, evidence.created_at,
-  incidents.created_at: the list endpoints' ORDER BY ... DESC LIMIT, which
-  otherwise sorts the whole table on every poll.
-- incidents.vehicle_id: every CRITICAL alert looks for an open incident on the
-  same vehicle; evidence.incident_id: every incident page loads its evidence.
+  incidents.created_at: list endpoints' ORDER BY ... DESC LIMIT sorted the
+  whole table every poll.
+- incidents.vehicle_id (every CRITICAL alert looks for an open incident on
+  the vehicle), evidence.incident_id (every incident page).
 
-Not added: zones.camera_id and watchlist_entries.identifier. Both tables hold a
-handful of rows, where an index is slower to maintain than the scan it saves.
+Skipped zones.camera_id and watchlist_entries.identifier: a handful of rows,
+the index costs more than the scan.
 
 Revision ID: 3f8a2c9d7e14
 Revises: 9d2e4b6a1c57

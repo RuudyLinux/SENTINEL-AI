@@ -1,27 +1,14 @@
-"""Zone and rule configuration must refuse controls that cannot ever fire.
+"""Zones and rules that can never fire are refused.
 
-`app/routers/zones.py` (43% covered) and `app/routers/rules.py` (42%) had no
-tests. Four defects:
-
-1. An unknown `camera_id` on a zone, or an unknown `zone_id` on a rule, raised
-   an unhandled IntegrityError once SQLite foreign keys were enforced — a 500
-   carrying a raw database error where the caller had simply named something
-   that is not there. (Before FK enforcement it silently wrote an orphan row,
-   which is worse.)
-
-2. Zone coordinates went unvalidated. They are frame fractions, and
-   `_bbox_center_in_zone` tests `x1 <= cx <= x2`, so an inverted or
-   out-of-range box matches nothing: the zone is created, is listed, looks
-   configured, and can never fire.
-
-3. `rule_type` was a free string. rules_engine only evaluates three types;
-   anything else is inert and sits in the rules list looking like an active
-   control. A loitering rule with no zone is the same failure — rules_engine
-   applies loitering only to the zone a rule names.
-
-4. DELETE /api/zones/{id} soft-deletes, but the list returned every row, so a
-   deleted zone stayed on the map AND in the zone dropdown on the rules page.
-   A rule attached to a deleted zone never fires.
+1. Unknown camera_id on a zone or zone_id on a rule became a 500 with a raw
+   DB error once FKs were enforced (before that, a silent orphan row).
+2. Zone coordinates weren't checked. They're frame fractions and
+   _bbox_center_in_zone does x1 <= cx <= x2, so an inverted or out-of-range
+   box matches nothing and looks configured.
+3. rule_type was free text; only three types are evaluated, anything else
+   sits in the list doing nothing. A loitering rule without a zone likewise.
+4. Zone delete is soft but the list returned every row, so deleted zones
+   stayed on the map and in the rules dropdown.
 """
 import uuid
 

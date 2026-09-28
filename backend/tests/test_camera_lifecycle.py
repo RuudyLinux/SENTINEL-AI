@@ -1,12 +1,9 @@
-"""Camera worker lifecycle: cancellation must be a clean stop, not a fault.
+"""Cancelling a worker is a clean stop, not a fault.
 
-The bug that motivated this file: cancelling a worker mid-commit let
-`_camera_loop`'s `finally: db.close()` race the commit still running on a
-worker thread, raising IllegalStateChangeError. Coming from a `finally`, that
-escaped to `_camera_loop_supervised`, which marked a perfectly HEALTHY camera
-offline and logged a critical self-heal event — on an ordinary stop.
-
-These tests assert the lifecycle contract directly:
+Cancelling mid-commit let the loop's finally db.close() race the commit on
+its thread (IllegalStateChangeError). From a finally that reached
+_camera_loop_supervised, which marked a healthy camera offline and logged a
+critical self-heal event on a normal stop.
 
     RUNNING -> STOPPING -> STOPPED      (never -> ERROR/OFFLINE)
 """
@@ -20,7 +17,7 @@ from app.pipeline.worker import CAMERA_STATS, RUNNING
 
 
 class _FakeAlwaysOpenSource:
-    """Real frames, no cv2 — the DB/lifecycle path is what is under test."""
+    """Real frames, no cv2; the DB/lifecycle path is what's under test."""
 
     def __init__(self, frame):
         self._frame = frame
@@ -57,8 +54,8 @@ def _camera(db_session, code: str, **kwargs) -> models.Camera:
 
 
 def _run_then_cancel(camera_id: str, run_for: float = 0.4):
-    """Bring a worker to a healthy running state, then cancel it the way a real
-    stop_worker/shutdown does, and report what the camera looks like after."""
+    """Get a worker running, cancel it like stop_worker/shutdown does, and
+    return what the camera looks like afterwards."""
 
     async def scenario():
         task = asyncio.ensure_future(worker._camera_loop_supervised(camera_id))
@@ -106,8 +103,7 @@ class TestNormalStop:
         assert task.cancelled() or task.exception() is None
 
     def test_stop_worker_reports_stopped_state_not_a_stale_running_one(self, monkeypatch, db_session):
-        """A deliberately stopped camera must not keep showing PROCESSING -
-        indistinguishable from still being connected."""
+        """A stopped camera mustn't keep showing PROCESSING."""
         camera = _camera(db_session, "C-LIFE-STATE", ai_person=True, ai_vehicle=False, ai_anpr=False)
         frame = np.zeros((64, 64, 3), dtype=np.uint8)
         monkeypatch.setattr(worker, "CameraSource", lambda *a, **k: _FakeAlwaysOpenSource(frame))
@@ -131,9 +127,8 @@ class TestNormalStop:
 
 class TestResourceRelease:
     def test_stopping_releases_every_per_camera_resource(self, monkeypatch, db_session):
-        """Model, clip buffer and plate-vote accumulator are all per camera and
-        must all be dropped together - a leak here is unbounded memory on a
-        long-running control room that starts and stops cameras."""
+        """Model, clip buffer and plate votes are per camera and all go
+        together; a leak is unbounded memory when cameras start and stop."""
         from app.pipeline import clips, plate_tracker
 
         camera = _camera(db_session, "C-LIFE-RELEASE")
@@ -147,8 +142,7 @@ class TestResourceRelease:
         assert all(released.values()), f"not every per-camera resource was released: {released}"
 
     def test_the_frame_buffer_is_dropped_on_stop(self, db_session):
-        """LATEST_FRAMES feeds the MJPEG endpoint. A stale frame left behind
-        would let a stopped camera keep serving a live-looking image."""
+        """A stale frame would keep a stopped camera's MJPEG looking live."""
         camera = _camera(db_session, "C-LIFE-FRAME")
         worker.LATEST_FRAMES[camera.id] = b"stale-jpeg"
 
@@ -159,8 +153,7 @@ class TestResourceRelease:
 
 class TestFailurePathStillWorks:
     def test_a_genuinely_unopenable_source_does_mark_the_camera_offline(self, monkeypatch, db_session):
-        """The fix must not have made the worker unable to report real failure.
-        A source that never opens is a real fault and must still go offline."""
+        """A source that never opens is a real fault and still goes offline."""
 
         class _NeverOpens(_FakeAlwaysOpenSource):
             def open(self):

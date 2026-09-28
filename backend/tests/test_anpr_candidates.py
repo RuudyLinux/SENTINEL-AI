@@ -1,9 +1,8 @@
-"""OCR candidate handling: structured reads, agreement-based selection, and the
-rule that multi-variant reading may only ever TIGHTEN the quality gate.
+"""OCR candidates: structured reads, agreement-based selection, and
+multi-variant reading only ever tightening the gate.
 
-The central invariant these pin: OCR confidence and cross-variant agreement are
-separate signals and are never blended. A read is not made more confident by
-being agreed with, and agreement is not inferred from confidence.
+Confidence and cross-variant agreement stay separate: agreement doesn't make
+a read more confident, and confidence doesn't imply agreement.
 """
 import pytest
 
@@ -22,9 +21,8 @@ def _candidate(variant: str, text: str, confidence: float) -> OcrCandidate:
 
 class TestAgreementSelection:
     def test_the_most_agreed_text_wins_over_a_single_confident_outlier(self):
-        """The headline behavior. Measured on the labelled corpus: picking the
-        highest-confidence of several variant reads scored WORSE than picking
-        the most-agreed one, and raised false positives."""
+        """On the labelled corpus, picking the most confident variant scored
+        worse than the most agreed one and raised false positives."""
         read = select_candidate([
             _candidate("original", PLATE, 0.55),
             _candidate("sharpen", PLATE, 0.58),
@@ -36,9 +34,8 @@ class TestAgreementSelection:
         assert read.variant_count == 4
 
     def test_reported_confidence_is_the_mean_of_agreeing_reads_not_the_max(self):
-        """Max-of-N is a biased estimator: it is systematically larger than any
-        single read, so reporting it would inflate every read's recorded
-        confidence and silently loosen the downstream gates."""
+        """Max of N is biased high; reporting it would inflate every read and
+        loosen the gates downstream."""
         read = select_candidate([
             _candidate("original", PLATE, 0.50),
             _candidate("sharpen", PLATE, 0.90),
@@ -47,9 +44,8 @@ class TestAgreementSelection:
         assert read.confidence < 0.90, "the maximum must never be reported as the confidence"
 
     def test_agreement_does_not_raise_the_reported_confidence(self):
-        """Five variants agreeing at 0.57 is stronger EVIDENCE, but the OCR
-        engine still only said 0.57. Corroboration is reported separately, never
-        folded into the number."""
+        """Five variants agreeing at 0.57 is stronger evidence, but the
+        engine still said 0.57. Agreement is reported separately."""
         read = select_candidate([_candidate(f"v{i}", PLATE, 0.57) for i in range(5)])
         assert read.confidence == pytest.approx(0.57)
         assert read.variants_agreeing == 5
@@ -69,8 +65,7 @@ class TestAgreementSelection:
         assert read.normalized == PLATE
 
     def test_all_empty_reads_report_an_honest_empty_result(self):
-        """No text was read. The honest answer is nothing — not the least-bad
-        garbage promoted to a plate."""
+        """Nothing read means nothing, not the least-bad garbage."""
         read = select_candidate([
             _candidate("original", "", 0.0),
             _candidate("sharpen", "", 0.0),
@@ -84,8 +79,7 @@ class TestAgreementSelection:
         assert read.normalized == "" and read.variant_count == 0 and read.confidence == 0.0
 
     def test_a_single_candidate_is_returned_verbatim(self):
-        """The default configuration. One variant in, that read out, unchanged —
-        this is what makes 'variants disabled' mean 'the previous behavior'."""
+        """Default config: one variant in, that read out unchanged."""
         read = select_candidate([_candidate("clahe", PLATE, 0.61)])
         assert read.normalized == PLATE
         assert read.confidence == pytest.approx(0.61)
@@ -107,16 +101,15 @@ class TestAgreementSelection:
 
 class TestReadGate:
     def test_a_single_variant_read_is_gated_exactly_as_before(self, monkeypatch):
-        """With one variant configured the agreement rule cannot fire, so the
-        gate must be identical to the pre-existing two-signal gate."""
+        """One variant: agreement rule can't fire, gate is the old one."""
         monkeypatch.setattr(settings, "plate_min_confidence", 0.35)
         read = OcrRead(raw=PLATE, normalized=PLATE, confidence=0.50, variant_count=1, variants_agreeing=1)
         assert passes_read_gate(read) is True
         assert passes_read_gate(read) == passes_anpr_gate(read.normalized, read.confidence)
 
     def test_multi_variant_reading_can_only_tighten_the_gate(self, monkeypatch):
-        """A high-confidence read that only ONE of several variants produced is
-        not corroborated evidence and must not be auto-accepted."""
+        """High confidence from only ONE of several variants isn't
+        corroborated and must not be auto-accepted."""
         monkeypatch.setattr(settings, "plate_min_confidence", 0.35)
         monkeypatch.setattr(settings, "plate_min_variants_agreeing", 2)
         lonely = OcrRead(
@@ -135,9 +128,8 @@ class TestReadGate:
         assert passes_read_gate(corroborated) is True
 
     def test_agreement_never_rescues_a_below_floor_confidence(self, monkeypatch):
-        """Corroboration does not substitute for the confidence floor. Seven
-        variants agreeing on a 0.05 read is seven variants failing the same
-        way."""
+        """Agreement doesn't replace the confidence floor. Seven variants
+        agreeing on a 0.05 read is seven variants failing the same way."""
         monkeypatch.setattr(settings, "plate_min_confidence", 0.35)
         monkeypatch.setattr(settings, "plate_min_variants_agreeing", 2)
         read = OcrRead(

@@ -50,12 +50,12 @@ class CameraCreate(BaseModel):
     location: str = ""
     lat: float = 0.0
     lng: float = 0.0
-    source_type: str  # webcam | video_file | rtsp | mock_vms | onvif (interface stub — see pipeline/adapters.py)
+    source_type: str  # webcam | video_file | rtsp | mock_vms | onvif (stub, see pipeline/adapters.py)
     source_uri: str  # "0" for webcam index, filename for video_file, url for rtsp
     ai_person: bool = True
     ai_vehicle: bool = True
     ai_anpr: bool = True
-    camera_group: str = ""  # free-form grouping/tag, e.g. "North Zone" — client-side filterable
+    camera_group: str = ""  # free-form tag like "North Zone", filtered client side
 
 
 class NearbyCameraOut(BaseModel):
@@ -70,10 +70,9 @@ class NearbyCameraOut(BaseModel):
 
 
 class CameraUpdate(BaseModel):
-    """PATCH payload — every field optional, only fields actually present in the
-    request are applied (see routers/cameras.py `model_dump(exclude_unset=True)`).
-    Deliberately excludes source_type/source_uri: changing a camera's source is a
-    reconnect operation (stop/re-add), not an in-place edit."""
+    """PATCH payload. Only fields present in the request get applied
+    (exclude_unset). No source_type/source_uri: changing the source is a
+    reconnect, not an edit."""
     name: Optional[str] = None
     location: Optional[str] = None
     camera_group: Optional[str] = None
@@ -103,31 +102,26 @@ class CameraOut(BaseModel):
     ai_anpr: bool
     camera_group: str = ""
     retired: bool = False
-    # AI is switched on but no AI slot is free (pipeline/ai_capacity.py).
+    # AI is on but no AI slot is free (pipeline/ai_capacity.py)
     ai_blocked: bool = False
+    # REC button running for this camera (pipeline/recorder.py)
+    recording: bool = False
     last_frame_at: Optional[datetime] = None
-    # Richer connection-lifecycle state (24/7 auto-connect task) — in-memory
-    # only (CAMERA_STATS), attached by routers/cameras.py.list_cameras; null
-    # for a camera whose worker has never run in this process. Distinct from
-    # `status` (DB column, only ever online/offline/degraded).
+    # In-memory lifecycle state from CAMERA_STATS, attached by the camera
+    # routes. Null if the worker never ran in this process. Not the same as
+    # `status`, the DB column (online/offline/degraded only).
     grid_state: Optional[str] = None
-    # Same in-memory source (CAMERA_STATS), same reasoning as grid_state above —
-    # already computed by worker.py per iteration, just not previously exposed.
-    # Null for a camera whose worker has never run in this process.
     reconnect_count: Optional[int] = None
     last_error: Optional[str] = None
-    # Catalogue linkage — informational only. Deliberately no `source_uri`
-    # here: the RTSP URL may carry embedded credentials and must never reach
-    # the frontend/logs (see P0-E from Phase 1 and pipeline/catalog.py).
+    # Catalogue linkage, informational. No source_uri on purpose: the RTSP URL
+    # can carry credentials and must never reach the frontend or logs.
     external_catalog_id: Optional[str] = None
     catalog_codec: str = ""
     catalog_live_status: str = ""
     catalog_synced_at: Optional[datetime] = None
     catalog_stale: bool = False
-    # Unlike source_uri, these ARE meant for the client — WHEP is for a
-    # browser preview player, HLS for dashboard/mobile/restricted-network
-    # fallback (per the official spec). Neither is required; both stay
-    # null when the catalogue didn't supply one.
+    # These are meant for the client: WHEP for the browser player, HLS as the
+    # fallback. Null when the catalogue has none.
     whep_url: Optional[str] = None
     hls_url: Optional[str] = None
 
@@ -138,7 +132,7 @@ class DetectionOut(BaseModel):
     id: str
     camera_id: str
     timestamp: datetime  # PROCESSING time
-    source_timestamp: Optional[datetime] = None  # SOURCE time — see models.Detection
+    source_timestamp: Optional[datetime] = None  # SOURCE time, see models.Detection
     cls: str
     confidence: float
     bbox: List[float]
@@ -157,9 +151,7 @@ class PlateOut(BaseModel):
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
-    # V2 sighting fields. All optional: rows written before V2 genuinely never
-    # captured them, and they stay null rather than being backfilled with a
-    # guess (see main.py's ensure_columns backfill choices).
+    # V2 sighting fields. Optional, pre-V2 rows never had them and stay null
     track_id: Optional[str] = None
     last_seen: Optional[datetime] = None
     reads_count: int = 1
@@ -167,16 +159,14 @@ class PlateOut(BaseModel):
     detection_confidence: float = 0.0
     vehicle_bbox: Optional[List[float]] = None
     plate_bbox: Optional[List[float]] = None
-    # Human-in-the-loop ANPR review (10/10 roadmap P7).
+    # ANPR review
     review_status: str = "auto_accepted"
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     corrected_text: Optional[str] = None
-    # ANPR explainability. Separate signals, never blended into `confidence`:
-    # which preprocessing variant produced the read, how many variants agreed,
-    # whether the temporal layer corroborated it across frames, and the plate
-    # crop OCR actually read. All optional — rows written before these existed
-    # genuinely have no value and stay null rather than being backfilled.
+    # ANPR explainability, kept apart from `confidence`: winning variant,
+    # variants agreeing, corroborated across frames, the crop OCR read.
+    # Null on rows from before these existed.
     ocr_variant: Optional[str] = None
     variants_agreeing: Optional[int] = None
     corroborated: Optional[bool] = None
@@ -207,12 +197,11 @@ class VehicleOut(BaseModel):
 
 
 class SightingOut(BaseModel):
-    """One hop in a vehicle's reconstructed cross-camera journey.
+    """One hop in a vehicle's journey across cameras.
 
-    Every field below is an OBSERVATION at a camera. There is deliberately no
-    interpolated position, heading or speed: the system knows where cameras saw
-    this vehicle and when, and nothing between those points. The route drawn
-    from these hops is a reconstructed camera-to-camera path, never a GPS track.
+    Only observations at cameras. No interpolated position, heading or speed;
+    we know where cameras saw it and when, nothing in between. It's a
+    camera-to-camera path, not a GPS track.
     """
     camera_id: str
     camera_code: str
@@ -220,8 +209,7 @@ class SightingOut(BaseModel):
     timestamp: datetime  # first confident recognition at this camera
     confidence: float
     snapshot_path: Optional[str] = None
-    # V2 additions — defaulted so a caller written against the pre-V2 shape
-    # keeps working unchanged.
+    # V2 additions, defaulted so pre-V2 callers still work
     location: str = ""
     lat: float = 0.0
     lng: float = 0.0
@@ -241,8 +229,8 @@ class VehicleRouteOut(BaseModel):
 
 
 class VehicleSummaryOut(BaseModel):
-    """The investigation header for one vehicle — everything the operator needs
-    before drilling into the journey, evidence or alerts."""
+    """Investigation header for one vehicle, shown before the journey,
+    evidence and alerts."""
     vehicle: VehicleOut
     total_sightings: int
     cameras_visited: int
@@ -252,16 +240,15 @@ class VehicleSummaryOut(BaseModel):
     current_camera_code: Optional[str] = None
     current_camera_name: Optional[str] = None
     current_seen_at: Optional[datetime] = None
-    # True only when the most recent sighting is inside the live window — the
-    # honest distinction between "this vehicle is on camera right now" and
-    # "this is where it was last seen". Never asserted from a stale row.
+    # only when the latest sighting is inside the live window: "on camera
+    # now" vs "last seen here"
     is_live: bool = False
     alert_count: int = 0
     incident_count: int = 0
     evidence_count: int = 0
     watchlist_flag: bool = False
     best_plate_confidence: float = 0.0
-    # Populated by the risk engine (pipeline/risk.py).
+    # from pipeline/risk.py
     risk_score: int = 0
     risk_severity: str = "LOW"
     risk_factors: List[dict] = []
@@ -330,21 +317,18 @@ class AlertOut(BaseModel):
     severity: str
     status: str
     vehicle_id: Optional[str] = None
-    # The real detection that fired the rule — the link evidence and review use.
+    # the detection that fired the rule
     detection_id: Optional[str] = None
     confidence: float
-    # Coerced, not merely typed: these columns are nullable JSON, and a single
-    # row with NULL made the WHOLE list endpoint fail response validation
-    # ("Input should be a valid list", input None) — one bad row blanked the
-    # entire Alert Center for every camera, not just its own line. An absent
-    # value means "no reasons recorded", which is exactly an empty list.
+    # Coerced, not just typed. These are nullable JSON columns and one NULL
+    # row failed response validation for the whole list, blanking the Alert
+    # Center. No reasons recorded = empty list.
     reasons: List[str] = []
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
-    # Explainable risk assessment (pipeline/risk.py). Alerts raised before V2
-    # carry 0 / [] — no assessment was made for them, and back-computing one now
-    # would assert a decision that was never taken.
+    # pipeline/risk.py. Pre-V2 alerts have 0 / [], no assessment was made
+    # back then and we don't invent one now
     risk_score: int = 0
     risk_factors: List[dict] = []
 
@@ -352,7 +336,7 @@ class AlertOut(BaseModel):
     @classmethod
     def _null_json_is_empty(cls, value):
         return [] if value is None else value
-    # False-positive feedback (10/10 roadmap P6). Null = not yet reviewed.
+    # false-positive feedback, null = not reviewed yet
     feedback: Optional[str] = None
     feedback_reason: Optional[str] = None
     feedback_at: Optional[datetime] = None
@@ -395,10 +379,9 @@ class IncidentOut(BaseModel):
 
 
 class IncidentNoteCreate(BaseModel):
-    # Bounded: an unvalidated `str` accepted a 2,000,000-character note (200 OK,
-    # measured), which any authenticated user could store repeatedly and which
-    # the incident timeline then has to render. The cap is generous for a real
-    # case note and still refuses a payload that is not one.
+    # A plain str took a 2,000,000-char note (200 OK) that any logged-in user
+    # could store over and over and the timeline had to render. 5000 is plenty
+    # for a real case note.
     text: str = Field(min_length=1, max_length=5000)
 
 
@@ -415,8 +398,7 @@ class EvidenceOut(BaseModel):
     detection_id: Optional[str] = None
     event_type: str = ""
     source_timestamp: Optional[datetime] = None
-    # Provenance completion (10/10 roadmap P8). Null for evidence captured
-    # before this field existed — an honest gap, not backfilled.
+    # versions at capture. null on older evidence, not backfilled
     model_version: Optional[str] = None
     rule_version: Optional[str] = None
 
@@ -424,10 +406,8 @@ class EvidenceOut(BaseModel):
 
 
 class PurgeExpiredRequest(BaseModel):
-    # Real deletion requires BOTH dry_run=False AND confirm=True — a single
-    # flag flip is not enough to permanently destroy evidence (10/10 roadmap
-    # P13). Mirrors the deliberate two-signal pattern used elsewhere in this
-    # codebase for irreversible actions.
+    # actually deleting needs dry_run=False AND confirm=True, one flag flip
+    # shouldn't destroy evidence
     dry_run: bool = True
     confirm: bool = False
 

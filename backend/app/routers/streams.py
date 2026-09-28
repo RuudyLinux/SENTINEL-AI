@@ -14,6 +14,7 @@ from ..security import (
     get_user_from_resource_token,
     resource_token_expiry,
 )
+from ..pipeline import worker
 from ..pipeline.worker import LATEST_FRAMES
 
 router = APIRouter(prefix="/api/streams", tags=["streams"])
@@ -21,9 +22,8 @@ router = APIRouter(prefix="/api/streams", tags=["streams"])
 
 @router.get("/{camera_id}/stream-token")
 def get_stream_token(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """RBAC-checked step handing out a signed token for the mjpeg/snapshot
-    endpoints below, which browsers hit via plain <img src> and can't attach
-    a bearer header to (P0-E — same pattern as evidence file/package)."""
+    """Hands out a signed token for the mjpeg/snapshot endpoints below, which
+    browsers load via <img src> without a bearer header (same as evidence)."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -31,13 +31,11 @@ def get_stream_token(camera_id: str, db: Session = Depends(get_db), user: models
 
 
 def _stream_deadline(token: str) -> datetime:
-    """The instant this stream must stop, always a real deadline.
+    """When this stream has to stop, always a real deadline.
 
-    `resource_token_expiry` returns None for any token it cannot decode — and
-    an EXPIRED token is one of those, since decoding verifies `exp`. Treating
-    None as "no deadline" would fail open on the exact input the bound exists
-    for, so an unreadable token falls back to the configured TTL measured from
-    now: still bounded, never unlimited.
+    resource_token_expiry gives None for anything it can't decode, expired
+    tokens included since decoding checks exp. None as "no deadline" would
+    fail open on exactly that, so fall back to the configured TTL from now.
     """
     return resource_token_expiry(token) or (datetime.utcnow() + timedelta(seconds=settings.stream_token_ttl_seconds))
 
@@ -45,35 +43,38 @@ def _stream_deadline(token: str) -> datetime:
 async def _mjpeg_generator(camera_id: str, deadline: datetime):
     """Frames until the authorizing token expires.
 
-    The token was checked once, when the stream opened, and an MJPEG response
-    then stays open indefinitely — so a stream started with a one-hour token
-    kept delivering live video for as long as the browser tab was left open,
-    days later, and deactivating the user's account did not interrupt it.
-    `stream_token_ttl_seconds` bounded nothing at all for the one endpoint
-    whose access lasts long enough for a bound to matter.
-
-    Ending the stream is the whole enforcement: the client re-authorizes by
-    requesting a new token, which re-runs the full RBAC check.
+    The token is checked once when the stream opens and MJPEG never ends on
+    its own, so a one-hour token kept streaming for days in an open tab, even
+    after the account was disabled. Ending the stream is the enforcement: the
+    client has to fetch a new token, which reruns the RBAC check.
     """
     boundary = b"--frame"
-    while True:
-        if datetime.utcnow() >= deadline:
-            return
-        frame = LATEST_FRAMES.get(camera_id)
-        if frame is not None:
-            yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        await asyncio.sleep(0.1)
+    # counted so the camera loop encodes the preview at full rate only while
+    # someone's watching
+    worker.VIEWERS[camera_id] = worker.VIEWERS.get(camera_id, 0) + 1
+    try:
+        while True:
+            if datetime.utcnow() >= deadline:
+                return
+            frame = LATEST_FRAMES.get(camera_id)
+            if frame is not None:
+                yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            await asyncio.sleep(0.1)
+    finally:
+        left = worker.VIEWERS.get(camera_id, 1) - 1
+        if left > 0:
+            worker.VIEWERS[camera_id] = left
+        else:
+            worker.VIEWERS.pop(camera_id, None)
 
 
 def _authorize_stream(camera_id: str, token: str, require_camera: bool) -> None:
-    """Validate the token against a SHORT-LIVED session, then release it.
+    """Check the token on a short-lived session and let it go.
 
-    Deliberately not `Depends(get_db)`: FastAPI holds a dependency open until
-    the response COMPLETES, and these responses are designed not to complete
-    for hours. Every viewer therefore pinned one connection out of the pool
-    (sized 15 — see db.py) for the lifetime of their stream, so a wall of
-    tiles could exhaust the pool and stall every other request in the API
-    while doing nothing but reading a dict of JPEG bytes.
+    Not Depends(get_db): FastAPI keeps a dependency open until the response
+    completes, and these run for hours. Each viewer pinned a pool connection
+    for its whole stream, so a wall of tiles could drain the pool and stall
+    the whole API while only reading JPEG bytes from a dict.
     """
     db = SessionLocal()
     try:

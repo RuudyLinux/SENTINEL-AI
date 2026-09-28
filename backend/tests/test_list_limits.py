@@ -1,16 +1,13 @@
-"""List endpoints must bound what a single request can pull back.
+"""List endpoints bound what one request can pull back.
 
-`GET /api/detections` (and `/api/review/queue`) took `limit: int` with no
-validation. SQLite reads `LIMIT -1` as NO LIMIT, so `?limit=-1` returned the
-whole table — as did any absurdly large value — from any authenticated user,
-against the largest table the platform writes (one row per detected object per
-frame per camera).
+/api/detections and /api/review/queue took a bare `limit: int`. SQLite reads
+LIMIT -1 as no limit, so ?limit=-1 (or any huge value) returned the whole
+table, the biggest one we have, to any logged-in user.
 
-Measured on a 120-row test database before the fix:
+On a 120-row test DB before the fix:
     default -> 100    limit=-1 -> 120 (all)    limit=100000000 -> 120 (all)
 
-`self_heal.py` already used `Query(default=100, le=500)`; these two endpoints
-were the deviation, not the new rule.
+self_heal.py already had Query(default=100, le=500).
 """
 import uuid
 
@@ -74,10 +71,8 @@ class TestReviewQueueLimit:
 
 @pytest.fixture
 def many_alerts(db_session):
-    """More alerts than the endpoint's default page, on one camera.
-
-    Filtering by this camera keeps the assertions independent of whatever
-    else the session's database happens to hold.
+    """More alerts than the default page, on one camera, so the asserts
+    don't depend on whatever else is in the shared DB.
     """
     camera = models.Camera(
         camera_code=f"ALIM-{uuid.uuid4().hex[:8]}", name="alert limit test cam",
@@ -92,13 +87,9 @@ def many_alerts(db_session):
 
 
 class TestAlertsLimit:
-    """`GET /api/alerts` truncated to a hard-coded 200 with no `limit` at all.
-
-    That is not a security hole the way an unbounded `.all()` is — the ceiling
-    was always there — but it made the one screen an operator lives in
-    un-pageable, and it was the last transactional list not following the
-    repo's own bounded-limit rule. The bound is now the same everywhere:
-    default 200, `ge=1`, `le=500`.
+    """/api/alerts was hard-capped at 200 with no limit param. Not a hole
+    like an unbounded .all(), but the Alert Center couldn't page. Now the
+    same everywhere: default 200, ge=1, le=500.
     """
 
     def test_a_negative_limit_is_rejected(self, client, auth, many_alerts):

@@ -1,19 +1,13 @@
-"""Workstream C1 (final deep-debug pass): per-endpoint concurrency cap on
-POST /api/cameras/test-connection.
+"""Concurrency cap on POST /api/cameras/test-connection.
 
-The measured problem: every probe occupies a thread from the SHARED
-`asyncio.to_thread` executor for up to `source_open_timeout_seconds` —
-measured at exactly 20.0s each for loopback / 0.0.0.0 / link-local / IPv6 /
-malformed / `file://` URIs. That executor is bounded
-(min(32, cpu_count + 4) workers) and is the same pool every camera worker
-uses for frame reads, inference offloads and DB commits. An
-authorized-but-lower-trust Control Room Operator could therefore fire a
-burst of probes and starve live camera processing for the full timeout,
-without exploiting anything — just by using the endpoint.
+Each probe holds a thread from the shared to_thread pool for up to
+source_open_timeout_seconds (exactly 20.0s for loopback, 0.0.0.0,
+link-local, IPv6, junk and file:// URIs). That pool is min(32, cpu+4) and
+also runs every camera's reads, inference and commits, so a burst of probes
+from an operator could starve live cameras just by using the endpoint.
 
-Uses a real ASGI transport rather than the sync TestClient so the requests
-are genuinely concurrent on one event loop, which is the condition under
-test.
+Real ASGI transport, not the sync TestClient, so requests are actually
+concurrent on one loop.
 """
 import asyncio
 
@@ -27,8 +21,7 @@ from app.routers import cameras as cameras_router
 
 @pytest.fixture(autouse=True)
 def _reset_semaphore():
-    """The cap is process-global; rebuild it per test so a test's own limit
-    change takes effect and cannot leak into the next test."""
+    """The cap is process-global; rebuilt per test so limits don't leak."""
     cameras_router._probe_semaphore = None
     yield
     cameras_router._probe_semaphore = None
@@ -36,9 +29,8 @@ def _reset_semaphore():
 
 @pytest.fixture
 def slow_source(monkeypatch):
-    """A source whose open() blocks, standing in for the measured real
-    behavior (an unreachable RTSP endpoint holding a thread for 20s) without
-    making the test itself take 20 seconds."""
+    """open() blocks, like an unreachable RTSP host holding a thread for 20s,
+    without the test taking 20s."""
     class _SlowSource:
         def __init__(self, source_type, source_uri):
             pass
@@ -85,9 +77,7 @@ def test_probes_beyond_the_cap_are_refused_fast_instead_of_queueing(admin_token,
 
 
 def test_the_shared_thread_pool_is_not_starved_by_a_probe_burst(admin_token, slow_source, monkeypatch):
-    """The actual property that matters: unrelated work that also needs the
-    shared executor must still complete promptly while probes are in
-    flight."""
+    """Other work on the shared pool still finishes quickly while probes run."""
     monkeypatch.setattr(settings, "camera_test_connection_max_concurrent", 2)
     auth = {"Authorization": f"Bearer {admin_token}"}
 
@@ -114,8 +104,7 @@ def test_the_shared_thread_pool_is_not_starved_by_a_probe_burst(admin_token, slo
 
 
 def test_the_cap_releases_so_later_probes_still_work(admin_token, slow_source, monkeypatch):
-    """A cap that leaked its slots would permanently break the endpoint after
-    one burst — worse than the problem it fixes."""
+    """Slots come back; a leaking cap would break the endpoint after one burst."""
     monkeypatch.setattr(settings, "camera_test_connection_max_concurrent", 2)
     auth = {"Authorization": f"Bearer {admin_token}"}
 
@@ -123,7 +112,7 @@ def test_the_cap_releases_so_later_probes_still_work(admin_token, slow_source, m
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             await asyncio.gather(*[_probe(client, auth) for _ in range(6)])
-            # Burst over — a single probe must be accepted again.
+            # burst over, one probe gets through again
             return (await _probe(client, auth)).status_code
 
     assert asyncio.run(scenario()) == 200

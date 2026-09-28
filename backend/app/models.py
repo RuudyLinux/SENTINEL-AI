@@ -1,4 +1,4 @@
-"""ORM models — mirrors doc §51 (Database Model) / §7 (Core Data Model)."""
+"""ORM models (doc §51 / §7)."""
 import uuid
 from datetime import datetime
 
@@ -57,44 +57,35 @@ class Camera(Base):
     error_count = Column(Integer, default=0)
     last_frame_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    # Official camera-catalogue linkage (Phase 3). Populated only by a
-    # catalogue sync (see pipeline/catalog.py) — null for manually-added
-    # cameras. `catalog_stale=True` means the catalogue no longer lists this
-    # camera as of the last sync; it is kept (not deleted) so history isn't lost.
+    # Catalogue linkage, only set by a catalogue sync (pipeline/catalog.py).
+    # catalog_stale = no longer listed as of the last sync; kept for history.
     external_catalog_id = Column(String, nullable=True, index=True)
     catalog_codec = Column(String, default="")
     catalog_live_status = Column(String, default="")
     catalog_synced_at = Column(DateTime, nullable=True)
     catalog_stale = Column(Boolean, default=False)
-    # A retired camera is kept, not deleted: its detections, alerts, incidents,
-    # evidence and audit rows must keep pointing at a real camera row. It never
-    # connects, starts or counts as an active camera again (routers/cameras.py
-    # POST /{id}/retire). Reversible with POST /{id}/reinstate.
+    # Retired cameras are kept so their history still points at a real row.
+    # Never connects, starts or counts as active again (POST /{id}/retire),
+    # undo with POST /{id}/reinstate.
     retired = Column(Boolean, default=False, nullable=False, server_default=sa_false())
-    # Phase 6: the catalogue's other two stream URLs, preserved alongside the
-    # RTSP one already used for AI ingestion (source_uri). Genuinely
-    # optional — a record missing either stays NULL, never fabricated.
-    # Unlike source_uri (may carry embedded RTSP credentials, deliberately
-    # never returned by the API), these are meant for direct client
-    # consumption per the official spec (WHEP -> browser preview, HLS ->
-    # dashboard/mobile fallback) so CameraOut does expose them.
+    # The catalogue's other two stream URLs. NULL when missing. Unlike
+    # source_uri (can embed RTSP credentials, never returned by the API) these
+    # are meant for clients (WHEP for browser preview, HLS as fallback), so
+    # CameraOut exposes them.
     whep_url = Column(String, nullable=True)
     hls_url = Column(String, nullable=True)
-    # Model 2/4: free-form grouping/tagging (e.g. "North Zone", "Highway Cams") —
-    # client-side filterable on the Cameras screen. Empty string, never null, so
-    # existing rows migrate cleanly (see ensure_columns backfill in main.py).
-    # Named `camera_group`, not `group` — the latter is a reserved SQL keyword and
-    # broke the raw-SQL ensure_columns/ensure_indexes migration helpers (SQLAlchemy's
-    # own query compiler would have auto-quoted it, but those helpers don't).
+    # Free-form grouping ("North Zone", "Highway Cams"), filtered client side.
+    # Empty string not null so old rows migrate cleanly (ensure_columns in
+    # main.py). Not `group`: reserved word, and the raw-SQL ensure_* helpers
+    # don't quote it.
     camera_group = Column(String, default="")
 
 
 class Detection(Base):
     __tablename__ = "detections"
-    # The live camera page asks for one camera's newest detections every few
-    # seconds. With only the single-column camera_id index SQLite read every
-    # detection that camera ever produced and sorted them: 27 ms on 22k rows,
-    # growing without bound. With this it reads 50 rows: 0.12 ms.
+    # The live camera page polls a camera's newest detections every few
+    # seconds. With just the camera_id index SQLite read and sorted all of a
+    # camera's rows: 27 ms on 22k and growing. With this, 50 rows, 0.12 ms.
     __table_args__ = (Index("ix_detections_camera_id_timestamp", "camera_id", "timestamp"),)
     id = Column(String, primary_key=True, default=lambda: uid("det"))
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
@@ -103,32 +94,24 @@ class Detection(Base):
     cls = Column(String, nullable=False)  # person | car | truck | bus | motorbike
     confidence = Column(Float, nullable=False)
     bbox = Column(JSON, default=list)  # [x1,y1,x2,y2]
-    # ByteTrack id, camera-scoped (detector.py keeps one tracker per camera).
-    # Indexed in V2: cross-referencing a vehicle sighting back to every frame of
-    # its track is a core investigation query, and was previously a table scan.
+    # ByteTrack id, per camera (detector.py keeps a tracker per camera).
+    # Indexed, going from a sighting back to its track's frames is a core query
     track_id = Column(String, nullable=True, index=True)
     model_version = Column(String, default="")
     snapshot_path = Column(String, nullable=True)
-    # Cross-camera PERSON correlation (Phase 5): a compact HSV color-histogram
-    # signature of the crop, computed only for cls=="person" (pipeline/appearance.py).
-    # Explicitly NOT biometric/facial — a visual-similarity signal only, used to rank
-    # candidate sightings for an investigator, never an identity claim. Null when not
-    # computed (never fabricated) — see worker.py._process_frame.
+    # HSV color-histogram signature, persons only (pipeline/appearance.py).
+    # Not biometric, just visual similarity for ranking leads. Null when not
+    # computed (worker.py._process_frame).
     appearance_signature = Column(JSON, nullable=True)
 
 
 class Track(Base):
-    """One tracked object's life on ONE camera (ByteTrack track id scoped by
-    camera — ultralytics track ids are only unique per model/predictor
-    instance, and detector.py keeps one instance per camera).
+    """One tracked object's life on one camera. ByteTrack ids are only unique
+    per predictor and detector.py keeps one per camera.
 
-    Declared since the first version of this schema but never written until V2:
-    nothing in the pipeline carried a track id past the Detection row, so the
-    vehicle-track <-> plate association this table was designed to hold did not
-    exist. It is now written by pipeline/worker.py for every tracked vehicle,
-    and `vehicle_id` is filled in once that track's plate is confidently read —
-    which is what makes "track 284 IS vehicle GJ05AB1234" a real, queryable
-    fact rather than an inference across three joins."""
+    Written by worker.py for every tracked vehicle; vehicle_id gets filled in
+    once the track's plate is read, so "track 284 is GJ05AB1234" is one row
+    instead of a three-join inference."""
     __tablename__ = "tracks"
     id = Column(String, primary_key=True, default=lambda: uid("trk"))
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
@@ -137,8 +120,7 @@ class Track(Base):
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
     vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
-    # Running totals for this track, so a sighting carries "how well did we
-    # actually observe this" without recomputing over every Detection row.
+    # running totals so we don't recount Detection rows
     detection_count = Column(Integer, default=0)
     plate_reads = Column(Integer, default=0)
 
@@ -146,65 +128,42 @@ class Track(Base):
 class Vehicle(Base):
     __tablename__ = "vehicles"
     id = Column(String, primary_key=True, default=lambda: uid("veh"))
-    # BUG-1 fix (10/10 debugging pass, 2026-09-11): was `index=True` only, no
-    # uniqueness. Two camera workers — each holding its own DB session — that
-    # both saw "no vehicle for this plate yet" for the SAME brand-new plate
-    # within the same race window could each insert a Vehicle row, silently
-    # splitting one real vehicle's identity across two rows: get_route()
-    # builds a cross-camera journey FROM Plate.vehicle_id, so a split vehicle
-    # silently loses half its route/sighting-count/risk signal, with no error
-    # anywhere. `unique=True` makes the SECOND insert fail loudly
-    # (IntegrityError) instead of silently succeeding; see
-    # `pipeline/correlate.py::upsert_vehicle_for_plate` for the recovery path
-    # that catches it and folds the loser into the winner. SQL UNIQUE treats
-    # multiple NULLs as distinct, so vehicles with no plate at all (e.g.
-    # person-only sightings) are unaffected — see
-    # tests/test_vehicle_upsert_race.py.
+    # Unique: two camera workers seeing a brand-new plate at the same moment
+    # could each insert a row and split one vehicle's route/sightings/risk in
+    # two, silently. Now the second insert raises IntegrityError and
+    # correlate.upsert_vehicle_for_plate merges it into the winner. Multiple
+    # NULLs are still allowed (tests/test_vehicle_upsert_race.py).
     #
-    # Known residual gap: SQLite's `ALTER TABLE ADD COLUMN` (see
-    # db.py::ensure_columns, used for an already-existing SQLite database)
-    # cannot retroactively add a UNIQUE constraint to an existing table — only
-    # a fresh `create_all()` (new deployments, the test suite) or the
-    # Alembic-managed PostgreSQL path actually gets the DB-level guarantee.
-    # An already-running SQLite deployment upgraded in place keeps only the
-    # narrowed race window, not the hard guarantee, until its DB file is
-    # recreated. Documented in docs/THREAT_MODEL.md rather than silently
-    # assumed away.
+    # Gap: SQLite's ALTER TABLE ADD COLUMN (db.ensure_columns) can't add
+    # UNIQUE to an existing table, so an old SQLite DB upgraded in place only
+    # gets the narrower race window until the file is recreated. Fresh
+    # create_all and the Alembic/PostgreSQL path get the real constraint.
+    # Noted in docs/THREAT_MODEL.md.
     plate_text = Column(String, unique=True, index=True, nullable=True)
     plate_confidence = Column(Float, default=0.0)
-    # Whether this vehicle's plate has EVER been corroborated across frames
-    # (pipeline/plate_tracker.has_consensus). A separate signal from
-    # plate_confidence and never blended into it: measured on the labelled
-    # benchmark, OCR confidence does not separate correct reads from wrong ones
-    # — correct reads span 0.262-0.990, wrong plate-shaped reads span
-    # 0.260-0.956 — so corroboration is independent evidence rather than more of
-    # the same.
-    #
-    # Ratchets up only: a vehicle identified well at one camera is not
-    # downgraded by a glimpse at the next. NULL on rows written before this
-    # column existed, and read as NOT corroborated — unknown provenance must not
-    # buy CRITICAL alert severity (see pipeline/rules_engine.py).
+    # Ever corroborated across frames (plate_tracker.has_consensus). Kept apart
+    # from plate_confidence: on the benchmark confidence doesn't separate right
+    # from wrong reads (0.262-0.990 vs 0.260-0.956), so this is independent
+    # evidence. Only ratchets up. NULL on old rows = not corroborated, which
+    # can't buy a CRITICAL (rules_engine.py).
     plate_corroborated = Column(Boolean, default=False)
     vehicle_type = Column(String, default="")
     color = Column(String, default="")
     first_seen = Column(DateTime, default=datetime.utcnow)
-    # Indexed: "most recently seen vehicles" is the default ordering of both the
-    # vehicles list API and the live control room.
+    # indexed, default sort of the vehicles list and the control room
     last_seen = Column(DateTime, default=datetime.utcnow, index=True)
     watchlist_flag = Column(Boolean, default=False)
 
 
 class Plate(Base):
-    """A plate recognition — and, in V2, a vehicle SIGHTING: one row per
-    (camera, vehicle track), not one per OCR frame.
+    """A plate read, and in V2 a vehicle sighting: one row per (camera,
+    vehicle track), not per OCR frame.
 
-    Pre-V2 this table got a new row every inference cycle a plate happened to
-    read, so a vehicle stopped at a signal produced dozens of identical rows.
-    That mattered beyond storage: `correlate.get_route()` reconstructs a
-    vehicle's cross-camera journey FROM these rows, so one real sighting became
-    dozens of duplicate route hops. V2 creates the row on first confident read
-    and UPDATES it (`confidence`, `reads_count`, `last_seen`) as the same
-    tracked vehicle stays in frame — see pipeline/plate_tracker.py."""
+    Pre-V2 a car waiting at a signal made dozens of identical rows, and since
+    correlate.get_route() builds the journey from these rows, dozens of fake
+    hops. Now the row is created on the first confident read and updated
+    (confidence, reads_count, last_seen) while the track stays in frame
+    (pipeline/plate_tracker.py)."""
     __tablename__ = "plates"
     id = Column(String, primary_key=True, default=lambda: uid("plt"))
     vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
@@ -213,66 +172,48 @@ class Plate(Base):
     plate_text_raw = Column(String, default="")
     plate_text_normalized = Column(String, default="", index=True)
     confidence = Column(Float, default=0.0)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time — FIRST confident read
-    source_timestamp = Column(DateTime, nullable=True)  # SOURCE time — see Detection.source_timestamp
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time, first confident read
+    source_timestamp = Column(DateTime, nullable=True)  # SOURCE time, see Detection.source_timestamp
     snapshot_path = Column(String, nullable=True)
-    # --- V2 sighting fields ---
-    # ByteTrack track id (camera-scoped, stored as text to match
-    # Detection.track_id). Null for a read that arrived with no track id, and
-    # for every row written before V2 — never backfilled with a guess.
+    # V2 sighting fields
+    # ByteTrack id as text (matches Detection.track_id). Null without a track
+    # id and on pre-V2 rows, never backfilled.
     track_id = Column(String, nullable=True, index=True)
-    # Last time this same tracked vehicle was still being observed at this
-    # camera. `timestamp` is first-seen; the pair gives real dwell time.
+    # last time the track was still seen here. with timestamp = dwell time
     last_seen = Column(DateTime, nullable=True)
-    # How many gate-passing OCR reads agreed on this plate text. 1 for a
-    # single-frame read; higher means real temporal corroboration.
+    # passing reads that agreed on the text. 1 = single frame
     reads_count = Column(Integer, default=1)
-    # The vehicle's own YOLO class and detection confidence at the moment of
-    # the recognition — so a sighting answers "what kind of vehicle" without a
-    # join back through Detection.
+    # the vehicle's YOLO class/confidence at recognition, saves a join
     vehicle_class = Column(String, default="")
     detection_confidence = Column(Float, default=0.0)
-    # Both boxes in FULL-FRAME pixel coordinates. plate_bbox is null when the
-    # localizer found no plate region and OCR fell back to the whole vehicle
-    # crop — that null is meaningful (it says the read is less trustworthy),
-    # so it is never filled in with the vehicle box as a substitute.
+    # Full-frame pixel coords. plate_bbox null = no plate region found and OCR
+    # read the whole vehicle crop, which is less trustworthy; never filled
+    # with the vehicle box.
     vehicle_bbox = Column(JSON, nullable=True)
     plate_bbox = Column(JSON, nullable=True)
-    # --- Human-in-the-loop ANPR review (10/10 roadmap P7) ---
-    # auto_accepted: cleared the confidence gate, no operator action needed.
-    # pending_review: recorded (per the "keep uncertain reads, never discard
-    # them" rule anpr.py already follows) but below plate_min_confidence, or
-    # below watchlist_high_confidence_floor while carrying a watchlist match —
-    # waiting on an operator. corrected: an operator supplied the true text.
-    # rejected: an operator determined the read is not usable intelligence.
+    # ANPR review.
+    # auto_accepted: cleared the gate, nothing to do.
+    # pending_review: kept but below the review floor, or uncorroborated, or
+    #   below the watchlist floor on a watchlist match. waiting on an operator.
+    # corrected: operator gave the real text. rejected: not usable.
     review_status = Column(String, default="auto_accepted", index=True)
     reviewed_by = Column(String, ForeignKey("users.id"), nullable=True)
     reviewed_at = Column(DateTime, nullable=True)
-    # The operator-supplied correct plate text, kept SEPARATE from both
-    # plate_text_raw (literal OCR output) and plate_text_normalized (grammar-
-    # repaired OCR output) — three distinct facts: what OCR said, what the
-    # parser resolved it to, and what a human confirmed it actually is.
+    # Operator's text, separate from plate_text_raw (what OCR said) and
+    # plate_text_normalized (what the parser made of it).
     corrected_text = Column(String, nullable=True)
-    # --- ANPR explainability ---
-    # Every field below is a SEPARATE evidence signal, stored unblended so a
-    # sighting can be audited on what actually supported it. `confidence` above
-    # remains the OCR engine's own number and is never adjusted by any of these.
+    # ANPR explainability. Separate signals, stored unblended; `confidence`
+    # stays the OCR engine's own number.
     #
-    # Which preprocessing variant produced the winning read ("clahe" by default;
-    # see pipeline/plate_preprocess.py). Null on rows written before this
-    # existed — never backfilled with a guess.
+    # preprocessing variant that won ("clahe" by default, plate_preprocess.py).
+    # null on older rows
     ocr_variant = Column(String, nullable=True)
-    # How many preprocessing variants agreed on the text. 1 whenever
-    # multi-variant reading is disabled, which is the default.
+    # variants that agreed on the text; 1 unless multi-variant is on
     variants_agreeing = Column(Integer, nullable=True)
-    # Whether the temporal layer got enough agreeing observations across frames
-    # to treat this as settled (pipeline/plate_tracker.has_consensus). False
-    # means the sighting is a real observation but an UNCORROBORATED one, and it
-    # is flagged pending_review regardless of how confident the read was.
+    # Enough agreeing frames to settle it (plate_tracker.has_consensus). False
+    # is a real but uncorroborated sighting, always pending_review.
     corroborated = Column(Boolean, nullable=True)
-    # The plate region OCR actually read, saved next to the full-frame snapshot
-    # so a reviewer can see the evidence rather than only the text. Null unless
-    # PLATE_DEBUG_CROPS is enabled.
+    # the plate crop OCR read, for reviewers. only with PLATE_DEBUG_CROPS
     plate_crop_path = Column(String, nullable=True)
 
 
@@ -313,10 +254,9 @@ class Zone(Base):
     schedule_start = Column(String, default="00:00")
     schedule_end = Column(String, default="23:59")
     active = Column(Boolean, default=True)
-    # Loitering rule support (Phase 6): dwell-time threshold in seconds. Null means
-    # no loitering check applies to this zone — only zones with this set AND an
-    # active AlertRule(rule_type="loitering") referencing them are checked (see
-    # rules_engine.py) — restricted-zone entry itself is unaffected either way.
+    # Loitering dwell threshold in seconds. Only checked when set AND an
+    # active AlertRule(rule_type="loitering") points at the zone
+    # (rules_engine.py). Zone entry doesn't care.
     loitering_seconds = Column(Float, nullable=True)
 
 
@@ -346,15 +286,12 @@ class Alert(Base):
     source_timestamp = Column(DateTime, nullable=True)  # SOURCE time of the triggering detection
     acknowledged_by = Column(String, ForeignKey("users.id"), nullable=True)
     snapshot_path = Column(String, nullable=True)
-    # Explainable 0-100 risk score and the per-factor breakdown that produced
-    # it (see pipeline/risk.py). `reasons` above stays exactly what it was — the
-    # rule-match narrative — while these carry the weighted assessment. Both are
-    # kept: the reasons say WHAT matched, the factors say how much each mattered.
+    # 0-100 risk score and its per-factor breakdown (pipeline/risk.py).
+    # reasons say what matched, factors say how much each counted.
     risk_score = Column(Integer, default=0, index=True)
     risk_factors = Column(JSON, default=list)
-    # --- Alert feedback / false-positive measurement (10/10 roadmap P6) ---
-    # Null until an operator actually reviews the alert — never defaulted to
-    # "confirmed", which would fabricate a review that never happened.
+    # Operator feedback / false-positive tracking. Null until someone reviews
+    # it, never defaulted to "confirmed".
     feedback = Column(String, nullable=True, index=True)  # confirmed | false_positive | needs_review
     feedback_reason = Column(String, nullable=True)
     feedback_by = Column(String, ForeignKey("users.id"), nullable=True)
@@ -362,21 +299,16 @@ class Alert(Base):
 
 
 class IncidentAlert(Base):
-    """Many alerts -> one correlated incident.
+    """Many alerts -> one incident.
 
-    `Incident.alert_id` is a single FK and remains the incident's originating
-    alert (existing callers depend on it). Real policing events are not
-    one-alert-shaped though: a watchlisted vehicle entering a restricted zone
-    and then being picked up by three more cameras is ONE event that generated
-    five alerts. Without this table each of those became its own incident, which
-    is precisely the operator-flooding the platform's own design principles
-    argue against."""
+    Incident.alert_id stays the originating alert (callers use it). But a
+    watchlisted car entering a zone and then showing up on three more cameras
+    is one event with five alerts, not five incidents."""
     __tablename__ = "incident_alerts"
     id = Column(String, primary_key=True, default=lambda: uid("ia"))
     incident_id = Column(String, ForeignKey("incidents.id"), nullable=False, index=True)
     alert_id = Column(String, ForeignKey("alerts.id"), nullable=False, index=True)
-    # Why this alert was judged part of that incident — the correlation is an
-    # inference and must be able to justify itself, not just assert a link.
+    # why this alert was judged part of the incident; it's an inference
     correlation_reason = Column(String, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -392,8 +324,8 @@ class Incident(Base):
     description = Column(String, default="")
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=True)
     alert_id = Column(String, ForeignKey("alerts.id"), nullable=True)
-    # Indexed with created_at: every CRITICAL alert looks for an open incident
-    # on the same vehicle inside the correlation window (rules_engine.py).
+    # indexed with created_at: every CRITICAL looks for an open incident on
+    # the same vehicle in the correlation window
     vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
     assigned_to = Column(String, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -420,17 +352,13 @@ class Evidence(Base):
     uploaded_by = Column(String, ForeignKey("users.id"), nullable=True)
     verification_status = Column(String, default="unverified")
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    # Event-clip linkage (Phase 3). Null for pre-existing snapshot/report rows.
+    # event clip linkage. null on older snapshot/report rows
     alert_id = Column(String, ForeignKey("alerts.id"), nullable=True)
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     event_type = Column(String, default="")  # e.g. watchlist_match | zone_entry
     source_timestamp = Column(DateTime, nullable=True)
-    # --- Evidence provenance completion (10/10 roadmap P8) ---
-    # The model/rule versions ACTIVE at capture time — stamped once, never
-    # updated later, so the record answers "what produced this" even after
-    # settings.model_version / an AlertRule.version subsequently changes.
-    # Null for evidence captured before this field existed (honest gap, not
-    # backfilled with today's version as if it always applied).
+    # Model/rule versions active at capture, stamped once and never updated.
+    # Null on older evidence rather than backfilled with today's version.
     model_version = Column(String, nullable=True)
     rule_version = Column(String, nullable=True)
 
@@ -445,29 +373,23 @@ class AuditLog(Base):
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    # --- Tamper-evident audit chain (10/10 roadmap P9) ---
-    # `id` is a random uid, not insertion-ordered, so the chain needs its own
-    # monotonic position. Assigned in app/audit.py (max(chain_seq)+1), unique
-    # so a concurrent-write race raises instead of silently mis-ordering the
-    # chain — see audit.py's retry loop for how that race is handled.
+    # Tamper-evident chain. id is random, so the chain needs its own position:
+    # max(chain_seq)+1 in app/audit.py. Unique so a concurrent write raises
+    # instead of mis-ordering (audit.py retries).
     chain_seq = Column(Integer, nullable=True, unique=True, index=True)
-    # sha256 of the PREVIOUS row's entry_hash ("0"*64 for the first row) and
-    # entry_hash = sha256(prev_hash + this row's own canonical fields).
-    # Deleting or editing any row breaks every entry_hash after it — that
-    # break, not any single row's hash alone, is what verify-chain detects.
+    # prev_hash is the previous row's entry_hash ("0"*64 for the first);
+    # entry_hash = sha256(prev_hash + this row's canonical fields). Edit or
+    # delete a row and every hash after it breaks, which is what verify-chain
+    # looks for.
     prev_hash = Column(String, nullable=True)
     entry_hash = Column(String, nullable=True)
 
 
 class SelfHealEvent(Base):
-    """Sentinel Self-Heal audit trail — one row per real recovery attempt
-    (see app/self_heal/engine.py). Deliberately NOT written for every routine
-    successful commit/read (that would be thousands of rows/minute with zero
-    diagnostic value) — only when something actually went wrong and a
-    recovery path (retry, reconnect, restart, rollback...) ran. Never the
-    system of record for correctness — a best-effort diagnostic/audit log;
-    losing an occasional row under extreme contention is acceptable and
-    never blocks the real operation it's describing."""
+    """One row per real recovery attempt (app/self_heal/engine.py). Not
+    written for routine successes, only when something went wrong and a
+    recovery ran. Best-effort diagnostics; losing a row under heavy contention
+    is fine and never blocks the operation it describes."""
     __tablename__ = "self_heal_events"
     id = Column(String, primary_key=True, default=lambda: uid("sh"))
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)

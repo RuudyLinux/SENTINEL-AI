@@ -1,5 +1,4 @@
-"""PATCH /api/cameras/{id} — in-place edit (Model 2/4: camera groups + editable
-analytics config). Only fields present in the payload should change."""
+"""PATCH /api/cameras/{id}: in-place edit, only fields in the payload change."""
 
 
 def _create_camera(client, admin_token, **overrides):

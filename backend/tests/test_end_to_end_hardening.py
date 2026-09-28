@@ -1,8 +1,7 @@
-"""Regressions found by walking the running system as an operator would.
+"""Regressions found by using the running system like an operator.
 
-Every test here failed before the fix that accompanies it. They are grouped by
-the flow the failure surfaced in, not by module, because that is how each one
-was actually found: a real login, a real search, a real camera delete.
+Each failed before its fix. Grouped by the flow where it showed up (a login,
+a search, a camera delete), not by module.
 """
 import uuid
 from datetime import datetime, timedelta
@@ -19,11 +18,9 @@ def auth(admin_token):
 
 
 class TestSelfHealEventsLimit:
-    """`GET /api/self-heal/events` declared `Query(default=100, le=500)` — an
-    upper bound with no lower one. SQLite reads `LIMIT -1` as NO LIMIT, so
-    `?limit=-1` returned the entire self-heal event table to any authenticated
-    user. `detections` and `review/queue` were given `ge=1` for exactly this
-    reason (tests/test_list_limits.py); this endpoint was missed.
+    """/api/self-heal/events had le=500 but no ge, and SQLite reads LIMIT -1
+    as no limit, so ?limit=-1 returned the whole table to any logged-in user.
+    detections and review/queue already had ge=1 (tests/test_list_limits.py).
     """
 
     def test_a_negative_limit_is_rejected(self, client, auth):
@@ -38,13 +35,9 @@ class TestSelfHealEventsLimit:
 
 
 class TestUnboundedListEndpoints:
-    """`GET /api/incidents` and `GET /api/evidence` ended in a bare `.all()`.
-
-    Both tables grow with operational activity — one incident per CRITICAL
-    alert, one evidence row per captured snapshot or clip — so "return every
-    row" is a query whose cost rises forever, on two of the screens an
-    operator opens most. Every other transactional list endpoint here is
-    already capped (alerts 200, detections 100/500, audit 500).
+    """/api/incidents and /api/evidence ended in a bare .all(). Both grow
+    with activity and are opened constantly; everything else was already
+    capped (alerts 200, detections 100/500, audit 500).
     """
 
     def test_incidents_are_capped(self, client, auth, db_session):
@@ -71,26 +64,15 @@ class TestUnboundedListEndpoints:
 
 
 class TestAuditResourceIsBounded:
-    """A failed login writes the SUBMITTED username into the audit log's
-    `resource` column, and nothing bounded it.
+    """A failed login writes the submitted username into the audit
+    `resource`, with no cap.
 
-    Reproduced against the running system: one POST /api/auth/login carrying a
-    5,000-character username — no account, no credential, no session needed —
-    stored a 5,000-character audit row. Two consequences, both real:
+    One login with a 5,000-char username (no account needed) stored a
+    5,000-char row, and the audit table (whitespace-nowrap) went 36,215px
+    wide. The rate limiter caps how many attempts, not how big each row is.
 
-      * The audit page renders every cell `whitespace-nowrap`, so that single
-        row stretched the table to 36,215px wide. The screen an investigator
-        uses to review activity was made unusable by input an unauthenticated
-        attacker chose.
-      * Storage growth from unauthenticated input is unbounded in the size
-        dimension. The login rate limiter caps how MANY attempts are made; it
-        never capped how LARGE what each attempt persists is.
-
-    Truncated with an explicit marker rather than silently cut: an audit trail
-    that quietly alters what it recorded is worse than one that says it
-    shortened a value. Bounded inside `log_action` — the single funnel every
-    audit write passes through — so the guarantee covers every caller, not
-    only the login path that happens to be reachable without credentials.
+    Cut with a visible marker, not silently. Done in log_action, which every
+    audit write goes through, so it covers all callers.
     """
 
     def test_a_long_resource_is_truncated(self, db_session, admin_user):
@@ -119,16 +101,10 @@ class TestAuditResourceIsBounded:
 
 
 class TestSearchWildcardsAreLiteral:
-    """The free-text pattern was built as an f-string around the operator's
-    text and handed to `ilike` unescaped, so their own input was read as LIKE
-    syntax.
-
-    Measured on the running system: searching for a single percent sign
-    returned 30 results — every camera in the database — from a query that
-    matched nothing the operator typed. The underscore is the same problem one
-    character at a time. In an investigative tool a search that silently
-    widens itself is worse than one that returns nothing, because the extra
-    rows look like findings.
+    """The search pattern was an f-string around the operator's text, so
+    their input was LIKE syntax: a lone % returned all 30 cameras, and _ did
+    the same one character at a time. A search that widens itself is worse
+    than one that finds nothing, the extra rows look like findings.
     """
 
     @pytest.fixture
@@ -157,21 +133,15 @@ class TestSearchWildcardsAreLiteral:
 
 
 class TestCameraDeleteIgnoresRetiredZones:
-    """Deleting a camera was blocked by zones the operator had already deleted.
+    """Zones the operator already deleted blocked deleting the camera.
 
-    `DELETE /api/zones/{id}` is a soft delete (active=False) and `GET
-    /api/zones` hides those rows. The camera-delete guard counted zones
-    regardless of `active`, so an operator saw a camera with zero zones, tried
-    to delete it, and was told it still held "1 zones" — with no screen
-    anywhere that could show that zone, let alone remove it. An unreachable
-    state: the instruction the error gives cannot be carried out.
+    Zone delete is soft and the zone list hides those rows, but the camera
+    guard counted them, so a camera showing no zones said it still held
+    "1 zones" that no screen could show or remove.
 
-    A zone is configuration, not evidence, and retiring one is already
-    audited. A retired zone is therefore deleted along with its camera, while
-    an ACTIVE zone still blocks — so the message always names something the
-    operator can actually see and act on. The chain-of-custody records this
-    guard exists for (detections, alerts, incidents, evidence, plates, tracks)
-    are untouched and still block.
+    Retired zones (config, already audited) go with the camera; active ones
+    still block. Detections, alerts, incidents, evidence, plates and tracks
+    still block too.
     """
 
     @pytest.fixture
@@ -208,9 +178,8 @@ class TestCameraDeleteIgnoresRetiredZones:
         )
 
     def test_a_rule_attached_to_a_retired_zone_does_not_500(self, client, auth, db_session, camera):
-        """A rule holds a foreign key to the zone, so deleting the zone row out
-        from under it would raise instead of answering. The rule is retired with
-        the zone it can no longer evaluate."""
+        """A rule has a FK to the zone, so it's retired along with the zone
+        it can no longer evaluate."""
         zone = models.Zone(camera_id=camera.id, name="retired zone", active=False)
         db_session.add(zone)
         db_session.flush()
@@ -231,29 +200,19 @@ class TestCameraDeleteIgnoresRetiredZones:
 
 
 class TestCameraDeleteSelfHealEvents:
-    """`DELETE /api/cameras/{id}` returned a raw 500 for almost every camera
-    that had ever been started.
+    """DELETE /api/cameras/{id} was a raw 500 for nearly every camera that had
+    ever been started.
 
-    `SelfHealEvent.camera_id` is a foreign key to `cameras.id`, and the
-    delete guard's blocker list never counted it — so the request passed the
-    guard, reached `DELETE FROM cameras`, and raised
-    `IntegrityError: FOREIGN KEY constraint failed`. Found by deleting a probe
-    camera on the running system; the camera had been started once, which is
-    all it takes, because starting and stopping a camera writes self-heal
-    events. On PostgreSQL, which has always enforced foreign keys, the failure
-    is identical.
+    SelfHealEvent.camera_id is a FK to cameras.id and the guard didn't count
+    it, so the delete hit "FOREIGN KEY constraint failed". Starting and
+    stopping a camera writes self-heal events, so one start was enough.
+    Same on PostgreSQL.
 
-    This is the third time a table has been missed from a delete/wipe list in
-    this codebase (BUG-C here, BUG-D in seed.reset_demo_data), so the fix is
-    paired with `test_every_camera_foreign_key_is_accounted_for` below, which
-    fails if a FUTURE table referencing `cameras.id` is added and neither
-    blocked nor cleaned up.
-
-    Self-heal events are per-camera operational telemetry — a recovery log,
-    not chain-of-custody evidence and not operator configuration — and they
-    are meaningless once the camera they describe is gone. They are therefore
-    deleted with the camera, the same way retired zones are. Nothing in the
-    evidence chain or the (separate, hash-chained) audit log is touched.
+    Third time a table was missed from a delete list, hence
+    test_every_camera_foreign_key_is_accounted_for below. Self-heal events
+    are per-camera telemetry, not evidence or config, so they're deleted
+    with the camera like retired zones. The evidence chain and audit log
+    aren't touched.
     """
 
     @pytest.fixture
@@ -310,14 +269,9 @@ class TestCameraDeleteSelfHealEvents:
         assert db_session.query(models.SelfHealEvent).filter(models.SelfHealEvent.id == keep_id).first() is not None
 
     def test_every_camera_foreign_key_is_accounted_for(self):
-        """Structural guard against a fourth instance of this bug.
-
-        Every mapped column that is a foreign key to `cameras.id` must either
-        BLOCK deletion (operational history worth protecting) or be CLEANED UP
-        with the camera. A new table that does neither passes review easily and
-        then fails in production as a 500 on an ordinary admin action, which is
-        exactly what happened here — so the check is derived from the mapper
-        metadata rather than from a list someone has to remember to update.
+        """Every FK to cameras.id must either block deletion or be cleaned up
+        with the camera. Derived from mapper metadata so a new table can't
+        slip by the way SelfHealEvent did.
         """
         from app.routers.cameras import CAMERA_BLOCKER_MODELS, CAMERA_CASCADE_MODELS
 
@@ -338,20 +292,15 @@ class TestCameraDeleteSelfHealEvents:
 
 
 class TestWatchlistDuplicateEntries:
-    """Three identical in-force watchlist entries for one plate were creatable
-    by clicking SAVE three times — reproduced against the running system.
+    """SAVE clicked three times made three identical in-force entries for one
+    plate.
 
-    The operational failure is not the extra rows, it is what Deactivate then
-    does: `plate_entry_in_force` takes `.first()`, so removing one of three
-    identical entries leaves the plate exactly as watchlisted as before. The
-    operator performs the documented removal action, watches the vehicle stay
-    flagged, and has no way to tell why. This codebase already fixed the
-    mirror image of that bug once — a stale `watchlist_flag` surviving
-    deactivation.
+    The problem is Deactivate afterwards: plate_entry_in_force takes .first(),
+    so removing one of three leaves the plate flagged, and the operator can't
+    tell why.
 
-    Refused with 409 naming the existing entry rather than silently
-    de-duplicated: the operator may have meant to change the priority or the
-    reason, and quietly discarding that input would hide it from them.
+    409 naming the existing entry instead of silently de-duplicating; they
+    may have meant to change the priority or reason.
     """
 
     @pytest.fixture

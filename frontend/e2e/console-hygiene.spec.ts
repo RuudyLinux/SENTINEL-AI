@@ -1,23 +1,18 @@
 import { expect, test, type Page } from "@playwright/test";
 
 /**
- * No screen may log a browser error, and no screen may overflow horizontally
- * on a phone.
+ * No screen logs a browser error, and none overflows horizontally on a phone.
  *
- * Both of these were real and both had been dismissed as cosmetic:
+ * Both happened and got dismissed as cosmetic:
+ * - every page requested /branding/smart-shield-logo.png, which isn't in the
+ *   repo, and logged a 404. BrandLogo fell back fine, but a console with a
+ *   permanent error in it is a console nobody checks.
+ * - /admin/users logged a DOM warning on its password field, and the
+ *   browser's suggested fix (current-password) would have been a real bug:
+ *   that field creates SOMEONE ELSE'S account.
  *
- * - Every single page requested `/branding/smart-shield-logo.png`, a file the
- *   repository does not contain, and logged `404 (Not Found)` for it. The
- *   visible result was correct — `BrandLogo` falls back to the shipped shield
- *   — so it was left alone as "one console line". The cost is not the line:
- *   it is that a console with a permanent error in it stops being somewhere
- *   anyone looks for a new one.
- * - `/admin/users` logged a DOM warning on its password field, and the
- *   browser's suggested fix (`current-password`) would have been a real bug:
- *   the field creates SOMEONE ELSE'S account.
- *
- * This spec is deliberately strict: any console error, any uncaught page
- * error, and any failed request on any of these routes fails the run.
+ * Strict on purpose: any console error, uncaught error or failed request on
+ * these routes fails the run.
  */
 
 const ADMIN = { username: "admin", password: "sentinel123" };
@@ -37,9 +32,8 @@ const ROUTES = [
   "/self-heal/activity", "/self-heal/errors", "/self-heal/camera-health",
 ] as const;
 
-/** Errors that are the HARNESS's, not the application's. Kept to the two that
- *  are genuinely not the app's to fix, and matched narrowly so a real failure
- *  cannot hide behind them. */
+/** Errors that belong to the harness, not the app. Just these two, matched
+ *  narrowly so a real failure can't hide behind them. */
 const IGNORED = [
   // Next's dev-mode HMR socket, closed when a navigation interrupts it.
   /_next\/static\/chunks\/.*hot-reloader/i,
@@ -58,9 +52,8 @@ async function login(page: Page) {
   await page.waitForURL(/\/dashboard/, { timeout: 30_000 });
 }
 
-/** Widest element that sticks out past the viewport, ignoring anything inside
- *  a deliberately scrollable container — a wide table in `overflow-x-auto` is
- *  a design decision, not a bug. */
+/** Widest element sticking out past the viewport, ignoring things inside a
+ *  scrollable container (a wide table in overflow-x-auto is on purpose). */
 async function horizontalOverflow(page: Page) {
   return page.evaluate(() => {
     const vw = document.documentElement.clientWidth;
@@ -89,9 +82,8 @@ async function horizontalOverflow(page: Page) {
 for (const viewport of VIEWPORTS) {
   test.describe(`console and layout hygiene (${viewport.name})`, () => {
     test(`every operator screen loads clean at ${viewport.width}px`, async ({ page }) => {
-      // One test walks 22 routes against a real backend. The suite-wide 60s
-      // budget is sized for a single screen, not for a sweep; on a loaded CI
-      // runner this would time out on speed alone and read as a failure.
+      // one test walks 22 routes against a real backend; the 60s default is
+      // for one screen and a loaded CI runner would time out on speed alone
       test.setTimeout(240_000);
       await page.setViewportSize({ width: viewport.width, height: viewport.height });
 
@@ -103,20 +95,18 @@ for (const viewport of VIEWPORTS) {
       });
       page.on("pageerror", (err) => problems.push(`[${page.url()}] uncaught: ${err.message}`));
       page.on("requestfailed", (req) => {
-        // Next.js prefetches every in-view <Link> as an `?_rsc=` request; moving
-        // on to the next route aborts the ones still in flight. That is the
-        // browser cancelling work nobody needs, not a failure — and it only
-        // appears once cameras exist, which is why an empty CI database never
-        // tripped it. Any other failure, or an RSC request that failed for a
-        // real reason, is still reported.
+        // Next prefetches every visible <Link> as ?_rsc=, and moving on aborts
+        // the in-flight ones. That's the browser dropping unneeded work, and
+        // it only shows up once cameras exist (empty CI DB never hit it).
+        // Other failures, or an RSC request failing for real, still count.
         const aborted = req.failure()?.errorText === "net::ERR_ABORTED";
         if (aborted && req.url().includes("_rsc=")) return;
         if (!isIgnorable(req.url())) problems.push(`[${page.url()}] request failed: ${req.url()}`);
       });
       page.on("response", (res) => {
-        // A 404 on a static asset is the exact shape of the logo bug. API
-        // 4xx are the app's own business (a 404 for an unknown vehicle is
-        // correct behaviour), so only same-origin non-API routes count.
+        // a 404 on a static asset is what the logo bug looked like. API 4xx
+        // are the app's business (unknown vehicle -> 404 is right), so only
+        // same-origin non-API routes count
         if (res.status() < 400) return;
         const url = new URL(res.url());
         if (url.port !== "3000" || url.pathname.startsWith("/api/")) return;

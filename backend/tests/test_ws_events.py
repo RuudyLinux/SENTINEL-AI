@@ -1,8 +1,6 @@
-"""V2 Phase 4 — live event vocabulary, batching and legacy compatibility.
-
-Two things must both hold: the stream gains canonical `domain.action` names and
-a throttle on the one genuinely high-frequency event type, AND every pre-V2
-consumer keeps working without being touched.
+"""Live event names, batching and legacy compatibility. Canonical
+domain.action names and a throttle on detections, and every old consumer
+keeps working untouched.
 """
 import asyncio
 import json
@@ -57,9 +55,8 @@ class TestImmediateEvents:
         assert EventType.INCIDENT_CREATED in asyncio.run(scenario()).types()
 
     def test_a_vehicle_sighting_is_sent_immediately(self):
-        """A plate identification is the headline V2 event — it is low
-        frequency (one per vehicle per camera, not per frame) and must not be
-        delayed behind the detection batch."""
+        """Plate identifications are low-frequency (per vehicle per camera) and
+        don't wait behind the detection batch."""
         async def scenario():
             manager, socket = _manager_with_client()
             await manager.publish(EventType.VEHICLE_SIGHTING, {"plate_text": "GJ05AB1234"})
@@ -69,8 +66,7 @@ class TestImmediateEvents:
 
 
 class TestLegacyCompatibility:
-    """The pre-V2 frontend listens for "alert" and "self_heal_event". Those
-    consumers must keep working without being migrated."""
+    """Old consumers listening for "alert" and "self_heal_event" keep working."""
 
     def test_an_alert_also_arrives_under_its_legacy_name(self):
         async def scenario():
@@ -93,8 +89,7 @@ class TestLegacyCompatibility:
         assert EventType.SELF_HEAL_RECOVERY in types
 
     def test_the_high_frequency_stream_is_not_aliased(self):
-        """Duplicating every detection under a legacy name would defeat the
-        batching it exists to enable."""
+        """Aliasing every detection would undo the batching."""
         assert EventType.DETECTION_CREATED not in LEGACY_ALIASES
 
     def test_the_legacy_payload_is_identical_to_the_canonical_one(self):
@@ -115,7 +110,7 @@ class TestDetectionBatching:
             manager, socket = _manager_with_client()
             for i in range(5):
                 await manager.publish(EventType.DETECTION_CREATED, {"detection_id": f"det_{i}"})
-            # Nothing sent yet — the whole point of buffering.
+            # nothing sent yet, that's the buffering
             assert socket.sent == []
             await asyncio.sleep(0.05)
             await manager.shutdown()
@@ -128,8 +123,7 @@ class TestDetectionBatching:
         assert [e["detection_id"] for e in batches[0]["events"]] == [f"det_{i}" for i in range(5)]
 
     def test_each_batched_event_keeps_its_own_type(self):
-        """A batch is an envelope, not a type erasure — a consumer must still
-        be able to tell what each event inside it was."""
+        """A batch still says what type each event inside it is."""
 
         async def scenario():
             manager, socket = _manager_with_client()
@@ -151,8 +145,7 @@ class TestDetectionBatching:
         assert socket.of_type(EventType.DETECTION_BATCH)[0]["count"] == 1
 
     def test_the_buffer_is_capped_and_drops_the_oldest(self, monkeypatch):
-        """If flushing ever stalls, a delivery hiccup must not become a memory
-        problem — and on a live feed the newest events are the ones that matter."""
+        """A stalled flush can't become a memory problem; newest events win."""
         monkeypatch.setattr(settings, "ws_batch_max_events", 3)
 
         async def scenario():
@@ -170,7 +163,7 @@ class TestDetectionBatching:
         assert [e["detection_id"] for e in batch["events"]] == ["det_3", "det_4", "det_5"]
 
     def test_the_flush_task_stops_when_the_stream_goes_quiet(self, monkeypatch):
-        """An idle process must be genuinely idle, not holding a permanent timer."""
+        """An idle process holds no timer."""
         monkeypatch.setattr(settings, "ws_batch_interval_seconds", 0.01)
 
         async def scenario():
@@ -183,8 +176,8 @@ class TestDetectionBatching:
         assert manager._flush_task is None or manager._flush_task.done()
 
     def test_buffering_outside_an_event_loop_does_not_raise(self):
-        """A synchronous caller must not crash on a producer call; the events
-        flush on the next publish that does have a loop."""
+        """A sync caller doesn't crash; events go out on the next publish
+        that has a loop."""
         manager, socket = _manager_with_client()
         manager._buffer(EventType.DETECTION_CREATED, EventType.DETECTION_BATCH, {"detection_id": "det_1"})
         assert manager._flush_task is None
@@ -220,7 +213,6 @@ def test_every_batched_type_declares_a_distinct_envelope():
     "camera.status", "camera.health", "self_heal.recovery",
 ])
 def test_the_declared_event_vocabulary_is_stable(name):
-    """These names are a published contract the frontend filters on — a rename
-    silently breaks a live dashboard, so changing one must fail here first."""
+    """The frontend filters on these names, so a rename fails here first."""
     declared = {v for k, v in vars(EventType).items() if not k.startswith("_") and isinstance(v, str)}
     assert name in declared

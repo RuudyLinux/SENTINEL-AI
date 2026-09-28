@@ -1,28 +1,17 @@
-"""The compose/Dockerfile contract, checked against the application itself.
+"""The compose/Dockerfile contract, checked against the app.
 
-**This is not a substitute for `docker compose up --build`.** A real build is
-the only thing that proves the images build and the services come up, and it
-cannot run in this environment (Docker Desktop's installer requires an
-elevation prompt nobody can click from here). That limitation is stated in the
-README rather than papered over.
+Not a substitute for `docker compose up --build`, the only thing that proves
+the images build and start. That can't run here (Docker Desktop's installer
+needs an elevation prompt), and the README says so.
 
-What CAN be checked without Docker is the contract between those files and the
-code — which is where silent drift actually lives, because nothing fails
-loudly when it breaks:
-
-* A volume is mounted at a path the app no longer writes to. Evidence would be
-  written INSIDE the container's writable layer and vanish on the next
-  `docker compose up --build` — for a platform whose entire premise is
-  chain-of-custody, that is the worst possible way to lose data, and both a
-  unit test suite and a green `docker ps` would look perfectly healthy.
-* An environment variable is set in compose that the settings object does not
-  read (a rename, a typo). The service starts, ignores it, and runs on the
-  default — so a deployment sets `METRICS_TOKEN` and gets an unauthenticated
-  metrics endpoint anyway.
-* A healthcheck polls a route that no longer exists, so the container reports
-  unhealthy forever, or `--wait` never returns.
-* A Dockerfile COPYs a file that was renamed, which fails the build at the
-  worst moment — during a deployment, not during development.
+What can be checked is where drift hides, since none of it fails loudly:
+* a volume mounted where the app no longer writes: evidence ends up in the
+  container's writable layer and disappears on the next rebuild, while tests
+  and `docker ps` look fine
+* a compose env var the settings don't read (rename, typo): the service
+  starts on the default, e.g. METRICS_TOKEN set and metrics open anyway
+* a healthcheck on a route that's gone: unhealthy forever, --wait hangs
+* a Dockerfile COPY of a renamed file: the build breaks mid-deploy
 """
 import re
 from pathlib import Path
@@ -65,21 +54,20 @@ class TestFilesReferencedByTheBuildExist:
 
     @pytest.mark.parametrize("relative", ["backend/.dockerignore", "frontend/.dockerignore"])
     def test_dockerignore_files_exist(self, relative):
-        """Without these, the build context includes .venv/node_modules and the
-        model weights the backend Dockerfile documents as deliberately absent."""
+        """Otherwise the build context pulls in .venv/node_modules and the
+        model weights the Dockerfile says are left out."""
         assert (_REPO_ROOT / relative).is_file()
 
     @pytest.mark.parametrize("pattern", [".venv-gpu/", ".env", ".env.*", "*.db"])
     def test_backend_image_excludes_local_environments_and_secrets(self, pattern):
-        """The CUDA environment is several GB, and `.env.*` copies have held the
-        live grid password; `COPY . .` must not carry either into an image."""
+        """The CUDA env is several GB and .env.* copies have held the live
+        grid password; COPY . . mustn't bring either along."""
         lines = (_REPO_ROOT / "backend/.dockerignore").read_text(encoding="utf-8").splitlines()
         assert pattern in lines
 
     def test_every_file_the_frontend_image_copies_exists(self, frontend_dockerfile):
-        """`COPY --from=builder /app/next.config.js` fails the build outright if
-        the config is renamed to .ts or .mjs — a rename that is invisible to
-        every other check in this repository."""
+        """COPY --from=builder /app/next.config.js breaks the build if the
+        config is renamed to .ts or .mjs, and nothing else here would notice."""
         copied = re.findall(r"COPY --from=builder /app/([\w./-]+)", frontend_dockerfile)
         for name in copied:
             if name.startswith(".next"):
@@ -118,8 +106,7 @@ class TestVolumesMatchWhereTheAppWrites:
 
 class TestEnvironmentKeysAreRead:
     def test_every_backend_environment_key_maps_to_a_setting(self, compose_text):
-        """A key compose sets that settings does not read is silently ignored —
-        the deployment believes it configured something it did not."""
+        """A key compose sets that settings doesn't read is silently ignored."""
         backend_block = compose_text.split("backend:", 1)[1].split("frontend:", 1)[0]
         env_block = backend_block.split("environment:", 1)[1].split("volumes:", 1)[0]
         keys = re.findall(r"^\s{6}([A-Z][A-Z0-9_]*):", env_block, flags=re.MULTILINE)
@@ -130,8 +117,8 @@ class TestEnvironmentKeysAreRead:
         assert unread == [], f"compose sets keys the application never reads: {unread}"
 
     def test_the_secrets_have_no_guessable_defaults(self, compose_text):
-        """`:?` makes compose FAIL when the value is unset, rather than starting
-        a police datastore on a default password."""
+        """`:?` makes compose fail when unset instead of starting the DB on a
+        default password."""
         assert "POSTGRES_PASSWORD:?" in compose_text.replace("${", "").replace("}", "")
         assert "JWT_SECRET:?" in compose_text.replace("${", "").replace("}", "")
 
@@ -157,17 +144,16 @@ class TestHealthchecksPollRealRoutes:
         assert page.is_file(), f"healthcheck polls {route}, but {page} does not exist"
 
     def test_the_backend_healthcheck_allows_for_model_loading(self, backend_dockerfile):
-        """`start-period` has to exceed a cold start: ultralytics and easyocr
-        fetch weights on first use, and a short grace period would restart the
-        container in a loop while it is legitimately starting."""
+        """start-period has to cover a cold start (ultralytics/easyocr fetch
+        weights on first use), or the container restart-loops while starting."""
         match = re.search(r"--start-period=(\d+)s", backend_dockerfile)
         assert match and int(match.group(1)) >= 60
 
 
 class TestSchemaIsMigratedOnStart:
     def test_compose_brings_the_schema_to_head_before_serving(self, compose_text):
-        """On PostgreSQL, Alembic owns the schema — app/db.py's additive helpers
-        are SQLite-only, so without this the first request hits missing tables."""
+        """On PostgreSQL Alembic owns the schema (db.py's helpers are SQLite
+        only), so without this the first request hits missing tables."""
         assert "alembic upgrade head" in compose_text
         backend_block = compose_text.split("backend:", 1)[1].split("frontend:", 1)[0]
         command = backend_block.split("command:", 1)[1]

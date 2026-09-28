@@ -1,26 +1,19 @@
-"""The Alembic chain must apply, match the models, and roll back — on SQLite too.
+"""The Alembic chain applies, matches the models and rolls back, on SQLite too.
 
-`alembic upgrade head` ABORTED on SQLite:
+`alembic upgrade head` used to abort on SQLite:
 
     NotImplementedError: No support for ALTER of constraints in SQLite dialect.
 
-Two post-baseline migrations used bare `op.create_foreign_key` /
-`op.create_unique_constraint`, which SQLite cannot do (the baseline migration
-had correctly used `batch_alter_table` throughout). So the migration chain
-could not be applied to SQLite at all, and CI's own "Verify migrations apply
-and roll back" step could never have passed — nobody noticed because those
-jobs only run on pushes to `main`, and day-to-day SQLite development uses the
-additive helpers in `app/db.py`, never Alembic.
+Two migrations used bare op.create_foreign_key / op.create_unique_constraint
+(the baseline used batch mode). CI's migration step only runs on main and
+dev uses db.py's additive helpers, so nobody noticed.
 
-Fixing that exposed a second defect hiding behind the first: `alembic check`
-then reported permanent drift, because the migrations created a unique
-CONSTRAINT plus a separate non-unique index while `models.py` declares
-`Column(..., unique=True, index=True)` — which SQLAlchemy renders as exactly
-ONE unique index.
+Fixing that showed `alembic check` drifting forever: the migrations made a
+unique constraint plus a plain index, while unique=True, index=True renders
+to one unique index.
 
-Run in a subprocess with its own DB_PATH, mirroring how CI invokes Alembic:
-the settings object is already loaded by the time this test runs, so an
-in-process override would not reach the migration environment.
+Runs in a subprocess with its own DB_PATH like CI does; settings are already
+loaded in this process, so an in-process override wouldn't reach Alembic.
 """
 import os
 import subprocess
@@ -62,10 +55,8 @@ class TestMigrationChain:
         assert scratch_db.exists()
 
     def test_the_migrated_schema_matches_the_models(self, scratch_db):
-        """`alembic check` on a database freshly migrated to head must find
-        nothing to do. Drift here means the models and the migrations disagree
-        — the failure mode where a column exists in one environment and not
-        another."""
+        """Freshly migrated to head, `alembic check` finds nothing. Drift means
+        models and migrations disagree."""
         assert _alembic("upgrade head", scratch_db).returncode == 0
         result = _alembic("check", scratch_db)
         assert result.returncode == 0, (
@@ -80,9 +71,8 @@ class TestMigrationChain:
         )
 
     def test_the_chain_is_re_appliable(self, scratch_db):
-        """upgrade -> downgrade -> upgrade. A migration whose downgrade leaves
-        a stray index or constraint behind passes the first two steps and fails
-        the third."""
+        """upgrade, downgrade, upgrade. A downgrade leaving an index behind
+        passes the first two and fails the third."""
         assert _alembic("upgrade head", scratch_db).returncode == 0
         assert _alembic("downgrade base", scratch_db).returncode == 0
         result = _alembic("upgrade head", scratch_db)
@@ -93,8 +83,8 @@ class TestMigrationChain:
 
 class TestUniquenessSurvivesTheChain:
     def test_plate_text_is_unique_after_migrating(self, scratch_db):
-        """BUG-1's database-level guard must actually exist in a migrated
-        database, not only in one built by `Base.metadata.create_all`."""
+        """The plate_text unique index exists in a migrated DB too, not only
+        one from create_all."""
         import sqlite3
 
         assert _alembic("upgrade head", scratch_db).returncode == 0

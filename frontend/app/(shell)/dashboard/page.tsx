@@ -24,9 +24,8 @@ function CameraControlWidget() {
   const [busy, setBusy] = useState<string | null>(null);
 
   async function quickAction(action: string) {
-    // "Restart All"/"Stop All" are disruptive per Camera Control Center's own
-    // confirmation rule — this compact widget only offers the full flow
-    // (with confirmation) via the deep link, not a bare fire-here button.
+    // Restart All / Stop All need confirmation (Camera Control Center), so this
+    // widget only deep-links there instead of firing directly
     if (action === "restart" || action === "stop") {
       router.push("/cameras/control");
       return;
@@ -99,15 +98,13 @@ export default function DashboardPage() {
       setLiveFeed((prev) => [{ ...e.data, kind: "alert" }, ...prev].slice(0, 20));
       reload();
     }
-    // Detections now arrive coalesced into one batch frame per interval rather
-    // than one frame each (backend ws.py) — N cameras at their inference rate
-    // would otherwise be that many React state updates per second here.
+    // detections come batched from ws.py, otherwise N cameras x inference rate
+    // would be that many state updates a second
     if (e.type === EVENT.DETECTION_BATCH) {
       const batched = (e.data?.events ?? []).map((d: any) => ({ ...d, kind: "detection" }));
       if (batched.length) setLiveFeed((prev) => [...batched.reverse(), ...prev].slice(0, 20));
     }
-    // A recognized plate is an identification, not one more anonymous
-    // detection, so it gets its own row in the command-centre feed.
+    // a recognized plate is an identification, gets its own row in the feed
     if (e.type === EVENT.VEHICLE_SIGHTING) {
       setLiveFeed((prev) => [{ ...e.data, kind: "sighting" }, ...prev].slice(0, 20));
     }

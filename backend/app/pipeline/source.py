@@ -1,12 +1,6 @@
-"""Camera source — backward-compat wrapper over the adapter interface.
-
-`CameraSource` is kept as the stable public class (same name, same methods) that
-`worker.py`, `routers/cameras.py`, and the test suite already import — it now just
-delegates to `pipeline/adapters.py`'s `CameraAdapter` interface (doc §48
-"vendor-agnostic adapter"; Model 3 — VMS Federation/Middleware). See `adapters.py`
-for the actual per-source-type logic (webcam/video_file/rtsp/mock_vms/onvif) and for
-how a future vendor-specific VMS adapter plugs in without touching this file, the
-detector, ANPR, correlation, or rules-engine code.
+"""CameraSource: the stable class worker.py, routers/cameras.py and tests use,
+delegating to the adapters in pipeline/adapters.py (doc §48). A new vendor
+adapter goes there, nothing here changes.
 """
 import cv2
 import numpy as np
@@ -14,16 +8,10 @@ import numpy as np
 from ..config import settings
 from .adapters import CameraAdapter, get_adapter
 
-# `cv2`/`settings` are never referenced below by name — they're kept as
-# module attributes here (not truly "unused") because test_source_rtsp.py
-# monkeypatches them via `source_mod.cv2.VideoCapture` / `source_mod.settings.*`.
-# Since `cv2` is a single shared module object, patching it through this
-# name also affects adapters.py's own `import cv2` (same object in
-# sys.modules) — that's the actual mechanism the test relies on. A bare
-# `# noqa: F401` doesn't silence this for plain `pyflakes` (only flake8
-# honors noqa), so this explicit reference is what actually keeps the
-# import from being flagged as dead code without deleting something a real
-# test depends on.
+# cv2/settings aren't used below but test_source_rtsp.py patches them through
+# this module (source_mod.cv2.VideoCapture, source_mod.settings.*); cv2 is the
+# same module object adapters.py imports, which is what the test relies on.
+# Plain pyflakes ignores noqa, hence the explicit reference.
 _ = (cv2, settings)
 
 
@@ -42,13 +30,24 @@ class CameraSource:
         return self._adapter.open()
 
     def pos_msec(self) -> float | None:
-        """Raw source-relative position, or None if unavailable. Reliability
-        varies by source_type — see pipeline/timing.py, which is the module that
-        actually decides whether to trust this value."""
+        """Raw source-relative position or None. How far to trust it depends
+        on source_type, pipeline/timing.py decides."""
         return self._adapter.pos_msec()
 
     def read(self) -> tuple[bool, "np.ndarray | None"]:
         return self._adapter.read()
+
+    @property
+    def can_grab(self) -> bool:
+        """Live stream adapters split decode (grab) from BGR conversion
+        (retrieve); see adapters._GrabMixin."""
+        return hasattr(self._adapter, "grab")
+
+    def grab(self) -> bool:
+        return self._adapter.grab()  # type: ignore[attr-defined]
+
+    def retrieve(self) -> tuple[bool, "np.ndarray | None"]:
+        return self._adapter.retrieve()  # type: ignore[attr-defined]
 
     def fps(self) -> float:
         return self._adapter.fps()

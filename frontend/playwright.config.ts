@@ -1,33 +1,26 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * Smoke-test configuration.
- *
- * The tests run against an already-running real stack (see the `e2e` job in
- * .github/workflows/frontend.yml, or start both services locally). There is no
- * `webServer` block on purpose: the backend needs its own environment — a
- * throwaway database, no real camera-grid credentials — and burying that in a
- * Playwright spawn command would hide it from anyone reading the workflow.
+ * Smoke tests against an already running stack (the e2e job in
+ * .github/workflows/frontend.yml, or both services started locally). No
+ * webServer block: the backend needs its own env (throwaway DB, no grid
+ * credentials) and hiding that in a spawn command would bury it.
  */
 export default defineConfig({
   testDir: "./e2e",
-  // A real backend loading YOLO/EasyOCR weights is not fast; these are
-  // wall-clock realities, not slow tests.
+  // a real backend loading YOLO/EasyOCR weights is slow
   timeout: 60_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
-  // The specs share one backend and one seeded account, so a retry of a
-  // half-finished test would fight the previous attempt's state.
+  // specs share one backend and account, a retry would fight the half-done
+  // previous attempt
   retries: 0,
   workers: 1,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : [["list"]],
   use: {
-    // `localhost`, not `127.0.0.1`: the backend's CORS_ALLOWED_ORIGINS default
-    // is http://localhost:3000, and a browser treats those two as different
-    // origins. Serving the page from 127.0.0.1 makes every API call fail CORS
-    // — correct enforcement, but it would look like a broken login rather than
-    // a misconfigured harness. Matching the documented origin keeps the test
-    // exercising the same configuration a real deployment uses.
+    // localhost, not 127.0.0.1: CORS_ALLOWED_ORIGINS defaults to
+    // http://localhost:3000 and the browser treats them as different origins.
+    // From 127.0.0.1 every API call fails CORS and it looks like a broken login.
     baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000",
     trace: "retain-on-failure",
     screenshot: "only-on-failure",

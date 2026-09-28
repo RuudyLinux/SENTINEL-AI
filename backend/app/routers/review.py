@@ -1,19 +1,14 @@
-"""Human-in-the-loop ANPR review (10/10 roadmap P7).
+"""ANPR review queue.
 
-A Plate sighting read below `settings.plate_review_confidence_floor` is
-never discarded — it already passed the real quality gate
-(`anpr.passes_anpr_gate`) and is genuine, if uncertain, intelligence — but is
-flagged `pending_review` (see `anpr.review_status_for`) so an operator can
-accept, correct, or reject it rather than the system silently treating an
-uncertain read as settled fact. Every action is audited and stamps
-reviewer/timestamp, which is also exactly the labelled (OCR-said, human-said)
-data pair a future ANPR accuracy improvement effort would need.
+Plate reads below plate_review_confidence_floor already passed the gate, so
+they're kept, but marked pending_review (anpr.review_status_for) for an
+operator to accept, correct or reject. Every action is audited with
+reviewer and time, which also gives (OCR said, human said) pairs for future
+accuracy work.
 
-Deliberately does NOT re-point the Plate's `vehicle_id` on a correction —
-that would ripple into watchlist matching, route reconstruction and risk
-scoring, and needs its own dedicated verification before being wired live.
-This module's scope is recording the correction and unblocking the review
-queue, not silently changing what the rest of the platform already believes.
+A correction doesn't re-point the Plate's vehicle_id. That ripples into
+watchlist matching, routes and risk and needs its own verification first;
+this just records the correction and clears the queue.
 """
 from datetime import datetime
 
@@ -31,12 +26,11 @@ router = APIRouter(prefix="/api/review", tags=["review"])
 
 @router.get("/queue", response_model=list[schemas.PlateOut])
 def review_queue(
-    # Bounded for the same reason as detections.py: an unvalidated int reaches
-    # SQLite as `LIMIT -1`, which means no limit at all.
+    # bounded like detections.py, SQLite treats LIMIT -1 as no limit
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
 ):
-    """Plate sightings genuinely waiting on an operator, newest first."""
+    """Plate sightings waiting on an operator, newest first."""
     return (
         db.query(models.Plate)
         .filter(models.Plate.review_status == "pending_review")
@@ -70,10 +64,9 @@ def correct_read(
     plate_id: str, payload: schemas.PlateReviewCorrectRequest,
     db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
-    """Operator supplies the true plate text. `plate_text_raw` (literal OCR
-    output) and `plate_text_normalized` (grammar-repaired OCR output) are left
-    untouched — `corrected_text` is a THIRD, separate fact: what a human
-    confirmed it actually is. All three stay queryable for audit."""
+    """Operator gives the real plate text. plate_text_raw (OCR output) and
+    plate_text_normalized (after repair) stay as they are; corrected_text is
+    a third fact, what a human confirmed. All three stay queryable."""
     plate = _get_plate(db, plate_id)
     corrected = normalize_plate(payload.corrected_text)
     if not corrected:
@@ -92,10 +85,9 @@ def reject_read(
     plate_id: str, payload: schemas.PlateReviewRejectRequest,
     db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
-    """Operator determines this read is not usable intelligence (e.g. the
-    plate is genuinely unreadable, or the localizer boxed a bumper sticker).
-    The row is kept — never deleted — with review_status=rejected so it is
-    excluded from the active queue but remains in the audit trail."""
+    """Operator marks the read unusable (unreadable plate, or the localizer
+    boxed a bumper sticker). The row stays with review_status=rejected: out of
+    the queue, still in the audit trail."""
     plate = _get_plate(db, plate_id)
     plate.review_status = "rejected"
     plate.reviewed_by = user.id

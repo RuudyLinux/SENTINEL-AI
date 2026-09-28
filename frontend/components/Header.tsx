@@ -53,9 +53,8 @@ export default function Header({ onMenuClick }: { onMenuClick?: () => void }) {
           <Bell size={17} strokeWidth={2} />
           <span className="text-xs">{error ? "—" : overview?.alerts.active ?? 0}</span>
         </button>
-        {/* System status — the one continuously-animated element in the navbar
-            (a subtle breathing pulse on the dot only), per the "don't animate
-            the whole navbar" rule. */}
+        {/* system status: the only animated thing in the navbar, and only the
+            dot pulses */}
         <span
           className={`hidden sm:flex items-center gap-1.5 text-xs ${error ? "text-critical" : "text-slate-400"}`}
           title={error ? `Backend unreachable: ${error}` : "Backend reachable"}

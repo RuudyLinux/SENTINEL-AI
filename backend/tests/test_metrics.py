@@ -1,8 +1,5 @@
-"""V2 Phase 7 — Prometheus metrics endpoint.
-
-The access rules matter as much as the numbers: camera counts, plate-recognition
-rates and alert volumes are operationally sensitive, so this endpoint has no
-unauthenticated mode.
+"""Prometheus metrics endpoint. No unauthenticated mode; the numbers are
+operationally sensitive.
 """
 import pytest
 
@@ -26,8 +23,7 @@ class TestAccessControl:
         assert client.get("/api/metrics", headers=auth).status_code == 200
 
     def test_the_configured_scrape_token_is_accepted(self, client, monkeypatch):
-        """Prometheus cannot perform a JWT login, so a shared scrape secret is
-        the only workable credential for the scraper itself."""
+        """Prometheus can't do a JWT login, so it needs a shared scrape secret."""
         monkeypatch.setattr(settings, "metrics_token", "a-real-scrape-secret")
         resp = client.get("/api/metrics", headers={"Authorization": "Bearer a-real-scrape-secret"})
         assert resp.status_code == 200
@@ -38,8 +34,7 @@ class TestAccessControl:
         assert resp.status_code == 401
 
     def test_an_empty_configured_token_never_authorizes(self, client):
-        """The default is an empty token. It must not become a credential that
-        an empty/absent bearer header satisfies."""
+        """Default token is empty, and an empty/missing bearer must not match it."""
         assert settings.metrics_token == ""
         assert client.get("/api/metrics", headers={"Authorization": "Bearer "}).status_code == 401
 
@@ -76,8 +71,8 @@ class TestExposition:
         assert 'sentinel_detections_total{camera_code="C-METRIC",cls="car"}' in body
 
     def test_gpu_memory_is_absent_rather_than_zero_without_a_gpu(self, client, auth):
-        """Reporting 0 bytes on a CPU-only host would read as an idle GPU. The
-        series is simply not present when there is no CUDA device."""
+        """0 bytes on a CPU-only host would look like an idle GPU; no CUDA,
+        no series."""
         import torch
 
         if torch.cuda.is_available():
@@ -86,6 +81,5 @@ class TestExposition:
         assert "sentinel_gpu_memory_allocated_bytes " not in body
 
     def test_rendering_never_raises_even_with_no_cameras(self):
-        """Metrics must never be able to take down the endpoint reporting on
-        system health — a partial scrape beats a 500."""
+        """A metrics failure mustn't take the endpoint down, partial beats 500."""
         assert b"sentinel_" in metrics.render()

@@ -1,8 +1,6 @@
-"""Real Sentinel Camera Grid integration (final integration task). Network-free:
-mocks httpx like test_catalog_host_missing.py does, and never uses real
-credentials. Proves the code paths (missing-config error, AUTH_ERROR detection,
-normalization, idempotent upsert, %40-encoded URL construction) without depending
-on the live external grid."""
+"""Sentinel Camera Grid integration, no network: httpx is mocked (like
+test_catalog_host_missing.py) and no real credentials are used. Missing
+config, AUTH_ERROR, normalization, idempotent upsert, %40-encoded URLs."""
 import asyncio
 
 import httpx
@@ -71,7 +69,7 @@ def test_upsert_creates_then_updates_without_duplicating(db_session):
     cams = db_session.query(models.Camera).filter(models.Camera.external_catalog_id == "grid:cam04").all()
     assert len(cams) == 1
     assert cams[0].source_type == "sentinel_grid"
-    assert cams[0].source_uri == "cam04"  # bare id — never a credentialed URL
+    assert cams[0].source_uri == "cam04"  # bare id, never a credentialed URL
     assert cams[0].camera_group == "Sentinel Grid"
     assert cams[0].status == "offline"  # registered only, never auto-connected
 
@@ -84,17 +82,9 @@ def test_upsert_creates_then_updates_without_duplicating(db_session):
 
 
 def test_upsert_new_camera_defaults_ai_on(db_session):
-    """Operator directive: every registered camera stays connected and under
-    AI processing as the standard posture, not an opt-in — so a freshly
-    discovered real grid camera now defaults ai_person/ai_vehicle/ai_anpr to
-    True, matching Camera.model's own column default and every other
-    camera-creation path (POST /api/cameras' schema default is also True).
-    This was a deliberate False-on-discovery EXCEPTION before; the exception
-    is gone, not the field independence it existed to protect — the
-    supervisor (pipeline/supervisor.py) still never writes these three
-    flags itself, it only connects whatever a camera's current flags say,
-    and an operator can still turn AI off per camera via
-    PATCH /api/cameras/{id}."""
+    """New grid cameras default ai_person/ai_vehicle/ai_anpr to True, like
+    the column default and POST /api/cameras. The supervisor still never
+    writes them, and PATCH /api/cameras/{id} turns AI off per camera."""
     records = [{"id": "cam-ai-default-test", "name": "AI Default Test", "location": "X"}]
     upsert_grid_cameras(db_session, records)
     cam = db_session.query(models.Camera).filter(
@@ -107,10 +97,8 @@ def test_upsert_new_camera_defaults_ai_on(db_session):
 
 
 def test_a_re_synced_camera_keeps_its_operator_set_ai_flags(db_session):
-    """The default flipping to True must not mean a re-sync silently
-    RE-enables AI on a camera an operator deliberately turned off — the
-    upsert's update branch has never touched ai_person/ai_vehicle/ai_anpr
-    (only the create branch sets them), and that must still hold."""
+    """A re-sync doesn't turn AI back on for a camera an operator switched
+    off; only the create branch sets the flags."""
     records = [{"id": "cam-ai-keep-test", "name": "Keep Test", "location": "X"}]
     upsert_grid_cameras(db_session, records)
     cam = db_session.query(models.Camera).filter(
@@ -135,19 +123,15 @@ def test_upsert_skips_invalid_records_without_crashing(db_session):
 
 
 def _thirty_catalogue_records() -> list[dict]:
-    # Real catalogue shape confirmed live this engagement: {"id": "cam01", "name": "..."} —
-    # no lat/lng/resolution/codec actually supplied by the real grid, so this fixture
-    # matches that honestly rather than inventing fields the real response doesn't have.
-    # "scaletest" prefix (not "cam01".."cam30") — this module's other tests already
-    # register "cam04"/"cam05" against the same on-disk shared test DB; a real id
-    # collision here would silently turn an expected `created` into an `updated`.
+    # Real catalogue shape: {"id": "cam01", "name": "..."}, no lat/lng/codec,
+    # so the fixture doesn't invent them. "scaletest" ids because other tests
+    # here register cam04/cam05 in the same DB, and a clash would turn
+    # `created` into `updated`.
     return [{"id": f"scaletest{i:02d}", "name": f"{i:02d} Test Location"} for i in range(1, 31)]
 
 
 def _scaletest_cameras(db_session):
-    """Scoped to this module's own "scaletest%" marker prefix — the shared on-disk
-    test DB also carries cam04/cam05 rows from earlier tests in this same file, so
-    an unscoped `source_type=="sentinel_grid"` query would count those too."""
+    """Only this module's scaletest% cameras; the shared DB also has cam04/05."""
     return (
         db_session.query(models.Camera)
         .filter(models.Camera.external_catalog_id.like("grid:scaletest%"))
@@ -156,15 +140,12 @@ def _scaletest_cameras(db_session):
 
 
 def _clear_scaletest_cameras(db_session) -> None:
-    """Remove this module's scaletest cameras AND their dependents.
+    """Delete the scaletest cameras and their dependents.
 
-    Three tests in this module sync the same 30 catalogue records, so
-    whichever runs FIRST creates them — which made the idempotency test's
-    `created == 30` assertion depend on test ordering. Invisible under
-    alphabetical collection, caught immediately by the --random-order gate.
-    Dependents must go first: test_upsert_marks_removed_camera_stale...
-    deliberately attaches a real Detection to scaletest15, and foreign keys
-    are now enforced (app/db.py), so deleting the cameras alone fails.
+    Three tests sync the same 30 records, so whichever ran first created
+    them and `created == 30` depended on order (--random-order caught it).
+    Dependents first: one test attaches a Detection to scaletest15, and with
+    FKs on the camera alone can't be deleted.
     """
     camera_ids = [
         c.id for c in db_session.query(models.Camera).filter(
@@ -183,10 +164,10 @@ def _clear_scaletest_cameras(db_session) -> None:
 
 
 def test_upsert_handles_full_30_camera_catalogue_idempotently(db_session):
-    """The actual scale this task cares about: 30 catalogue cameras -> 30 database
-    cameras, and re-running discovery never duplicates or drops any of them."""
+    """30 catalogue cameras -> 30 rows, and rediscovery never duplicates or
+    drops any."""
     records = _thirty_catalogue_records()
-    # Precondition established, not assumed — see _clear_scaletest_cameras.
+    # make the precondition true, see _clear_scaletest_cameras
     _clear_scaletest_cameras(db_session)
 
     summary1 = upsert_grid_cameras(db_session, records)
@@ -199,7 +180,7 @@ def test_upsert_handles_full_30_camera_catalogue_idempotently(db_session):
     codes = [c.camera_code for c in grid_cams]
     assert len(codes) == len(set(codes))  # no duplicate camera_code
 
-    # Second discovery of the exact same 30 — idempotent, no duplicates, no new rows.
+    # same 30 again: idempotent, no new rows
     summary2 = upsert_grid_cameras(db_session, records)
     assert summary2["created"] == 0
     assert summary2["updated"] == 30
@@ -208,13 +189,13 @@ def test_upsert_handles_full_30_camera_catalogue_idempotently(db_session):
 
 
 def test_upsert_marks_removed_camera_stale_without_deleting_it(db_session):
-    """A camera the catalogue stops listing must be marked catalog_stale=True, never
-    deleted — its detections/alerts/incidents/evidence history must survive."""
+    """A camera the catalogue drops is marked stale, never deleted; its
+    history stays."""
     full = _thirty_catalogue_records()
     upsert_grid_cameras(db_session, full)
 
-    # Attach a real detection to scaletest15 before it "disappears" from the
-    # catalogue, to prove the history genuinely survives, not just the row.
+    # a real detection on scaletest15 first, so we check the history
+    # survives, not just the row
     removed_camera = db_session.query(models.Camera).filter(models.Camera.external_catalog_id == "grid:scaletest15").first()
     assert removed_camera is not None
     det = models.Detection(camera_id=removed_camera.id, cls="car", confidence=0.9, bbox=[0, 0, 10, 10])
@@ -232,7 +213,7 @@ def test_upsert_marks_removed_camera_stale_without_deleting_it(db_session):
     assert still_there is not None  # history preserved
 
     grid_cams = _scaletest_cameras(db_session)
-    assert len(grid_cams) == 30  # nothing deleted — still 30 rows, one now stale
+    assert len(grid_cams) == 30  # nothing deleted, one now stale
     assert sum(1 for c in grid_cams if c.catalog_stale) == 1  # exactly the removed one
 
     # Camera reappearing in a later sync clears the stale flag again.
@@ -242,9 +223,8 @@ def test_upsert_marks_removed_camera_stale_without_deleting_it(db_session):
 
 
 def test_api_response_never_exposes_rtsp_credentials(client, admin_token):
-    """End-to-end through the real API: sync 30 real-shaped cameras, then confirm
-    GET /api/cameras never returns source_uri, an rtsp:// URL, or anything
-    resembling the configured grid host/credentials."""
+    """Through the real API: sync 30 cameras, then GET /api/cameras never
+    shows source_uri, an rtsp:// URL, or the grid host/credentials."""
     import json
     from app.db import SessionLocal
     from app.pipeline.sentinel_grid import upsert_grid_cameras as _upsert
@@ -270,9 +250,8 @@ def test_api_response_never_exposes_rtsp_credentials(client, admin_token):
 
 
 def test_adapter_builds_correctly_encoded_rtsp_url_and_never_returns_it(monkeypatch):
-    """The '@' in the email MUST be percent-encoded (%40) per the task spec, and
-    the built URL must never be exposed by any adapter method — only handed to
-    the internal RTSPAdapter, which this test intercepts to inspect it."""
+    """The @ in the email is encoded as %40, and the URL is only handed to
+    the internal RTSPAdapter (intercepted here), never exposed."""
     monkeypatch.setattr(config.settings, "sentinel_grid_email", "officer@example.com")
     monkeypatch.setattr(config.settings, "sentinel_grid_password", "s3cret")
     monkeypatch.setattr(config.settings, "sentinel_grid_rtsp_host", "203.0.113.10")
@@ -282,8 +261,9 @@ def test_adapter_builds_correctly_encoded_rtsp_url_and_never_returns_it(monkeypa
     from app.pipeline import adapters as adapters_mod
 
     class _FakeRTSPAdapter:
-        def __init__(self, url):
+        def __init__(self, url, transport=None):
             captured["url"] = url
+            captured["transport"] = transport
 
         def open(self):
             return True
@@ -293,6 +273,7 @@ def test_adapter_builds_correctly_encoded_rtsp_url_and_never_returns_it(monkeypa
     adapter = SentinelGridAdapter("cam04")
     assert adapter.open() is True
     assert captured["url"] == "rtsp://officer%40example.com:s3cret@203.0.113.10:8554/stream/cam04"
+    assert captured["transport"] == config.settings.sentinel_grid_rtsp_transport
     # SentinelGridAdapter's own public surface never returns the built URL anywhere
     assert not hasattr(adapter, "url")
 

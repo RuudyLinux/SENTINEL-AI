@@ -1,4 +1,4 @@
-"""4. ANPR quality gate — P0-C."""
+"""ANPR quality gate."""
 from app.pipeline.anpr import passes_anpr_gate
 
 

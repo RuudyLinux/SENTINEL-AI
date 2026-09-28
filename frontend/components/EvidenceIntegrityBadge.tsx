@@ -1,13 +1,10 @@
 import { ShieldCheck, ShieldAlert, ShieldQuestion, ShieldX, type LucideIcon } from "lucide-react";
 
-/** 10/10 roadmap P8: the exact wording an operator sees must never overstate
- * what was actually checked. Four honest states only — never a generic
- * "OK"/"checked" that would blur VERIFIED (matches its capture-time digest)
- * with NOT YET VERIFIED (no check has run) or UNVERIFIABLE (the file/digest
- * itself is gone) or NO BASELINE (predates capture-time hashing, so a match
- * now proves nothing about what was originally captured). Backed by
- * app/routers/evidence.py::verify_evidence — see its docstring for the same
- * four outcomes on the API side. */
+/** Wording must never claim more than was checked. Four states, no generic
+ * "OK": VERIFIED (matches the capture digest), NOT YET VERIFIED (not
+ * checked), UNVERIFIABLE (file or digest gone), NO BASELINE (predates
+ * capture-time hashing, so a match proves nothing). Same four as
+ * app/routers/evidence.py verify_evidence. */
 const STATUS_MAP: Record<string, { label: string; cls: string; Icon: LucideIcon }> = {
   verified: { label: "VERIFIED", cls: "bg-green-500/15 text-green-400 border border-green-500/30", Icon: ShieldCheck },
   tampered: { label: "TAMPERED", cls: "bg-red-500/15 text-red-400 border border-red-500/30", Icon: ShieldX },

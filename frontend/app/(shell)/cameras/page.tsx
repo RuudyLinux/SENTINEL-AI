@@ -10,10 +10,8 @@ import ErrorState from "@/components/ErrorState";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "@/components/ConnectionBadge";
 import KpiCard from "@/components/KpiCard";
 
-// Mirrors the backend's require_roles("Administrator", "Control Room Operator")
-// on catalog sync / create / start / stop / restart (see routers/cameras.py) —
-// the backend is the actual enforcement; this just keeps an Auditor/
-// Investigator/Supervisor from being shown buttons that would 403.
+// mirrors require_roles("Administrator", "Control Room Operator") on the
+// camera routes; the backend enforces it, this just hides buttons that would 403
 const CAN_MANAGE_CAMERAS = ["Administrator", "Control Room Operator"];
 
 export default function CamerasPage() {
@@ -82,8 +80,8 @@ export default function CamerasPage() {
     }
   }
 
-  // Retiring keeps the camera's history (alerts, incidents, evidence) and takes
-  // it out of every active list; the backend enforces Administrator.
+  // retiring keeps the history and hides the camera from active lists;
+  // backend enforces Administrator
   async function retire(c: any, e: React.MouseEvent) {
     e.stopPropagation();
     if (!window.confirm(`Retire ${c.camera_code}? It stops, disappears from active camera lists and can no longer be connected. Its history is kept.`)) return;
@@ -143,12 +141,9 @@ export default function CamerasPage() {
     }
   }
 
-  // Catalogue sync only REGISTERS cameras — CONNECTING (establishing the
-  // backend stream) is a separate, explicit step the operator takes here.
-  // /start and /stop already mean Connect/Disconnect (routers/cameras.py
-  // routes sentinel_grid cameras through the supervisor's connect/disconnect,
-  // everything else through start_worker/stop_worker) — same endpoints,
-  // clearer labels below.
+  // Sync only registers cameras; connecting is a separate step here. /start
+  // and /stop already mean connect/disconnect (grid cameras go through the
+  // supervisor, the rest through start_worker/stop_worker), just clearer labels.
   async function bulkAction(action: "start" | "stop") {
     setBulkBusy(true);
     setActionError(null);
@@ -165,13 +160,10 @@ export default function CamerasPage() {
     }
   }
 
-  // Start AI / Stop AI is deliberately NOT /start or /stop — those connect
-  // or disconnect the stream. AI on/off is the ai_person/ai_vehicle flags
-  // (PATCH, already existed for the Edit form) — toggling them never stops
-  // the worker, so a camera stays CONNECTED with AI OFF when AI is stopped.
-  // ai_anpr is left untouched: it can never fire without person/vehicle
-  // detections feeding it, so it's inert either way and this shouldn't
-  // silently override an operator's separate ANPR preference.
+  // Start/Stop AI isn't /start or /stop, those connect the stream. AI is the
+  // ai_person/ai_vehicle flags via PATCH, so the camera stays CONNECTED with
+  // AI off. ai_anpr is left alone: it can't fire without person/vehicle
+  // detections anyway, and shouldn't override a separate ANPR preference.
   async function bulkAiAction(on: boolean) {
     setBulkBusy(true);
     setActionError(null);
@@ -233,18 +225,15 @@ export default function CamerasPage() {
     { key: "location", label: "Location" },
     { key: "camera_group", label: "Group", render: (c) => c.camera_group ? <span className="text-xs text-slate-400">{c.camera_group}</span> : <span className="text-xs text-slate-600">—</span> },
     {
-      // Connection lifecycle (24/7 auto-connect supervisor) — REGISTERED/
-      // CONNECTING/CONNECTED/PROCESSING/DEGRADED/RECONNECTING/DISCONNECTED/
-      // AUTH_ERROR/ERROR. Replaces the old plain online/offline StatusDot:
-      // that DB column can't distinguish "never connected" from "was
-      // connected, then dropped" the way grid_state can.
+      // Connection lifecycle from grid_state (REGISTERED ... AUTH_ERROR/ERROR).
+      // The old online/offline dot couldn't tell "never connected" from
+      // "connected, then dropped".
       key: "connection", label: "Connection",
       render: (c) => <ConnectionBadge camera={c} />,
     },
     {
-      // AI processing is independent of connection state — shown as its own
-      // fact so "CONNECTED, AI OFF" (the 24/7 auto-connect default) reads
-      // clearly rather than looking like AI is silently running.
+      // AI is its own column so "CONNECTED, AI OFF" doesn't look like AI is
+      // quietly running
       key: "ai", label: "AI",
       render: (c) => <AiBadge camera={c} />,
     },
@@ -305,23 +294,19 @@ export default function CamerasPage() {
   const visibleCameras = groupFilter ? allCameras.filter((c: any) => c.camera_group === groupFilter) : allCameras;
   const editingCamera = editingId ? allCameras.find((c: any) => c.id === editingId) : null;
 
-  // Auto-connect visibility (24/7 supervisor) — real cameras only, i.e.
-  // discovered from the Sentinel Grid catalogue (external_catalog_id set),
-  // not a manually-added test row of the same source_type. All numbers
-  // derived from this poll's actual API data, never hardcoded. "Connected"
-  // includes PROCESSING (a live stream with AI also on is still connected);
-  // "Processing" is called out separately since it's a strict subset.
-  // "Disconnected" is the residual so the five numbers stay internally
-  // consistent: Registered = Connected + Reconnecting + Disconnected.
+  // Auto-connect summary, grid cameras only (external_catalog_id set), not a
+  // hand-added row of the same source_type. All from this poll's data.
+  // Connected includes PROCESSING; Processing is shown separately as a
+  // subset. Disconnected is the remainder so the numbers add up:
+  // Registered = Connected + Reconnecting + Disconnected.
   const gridCameras = allCameras.filter((c: any) => c.source_type === "sentinel_grid" && c.external_catalog_id);
   const gridRegistered = gridCameras.length;
   const gridConnected = gridCameras.filter((c: any) => ["CONNECTED", "PROCESSING"].includes(deriveConnectionState(c))).length;
   const gridProcessing = gridCameras.filter((c: any) => deriveConnectionState(c) === "PROCESSING").length;
   const gridReconnecting = gridCameras.filter((c: any) => deriveConnectionState(c) === "RECONNECTING").length;
   const gridDisconnected = Math.max(0, gridRegistered - gridConnected - gridReconnecting);
-  // Real evidence the auto-connect machinery has actually run in this backend
-  // process, not an assumed/hardcoded flag — a camera only carries grid_state
-  // once its worker has started.
+  // only true once a worker has actually started (a camera only gets
+  // grid_state then), not a hardcoded flag
   const supervisorActive = gridCameras.some((c: any) => !!c.grid_state);
   const lastCatalogSync = gridCameras.reduce((latest: string | null, c: any) => {
     if (!c.catalog_synced_at) return latest;

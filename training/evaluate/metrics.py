@@ -1,17 +1,12 @@
-"""Recognition metrics, calibration, and paired model comparison.
+"""Recognition metrics, calibration and paired model comparison.
 
-Definitions are pinned deliberately, because the whole Phase 3 comparison rests
-on before/after numbers being computed the same way. `tests/test_metrics.py`
-asserts this module's edit distance against the backend benchmark's
-implementation (`backend/tools/anpr_bench.py::levenshtein`), so the two cannot
-drift apart unnoticed — two definitions of CER is how a before/after comparison
-quietly stops being a comparison.
+Definitions are pinned since the Phase 3 comparison depends on before and
+after being computed the same way. tests/test_metrics.py checks the edit
+distance against backend/tools/anpr_bench.py::levenshtein; two definitions of
+CER and before/after stops meaning anything.
 
-Nothing here fabricates a result. Calibration returns empty structures until
-real predictions with real confidences exist; McNemar refuses to run unless both
-systems were scored on exactly the same examples.
-
-Stdlib only.
+Calibration returns empty until there are real predictions; McNemar refuses
+unless both systems were scored on the same examples. Stdlib only.
 """
 from __future__ import annotations
 
@@ -20,11 +15,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 
-# ---- edit distance ------------------------------------------------------
+# edit distance
 
 def levenshtein(a: str, b: str) -> int:
-    """Edit distance. Same algorithm and same result as the backend benchmark's
-    implementation, which is what produced the 0.3983 CER baseline."""
+    """Edit distance, same as the backend benchmark (which gave the 0.3983
+    CER baseline)."""
     if not a:
         return len(b)
     if not b:
@@ -39,12 +34,11 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def edit_operations(truth: str, prediction: str) -> list[tuple[str, str, str]]:
-    """Backtrace the alignment into `(op, truth_char, predicted_char)`.
+    """Backtrace the alignment into (op, truth_char, predicted_char).
 
-    Phase 2 showed the MIX matters, not just the total: 25 substitutions but
-    also 20 deletions and 12 insertions, which together say the recogniser is
-    failing at segmentation rather than at glyph identity. A single CER number
-    hides that distinction entirely, so the operations are always available.
+    The mix matters: Phase 2 had 25 substitutions but also 20 deletions and
+    12 insertions, i.e. segmentation trouble, not glyph trouble. One CER
+    number hides that.
     """
     rows, cols = len(truth) + 1, len(prediction) + 1
     dist = [[0] * cols for _ in range(rows)]
@@ -74,7 +68,7 @@ def edit_operations(truth: str, prediction: str) -> list[tuple[str, str, str]]:
     return list(reversed(operations))
 
 
-# ---- aggregate recognition metrics --------------------------------------
+# aggregate recognition metrics
 
 @dataclass
 class RecognitionMetrics:
@@ -96,19 +90,15 @@ class RecognitionMetrics:
 
     @property
     def cer(self) -> float:
-        """Character error rate: total edits / ground-truth characters.
-
-        Denominator is the TRUTH length, so an over-long prediction can push CER
-        above 1.0. That is intended — a read that invents ten characters is
-        worse than one that reads nothing, and a metric capped at 1.0 would hide
-        it.
+        """CER: total edits / truth characters. Can go over 1.0 for long
+        predictions, on purpose; inventing ten characters is worse than
+        reading nothing.
         """
         return self.total_edits / self.truth_characters if self.truth_characters else 0.0
 
     @property
     def character_accuracy(self) -> float:
-        """1 - CER, floored at 0. Stated explicitly so it is never confused with
-        exact-match accuracy, which is a per-PLATE measure."""
+        """1 - CER, floored at 0. Not exact match, which is per plate."""
         return max(0.0, 1.0 - self.cer)
 
     def as_dict(self) -> dict:
@@ -126,8 +116,7 @@ class RecognitionMetrics:
 
 
 def normalize(text: str) -> str:
-    """Case-normalized comparison form. Nothing else — no character repair, no
-    format coercion. The evaluator must measure what the model produced."""
+    """Case-normalized, nothing else; measure what the model actually output."""
     return (text or "").strip().upper()
 
 
@@ -151,13 +140,11 @@ def evaluate(pairs: list[tuple[str, str]]) -> RecognitionMetrics:
     return metrics
 
 
-# ---- confidence intervals ----------------------------------------------
+# confidence intervals
 
 def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
-    """95% Wilson score interval for a proportion.
-
-    Used rather than the normal approximation because it behaves correctly at
-    small n and near 0/1 — precisely the regime a 500-plate test set sits in.
+    """95% Wilson interval. Behaves at small n and near 0/1, which is where
+    a 500-plate test set sits; the normal approximation doesn't.
     """
     if total <= 0:
         return (0.0, 0.0)
@@ -168,7 +155,7 @@ def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float,
     return (max(0.0, centre - spread), min(1.0, centre + spread))
 
 
-# ---- paired model comparison -------------------------------------------
+# paired model comparison
 
 @dataclass
 class PairedComparison:
@@ -196,11 +183,7 @@ class PairedComparison:
 
 
 def _chi2_sf_1df(x: float) -> float:
-    """Survival function of chi-squared with 1 degree of freedom.
-
-    For 1 df this is exactly `erfc(sqrt(x/2))`, so no scipy dependency is
-    needed — which keeps this tooling stdlib-only and runnable anywhere.
-    """
+    """Chi-squared survival function, 1 df: erfc(sqrt(x/2)), so no scipy."""
     return math.erfc(math.sqrt(x / 2.0)) if x > 0 else 1.0
 
 
@@ -209,16 +192,12 @@ def mcnemar(
     predictions_a: dict[str, str],
     predictions_b: dict[str, str],
 ) -> PairedComparison:
-    """Paired significance test between two systems on the SAME examples.
+    """Paired test between two systems on the SAME examples (keys are ids).
 
-    Keys are example ids. Raises if the two systems were not scored on an
-    identical example set — comparing a model evaluated on 480 samples against
-    one evaluated on 500 is not a paired test, and silently intersecting them
-    would produce a number that looks valid and is not.
-
-    Uses the exact binomial test on the discordant pairs when they are few
-    (< 25), where the chi-squared approximation is unreliable; otherwise the
-    continuity-corrected chi-squared statistic.
+    Raises if the example sets differ; 480 vs 500 isn't paired, and quietly
+    intersecting them gives a valid-looking wrong number. Exact binomial on
+    discordant pairs when there are few (< 25), otherwise continuity-corrected
+    chi-squared.
     """
     keys_a, keys_b = set(predictions_a), set(predictions_b)
     if keys_a != keys_b:
@@ -263,7 +242,7 @@ def mcnemar(
     )
 
 
-# ---- confidence calibration --------------------------------------------
+# confidence calibration
 
 @dataclass
 class CalibrationBin:
@@ -300,18 +279,15 @@ class CalibrationReport:
 def calibration(
     outcomes: list[tuple[float, bool]], bin_count: int = 10,
 ) -> CalibrationReport:
-    """Reliability bins and expected calibration error.
+    """Reliability bins and expected calibration error. outcomes is
+    (confidence, was_correct) per prediction.
 
-    `outcomes` is `(confidence, was_correct)` per prediction.
+    Matters here because production uses confidence: plate_min_confidence
+    gates persistence and plate_review_confidence_floor decides if a human
+    sees a read. A model saying 0.9 on reads that are right 60% of the time
+    defeats both, whatever its accuracy.
 
-    This matters more here than in a typical model report, because the
-    production pipeline CONSUMES confidence: `plate_min_confidence` gates
-    persistence and `plate_review_confidence_floor` decides whether a human ever
-    sees a read. A recogniser reporting 0.9 on reads that are right 60% of the
-    time would silently defeat both gates, however good its headline accuracy.
-
-    Returns an empty report for empty input — it never invents bins, and no
-    calibration number exists until real predictions do.
+    Empty input gives an empty report, no invented bins.
     """
     report = CalibrationReport(samples=len(outcomes))
     if not outcomes:

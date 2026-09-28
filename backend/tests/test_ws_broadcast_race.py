@@ -1,16 +1,10 @@
-"""BUG-2 (found in the 10/10 debugging pass, 2026-09-11):
-`ConnectionManager.broadcast` iterated `self.active` directly while
-`await`ing each client's `send_text` — a real yield point. If a DIFFERENT
-task calls `manager.disconnect(ws)` during that await (exactly what
-`main.py::websocket_endpoint`'s own per-client receive-loop does the instant
-it notices its socket disconnected), the list shifts under the iterator and
-the NEXT still-connected, still-live client in the list can be silently
-skipped for that one broadcast — including a CRITICAL `alert.created` event.
+"""broadcast iterated self.active while awaiting each send_text. If another
+task called manager.disconnect(ws) during that await (the per-client receive
+loop does as soon as its socket drops), the list shifted and the next live
+client could be skipped for that broadcast, CRITICAL alerts included.
 
-Reproduced deterministically (no real concurrency needed — a plain
-synchronous side effect inside one fake socket's `send_text` reproduces the
-exact list-mutation-during-iteration hazard, since Python's iterator
-protocol does not care WHY the list changed mid-loop).
+Reproduced without real concurrency: a fake socket whose send_text mutates
+the list is the same hazard.
 """
 import asyncio
 import json
@@ -32,10 +26,8 @@ def test_a_client_disconnecting_during_broadcast_does_not_skip_the_next_live_cli
     manager.active.extend([a, b, c])
 
     async def a_send_text(_message: str) -> None:
-        # Simulate the real interleaving: while broadcast() is awaiting A's
-        # send, A's OWN receive-loop task (main.py::websocket_endpoint,
-        # a separate asyncio task per connected client) notices A's socket
-        # disconnected and calls manager.disconnect(a) concurrently.
+        # while broadcast awaits A's send, A's own receive task notices the
+        # disconnect and calls manager.disconnect(a)
         manager.disconnect(a)
 
     a.send_text = a_send_text  # type: ignore[method-assign]
@@ -54,11 +46,9 @@ def test_a_client_disconnecting_during_broadcast_does_not_skip_the_next_live_cli
 
 
 def test_broadcast_still_reaches_every_client_under_repeated_churn():
-    """Stronger version: several clients disconnect themselves mid-broadcast,
-    at different positions in the list, across several broadcasts — the
-    invariant (every client connected AT THE START of a given broadcast call
-    either receives it or was the one disconnecting) must hold regardless of
-    WHICH position churns."""
+    """Several clients disconnect at different positions across several
+    broadcasts; everyone connected at the start of a broadcast either gets
+    it or is the one leaving."""
     manager = ConnectionManager()
     sockets = [_FakeSocket() for _ in range(6)]
     manager.active.extend(sockets)

@@ -1,31 +1,14 @@
-"""Taking a plate OFF the watchlist must actually take it off.
+"""Taking a plate off the watchlist actually takes it off.
 
-Four defects, found by exercising `app/routers/watchlists.py` (39% covered,
-no test referencing it):
-
-1. **Deactivation did not stop the alerts.** `DELETE /api/watchlists/{id}` set
-   `entry.active = False`, but `rules_engine.evaluate` gated the watchlist rule
-   on `vehicle.watchlist_flag` alone and nothing ever cleared that flag. The
-   vehicle kept producing CRITICAL watchlist alerts forever — each one stating
-   in its own reason string that the plate "matches an active watchlist entry"
-   while no such entry existed, because the lookup's `entry.priority if entry
-   else "HIGH"` fallback quietly covered the absence.
-
-2. **`valid_until` was never enforced.** The column is on the model, accepted
-   by the create schema and stored by the API, and no query in the codebase
-   ever compared it to the clock. An entry given an explicit end date matched
-   forever.
-
-3. **The stale flag leaked past alerting.** `worker.py` captures snapshot
-   evidence of any vehicle whose flag is set, and the vehicles/search/tracking
-   pages render "⚠ WATCHLIST" (CRITICAL priority on the tracking page) from it
-   — so a cleared plate kept being photographed and kept being shown as a hit.
-
-4. **Deactivated and expired entries were still listed as live.** `GET
-   /api/watchlists` filtered on neither `active` nor `valid_until`, and the
-   watchlist page renders no active/inactive indicator, so a deactivated entry
-   stayed on screen identical to a live one: same priority, same Deactivate
-   button. Deactivation looked like it had failed.
+1. Deactivating didn't stop alerts. DELETE set active = False, but
+   rules_engine went on watchlist_flag alone and nothing cleared it, so
+   CRITICAL alerts kept coming, each saying the plate "matches an active
+   watchlist entry" (an `else "HIGH"` fallback hid the missing entry).
+2. valid_until was stored but never compared to the clock.
+3. The stale flag kept snapshots being captured (worker.py) and "⚠ WATCHLIST"
+   showing on the vehicles/search/tracking pages.
+4. GET /api/watchlists listed deactivated and expired entries like live ones,
+   so Deactivate looked broken.
 """
 import asyncio
 import random
@@ -97,8 +80,7 @@ def _evaluate(db, camera, vehicle):
 
 class TestDeactivationTakesEffect:
     def test_an_in_force_entry_still_fires(self, db_session):
-        """Precondition for every test below: this is the behaviour that must
-        be PRESERVED, not the bug."""
+        """The behaviour to keep, not the bug."""
         plate = _plate()
         _entry(db_session, plate)
         camera = _camera(db_session)
@@ -121,8 +103,8 @@ class TestDeactivationTakesEffect:
         )
 
     def test_deactivating_the_entry_clears_the_cached_vehicle_flag(self, client, db_session, auth):
-        """The flag drives snapshot evidence capture (worker.py) and the
-        "⚠ WATCHLIST" badge on four pages, so stopping the alert is not enough."""
+        """The flag drives snapshot capture and the badge on four pages, so
+        stopping the alert isn't enough."""
         plate = _plate()
         entry = _entry(db_session, plate)
         vehicle = _watchlisted_vehicle(db_session, plate)
@@ -134,8 +116,7 @@ class TestDeactivationTakesEffect:
         assert db_session.query(models.Vehicle).filter(models.Vehicle.id == vehicle.id).one().watchlist_flag is False
 
     def test_a_second_in_force_entry_keeps_the_vehicle_flagged(self, client, db_session, auth):
-        """The flag is RECOMPUTED, not blindly cleared: two agencies can list
-        the same plate, and one withdrawing must not clear the other's."""
+        """Recomputed, not cleared: two agencies can list the same plate."""
         plate = _plate()
         first = _entry(db_session, plate, reason="agency A")
         _entry(db_session, plate, reason="agency B")
@@ -168,11 +149,9 @@ class TestExpiry:
         assert len(_evaluate(db_session, _camera(db_session), vehicle)) == 1
 
     def test_creating_an_in_force_entry_flags_an_existing_vehicle(self, client, db_session, auth):
-        """Guards the OTHER direction of the recompute. Replacing the create
-        path's `watchlist_flag = True` with a recompute broke this at first:
-        SessionLocal sets autoflush=False, so the recompute ran before the new
-        entry reached the database, found nothing in force, and left an
-        already-seen vehicle unflagged — silently failing to watchlist it."""
+        """The other direction. The create path's recompute first ran before
+        the new entry was flushed (autoflush=False), found nothing and left
+        an already-seen vehicle unflagged."""
         plate = _plate()
         vehicle = models.Vehicle(plate_text=plate, plate_confidence=0.9, watchlist_flag=False)
         db_session.add(vehicle)
@@ -206,8 +185,8 @@ class TestExpiry:
         assert db_session.query(models.Vehicle).filter(models.Vehicle.id == vehicle.id).one().watchlist_flag is False
 
     def test_a_later_sighting_refreshes_a_stale_flag(self, db_session):
-        """Nothing runs at the instant an entry expires, so the cached flag is
-        reconciled at the next sighting — the moment it would next be used."""
+        """Nothing runs at expiry time, so the flag is fixed at the next
+        sighting, when it's next used."""
         plate = _plate()
         _entry(db_session, plate, valid_until=datetime.utcnow() - timedelta(minutes=5))
         vehicle = _watchlisted_vehicle(db_session, plate)
@@ -250,8 +229,7 @@ class TestListing:
         assert entry.id not in [e["id"] for e in listed]
 
     def test_history_is_still_retrievable(self, client, db_session, auth):
-        """Rows are hidden from the in-force view, never deleted — an audit
-        trail of who was watchlisted and when must survive deactivation."""
+        """Hidden from the in-force view, never deleted; the history stays."""
         plate = _plate()
         entry = _entry(db_session, plate)
         db_session.commit()
@@ -272,8 +250,7 @@ class TestListing:
 
 class TestInvestigatorSummary:
     def test_the_summary_drops_the_match_once_deactivated(self, client, db_session, auth):
-        """The incident summary tells an investigator "watchlist match
-        (CRITICAL): stolen vehicle". That claim must be true at read time."""
+        """The summary's "watchlist match (CRITICAL)" has to be true when read."""
         plate = _plate()
         entry = _entry(db_session, plate)
         vehicle = _watchlisted_vehicle(db_session, plate)
@@ -291,8 +268,8 @@ class TestInvestigatorSummary:
 
 
 class TestInForcePredicate:
-    """Direct unit cover for the shared predicate, so a future caller that
-    reintroduces a bare `active == True` filter has something to compare to."""
+    """The shared predicate, so a bare `active == True` somewhere new has
+    something to be compared with."""
 
     def test_no_expiry_means_never_expires(self, db_session):
         plate = _plate()

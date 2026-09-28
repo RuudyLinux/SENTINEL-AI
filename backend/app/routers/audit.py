@@ -29,7 +29,6 @@ def list_audit(
 def verify_audit_chain(
     db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Auditor")),
 ):
-    """Walks the full tamper-evident hash chain (10/10 roadmap P9) and reports
-    whether it is intact, or exactly where it first breaks. See app/audit.py
-    for what the chain actually covers and cannot cover (pre-chain rows)."""
+    """Walk the hash chain and report whether it's intact or where it first
+    breaks. app/audit.py covers what it can't check (pre-chain rows)."""
     return verify_chain(db)

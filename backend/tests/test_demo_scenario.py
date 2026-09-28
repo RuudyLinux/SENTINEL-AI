@@ -1,4 +1,4 @@
-"""Phase 6 — demo reset + deterministic scenario trigger."""
+"""Demo reset and the deterministic scenario trigger."""
 import asyncio
 import time
 from pathlib import Path
@@ -7,20 +7,17 @@ import pytest
 
 from app import models
 from app.config import settings
-from app.seed import reset_demo_data, DEMO_CAMERAS, DEMO_PLATE
+from app.seed import reset_demo_data, DEMO_PLATE
 from app.pipeline import demo_scenario, worker
 from app.pipeline.demo_scenario import trigger_scenario, DemoScenarioError
 
 
 @pytest.fixture(autouse=True)
 def _fast_frame_wait(monkeypatch):
-    """Real-evidence-workflow fix (final-demo-readiness phase): trigger_scenario
-    now waits (bounded, real polling — see demo_scenario._wait_for_live_frame)
-    for the camera's worker to have decoded at least one frame before giving
-    up on a snapshot. None of these tests start a real worker, so without
-    this the whole suite would burn the full real timeout (3s * 2 cameras)
-    on every test in this file for no reason. Shortened here, not removed —
-    the wait logic itself is still exercised, just on a fast clock."""
+    """trigger_scenario polls for a decoded frame before giving up on a
+    snapshot (demo_scenario._wait_for_live_frame). No test here starts a real
+    worker, so the full 3s x 2 cameras would be wasted on every test.
+    Shortened, not removed; the wait logic still runs."""
     monkeypatch.setattr(demo_scenario, "DEMO_FRAME_WAIT_TIMEOUT_S", 0.05)
 
 
@@ -63,14 +60,10 @@ def test_trigger_scenario_refuses_outside_demo_mode(db_session, admin_user, monk
 
 def test_trigger_scenario_requires_demo_cameras_registered(db_session, admin_user, monkeypatch):
     monkeypatch.setattr(settings, "demo_mode", True)
-    # Any earlier test — in this module OR, under --random-order, anywhere in
-    # the suite — may have registered the demo cameras in this shared test DB,
-    # so this test's precondition ("not registered yet") has to be established,
-    # not assumed. Deleting the Camera rows alone is no longer enough now that
-    # foreign keys are enforced (app/db.py): a demo camera that already has
-    # detections/plates/incidents cannot be removed without its dependents,
-    # and the delete simply fails. `delete_cameras_by_code` clears both, in
-    # the correct order.
+    # An earlier test (anywhere, under --random-order) may have registered the
+    # demo cameras, so make "not registered" true instead of assuming it.
+    # With FKs on, a camera that has detections/plates can't be deleted on
+    # its own; delete_cameras_by_code clears dependents first.
     from conftest import delete_cameras_by_code
 
     delete_cameras_by_code(db_session, ["C-014", "C-019"])
@@ -103,18 +96,11 @@ def test_trigger_scenario_produces_real_cross_camera_correlation(db_session, adm
 
 
 def test_trigger_scenario_produces_real_evidence_when_camera_has_a_live_frame(db_session, admin_user, monkeypatch, tmp_path):
-    """Final-demo-readiness-phase fix: reset_demo_data alone never started
-    the demo cameras' workers, so worker.LATEST_FRAMES was always empty and
-    _save_demo_snapshot always returned None — the ENTIRE real evidence
-    chain (Detection.snapshot_path -> rules_engine.evaluate's own real
-    `if detection.snapshot_path: Evidence(...)`) never fired, so the demo's
-    flagship CRITICAL alert produced zero Evidence rows. This simulates
-    "the camera is actually running" the same way other tests fake a real
-    decoded frame (a real JPEG-encoded array, not an empty/placeholder
-    value) and proves a REAL Evidence row comes out the other end, correctly
-    linked to the incident/camera/detection — through the unmodified,
-    already-real rules_engine code path, not a new evidence-creation path
-    written for the demo."""
+    """reset_demo_data didn't start the demo workers, so LATEST_FRAMES was
+    empty, _save_demo_snapshot returned None, and the demo's CRITICAL alert
+    produced no Evidence at all. Fakes a running camera with a real encoded
+    JPEG and checks a real Evidence row comes out of the unchanged
+    rules_engine path, linked to incident, camera and detection."""
     import cv2
     import numpy as np
 
@@ -141,7 +127,7 @@ def test_trigger_scenario_produces_real_evidence_when_camera_has_a_live_frame(db
         for ev in evidence_rows:
             assert ev.incident_id is not None  # incident association
             assert ev.camera_id in {c.id for c in cameras.values()}  # camera ID
-            assert ev.file_path  # real file path, not fabricated metadata
+            assert ev.file_path  # a real path
             incident = db_session.query(models.Incident).filter(models.Incident.id == ev.incident_id).first()
             assert incident is not None and incident.priority == "CRITICAL"
     finally:
@@ -150,15 +136,9 @@ def test_trigger_scenario_produces_real_evidence_when_camera_has_a_live_frame(db
 
 
 def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_token, tmp_path, monkeypatch):
-    """HTTP-level regression test for the root cause: reset_demo_data()
-    alone never started a worker for either demo camera, so
-    worker.LATEST_FRAMES stayed empty forever and the demo's real evidence
-    chain never had a snapshot to work with. Drives the REAL
-    POST /api/system/demo/reset endpoint (real event loop, real
-    asyncio.create_task) against the REAL bundled
-    app/demo_assets/car-detection.mp4 and waits briefly for a real decoded frame —
-    this is the concrete, observable proof that a judge calling reset then
-    trigger-scenario moments later gets real evidence, not an empty demo."""
+    """Through the real POST /api/system/demo/reset (real loop, real
+    create_task) on the bundled car-detection.mp4, waiting for a decoded
+    frame: reset then trigger-scenario gives real evidence."""
     monkeypatch.setattr(settings, "evidence_dir", tmp_path)
     resp = client.post("/api/system/demo/reset", headers={"Authorization": f"Bearer {admin_token}"})
     assert resp.status_code == 200, resp.text
@@ -168,14 +148,9 @@ def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_toke
         cameras = db.query(models.Camera).filter(models.Camera.camera_code.in_(["C-014", "C-019"])).all()
         assert len(cameras) == 2
         try:
-            # CI finding (first real run on GitHub Actions — the Test step
-            # silently never ran there at all until this pass fixed its
-            # `pytest` invocation): 5s was tuned against local dev hardware.
-            # Real cv2.VideoCapture open + first-frame decode on a shared,
-            # throttled CI runner took measurably longer with no error of any
-            # kind logged — genuinely slower I/O, not a hang or a bug. The
-            # assertion is unchanged (a real decoded frame must still appear);
-            # this only gives it more wall-clock room to finish on slower hardware.
+            # 5s was fine locally but a throttled CI runner is slower to open
+            # and decode the first frame (no errors, just slow I/O). Same
+            # assertion, more time.
             for _ in range(150):  # up to ~15s for a real local video file to open + decode one frame
                 if all(c.id in worker.LATEST_FRAMES for c in cameras):
                     break
@@ -184,20 +159,12 @@ def test_demo_reset_endpoint_actually_starts_the_demo_cameras(client, admin_toke
                 "demo cameras never produced a real decoded frame after /demo/reset"
             )
         finally:
-            # Test-isolation hygiene, not a product fix: stop_worker() only
-            # REQUESTS cancellation (see supervisor.py's own audit-finding
-            # comment) — waiting here for it to actually finish before this
-            # test returns keeps this real video-decode background activity
-            # from bleeding into a LATER test's own timing (observed: left
-            # running, it destabilized test_stress_concurrency's tight
-            # real-concurrency assertions when run immediately after).
+            # test hygiene: stop_worker only requests cancellation, wait for it
+            # so this decode doesn't bleed into the next test's timing (it
+            # upset test_stress_concurrency when left running)
             stopped_tasks = [worker.stop_worker(c.id) for c in cameras]
             stopped_tasks = [t for t in stopped_tasks if t is not None]
-            # Widened alongside the wait loop above, same reasoning: real
-            # source.release()/task cleanup on slower CI hardware needs more
-            # wall-clock room, and this comment's own warning (bleed into
-            # test_stress_concurrency) is exactly what a too-short budget here
-            # would risk on a slow runner.
+            # widened with the loop above, slow runners need longer to clean up
             for _ in range(100):
                 if all(t.done() for t in stopped_tasks):
                     break

@@ -1,22 +1,16 @@
-"""Real Sentinel Camera Grid integration (final integration task).
+"""Sentinel Camera Grid integration.
 
-Discovery is NOT a bare public JSON endpoint, despite how it's often described:
-`GET {base_url}/cameras.json` unauthenticated redirects (302) to
-`{base_url}/auth/login` — a session-cookie web login (`POST /auth/login` with
-`email`/`password` form fields, confirmed by fetching the real login page's markup;
-`{base_url}` and that shape are not secret). So discovery here is: log in once to
-get a session cookie, then fetch the catalogue with it, all inside one
-`httpx.AsyncClient` so the cookie is carried automatically.
+Discovery isn't a public JSON endpoint: GET {base_url}/cameras.json without a
+session redirects (302) to /auth/login, a cookie login (POST /auth/login with
+email/password form fields). So we log in once and fetch the catalogue in the
+same httpx.AsyncClient, which carries the cookie.
 
-Credentials (`settings.sentinel_grid_email/password`) come from `.env` only — never
-hardcoded, never logged, never included in any exception message, never returned by
-any API response. A missing/rejected credential fails loudly and specifically
-(`SentinelGridError`, distinguishing "not configured" from "rejected by the grid")
-rather than silently no-op'ing or fabricating camera data.
+Credentials come from .env only; never hardcoded, logged, put in an exception
+message or returned by the API. Missing or rejected credentials raise
+SentinelGridError, keeping "not configured" and "rejected" apart.
 
-Sync here only REGISTERS cameras (see `upsert_grid_cameras`) — it never starts AI
-processing, matching the existing official-catalogue sync's contract
-(`pipeline/catalog.py`).
+Sync only registers cameras (upsert_grid_cameras), like pipeline/catalog.py;
+it never starts AI.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,13 +21,12 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import settings
-from .catalog import _first  # same tolerant multi-key-spelling lookup, reused not duplicated
+from .catalog import _first  # same tolerant key lookup as the catalogue
 
 
 class SentinelGridError(Exception):
-    """Raised for any grid login/fetch/parse failure. The caller (the sync
-    endpoint) turns this into a clear HTTP error, never a stack trace, and never
-    falls back to fabricated camera data."""
+    """Any grid login/fetch/parse failure. The sync endpoint turns it into a
+    clear HTTP error; no fallback camera data."""
 
 
 @dataclass
@@ -91,10 +84,9 @@ async def _login(client: httpx.AsyncClient) -> None:
     except httpx.RequestError as exc:
         raise SentinelGridError(f"Sentinel Camera Grid host unreachable: {exc.__class__.__name__}")
 
-    # A 3xx back to /auth/login (httpx does not auto-follow by default here) or a
-    # 401/403 both mean the credentials were rejected — reported as AUTH_ERROR-class,
-    # distinct from "not configured" above, and never includes the credentials
-    # themselves in the message.
+    # a 3xx back to /auth/login (httpx doesn't follow here) or 401/403 means
+    # rejected credentials, reported separately from "not configured" and
+    # without the credentials in the message
     if resp.status_code in (401, 403):
         raise SentinelGridError(
             "Sentinel Camera Grid login rejected (AUTH_ERROR) — check "
@@ -120,8 +112,8 @@ async def fetch_grid_cameras() -> list[dict]:
             raise SentinelGridError(f"Sentinel Camera Grid host unreachable: {exc.__class__.__name__}")
 
         if resp.status_code in (301, 302, 303, 307, 308) and "/auth/login" in resp.headers.get("location", ""):
-            # Logged in but the session wasn't accepted for this request — report
-            # as an honest auth failure rather than an opaque parse error.
+            # logged in but the session wasn't accepted, say so instead of a
+            # confusing parse error
             raise SentinelGridError("Sentinel Camera Grid rejected the authenticated session (AUTH_ERROR)")
         if resp.status_code != 200:
             raise SentinelGridError(f"Sentinel Camera Grid catalogue returned HTTP {resp.status_code}")
@@ -141,15 +133,12 @@ async def fetch_grid_cameras() -> list[dict]:
 
 
 def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
-    """Idempotent, register-only sync — matched by a `grid:<id>` marker stored in
-    the existing `external_catalog_id` column (distinct prefix so it can never
-    collide with an official-catalogue id in the same column). `source_uri` is
-    set to the BARE grid camera id, never a credentialed URL — the real RTSP URL
-    is built in memory, at connect time, by `pipeline/adapters.SentinelGridAdapter`
-    and is never persisted anywhere. A grid camera absent from this sync's response
-    (removed/deprecated in the catalogue) is marked `catalog_stale=True` — same field
-    and convention as the official-catalogue sync (`pipeline/catalog.py`) — never
-    deleted, so its detections/alerts/incidents/evidence history survives."""
+    """Idempotent register-only sync, matched on a `grid:<id>` marker in
+    external_catalog_id (prefix keeps it apart from official catalogue ids).
+    source_uri is the bare grid id; the credentialed RTSP URL is only built in
+    memory by adapters.SentinelGridAdapter at connect time, never stored.
+    Cameras missing from the response get catalog_stale=True (same as
+    catalog.py) and are never deleted, so their history stays."""
     created, updated, skipped_invalid = 0, 0, 0
     seen_markers: set[str] = set()
     for raw in raw_records:
@@ -172,19 +161,11 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
                 source_uri=norm.grid_id,
                 external_catalog_id=marker,
                 camera_group="Sentinel Grid",
-                status="offline",  # registered only — not connected
-                # AI ON by default on discovery (operator directive: every
-                # camera stays connected and under AI processing as the
-                # standard operating posture, not an opt-in). This matches
-                # Camera.model's own column default (True) and every other
-                # camera-creation path (POST /api/cameras' schema default is
-                # also True) — a freshly discovered grid camera is no longer
-                # a deliberate exception to that. "Registered/connected" and
-                # "AI processing" remain two SEPARATE fields (the supervisor
-                # still never writes ai_person/ai_vehicle/ai_anpr itself,
-                # here or anywhere else — see supervisor.py's own docstring),
-                # only the starting VALUE of one changed; an operator can
-                # still turn AI off per camera via PATCH /api/cameras/{id}.
+                status="offline",  # registered, not connected
+                # AI on by default, every camera stays connected and running
+                # AI. Same as the column default and POST /api/cameras. The
+                # supervisor still never touches ai_* itself; PATCH
+                # /api/cameras/{id} turns AI off per camera.
                 ai_person=True,
                 ai_vehicle=True,
                 ai_anpr=True,

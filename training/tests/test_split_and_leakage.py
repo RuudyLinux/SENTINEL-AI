@@ -1,8 +1,6 @@
-"""Vehicle-disjoint splitting, determinism, and the leakage gate.
-
-`TestCiLeakageGate` is the permanent regression test the M1 brief requires: a
-dataset where one vehicle appears in both train and test must FAIL, and the
-otherwise-identical dataset with distinct vehicles must PASS.
+"""Vehicle-disjoint splits, determinism, and the leakage gate.
+TestCiLeakageGate: one vehicle in train and test must FAIL, the same data
+with distinct vehicles must PASS.
 """
 import pytest
 
@@ -18,8 +16,8 @@ from split import (
 
 class TestVehicleDisjointness:
     def test_every_frame_of_a_vehicle_lands_in_one_split(self):
-        """The core guarantee. Consecutive frames are near-duplicates; splitting
-        on frames scores the model on its own training data."""
+        """Consecutive frames are near-duplicates; splitting on frames scores
+        the model on its training data."""
         records = assign_splits(clean_dataset(vehicles=60, frames_per_vehicle=5))
         by_vehicle = {}
         for record in records:
@@ -38,8 +36,7 @@ class TestVehicleDisjointness:
             assert report.unique_identities[name] > 0
 
     def test_ratios_are_approximately_respected(self):
-        """Approximately, not exactly: identities are hashed independently, which
-        buys growth stability at the cost of exact proportions."""
+        """Approximately: independent hashing trades exact ratios for stability."""
         records = assign_splits(clean_dataset(vehicles=600, frames_per_vehicle=1))
         percentages = plan_split(records).identity_percentages()
         assert percentages["train"] == pytest.approx(70, abs=6)
@@ -47,8 +44,7 @@ class TestVehicleDisjointness:
         assert percentages["test"] == pytest.approx(15, abs=6)
 
     def test_an_empty_identity_is_left_unassigned_not_defaulted_to_train(self):
-        """A record whose vehicle is unknown cannot be guaranteed disjoint from
-        anything, so it must never silently become training data."""
+        """Unknown vehicle can't be guaranteed disjoint, never becomes train data."""
         records = assign_splits([make_record("", plate_text="GJ05AB1234")])
         assert records[0].split == ""
 
@@ -65,9 +61,7 @@ class TestDeterminism:
         assert [r.split for r in first] != [r.split for r in second]
 
     def test_assignment_does_not_depend_on_record_order(self):
-        """Guards the specific failure the hashing design exists to prevent:
-        a split that depends on dict/set iteration order or on the order records
-        happen to appear in the file."""
+        """Split must not depend on dict/set order or file order."""
         forward = clean_dataset(vehicles=50)
         backward = list(reversed(clean_dataset(vehicles=50)))
         assign_splits(forward)
@@ -77,9 +71,8 @@ class TestDeterminism:
         assert forward_map == backward_map
 
     def test_adding_vehicles_does_not_move_existing_ones(self):
-        """Growth stability. With shuffling, appending one record reshuffles
-        everything and the frozen test set silently changes — while still
-        looking like the same test set."""
+        """Growth stability: shuffling would reshuffle everything on one new
+        record and quietly change the frozen test set."""
         small = assign_splits(clean_dataset(vehicles=40))
         before = {r.vehicle_id: r.split for r in small}
         large = assign_splits(clean_dataset(vehicles=120))
@@ -125,8 +118,7 @@ class TestCiLeakageGate:
 
 class TestImageLeakage:
     def test_the_same_image_in_two_splits_is_an_error(self):
-        """Distinct from identity leakage: one frame can hold two vehicles, and
-        if they hash into different splits the same PIXELS are in both."""
+        """One frame, two vehicles, different splits: same pixels in both."""
         records = [
             make_record("vehicle_A", 0, "GJ05AB1234", split="train"),
             make_record("vehicle_B", 0, "MH12CD5678", split="test"),
@@ -138,9 +130,8 @@ class TestImageLeakage:
 
 class TestRepeatedPlateText:
     def test_repeated_text_is_reported_but_does_not_fail_the_build(self):
-        """A repeated registration is usually one vehicle given two ids — but
-        not always. Auto-failing would delete genuine data; ignoring it would
-        hide a real identity bug. So: WARNING, and a human decides."""
+        """A repeated plate is usually one vehicle with two ids, not always.
+        WARNING, a human decides."""
         records = [
             make_record("vehicle_A", 0, "GJ05AB1234", split="train"),
             make_record("vehicle_B", 0, "GJ05AB1234", split="test"),
@@ -154,8 +145,8 @@ class TestRepeatedPlateText:
 
 class TestSplitReport:
     def test_report_counts_distinct_units_separately(self):
-        """unique vehicles, records, plates, images and cameras are different
-        numbers, and conflating them is how dataset size gets inflated."""
+        """Vehicles, records, plates, images and cameras are different counts;
+        mixing them up inflates dataset size."""
         records = assign_splits(clean_dataset(vehicles=40, frames_per_vehicle=3))
         report = plan_split(records)
         assert sum(report.unique_identities.values()) == 40

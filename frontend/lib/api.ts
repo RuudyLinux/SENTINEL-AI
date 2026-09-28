@@ -32,14 +32,11 @@ class ApiError extends Error {
   }
 }
 
-// Self-Heal "API transient errors" recovery (spec recovery type 6): a
-// bounded retry, only for the standard transient set, only for GET — a
-// POST/PATCH/DELETE that reached the server may have already taken effect,
-// so auto-retrying those here could double-fire a non-idempotent action
-// (e.g. creating a duplicate incident); callers that need a retry for those
-// offer it explicitly (a Retry button), never silently. A network-level
-// fetch failure (no response at all) is retried for any method that never
-// left the browser — nothing on the server could have run yet.
+// Bounded retry on transient errors, GET only. A POST/PATCH/DELETE that
+// reached the server may already have happened, so retrying could double-fire
+// it (a duplicate incident); callers offer a Retry button instead. A network
+// failure with no response at all is retried for any method, the request
+// never left the browser.
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const MAX_FETCH_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = [300, 900]; // between attempts 1->2 and 2->3
@@ -57,9 +54,24 @@ async function _fetchWithRetry(url: string, init: RequestInit, method: string): 
     }
     await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)]));
   }
-  // Unreachable in practice (the loop above always returns or throws on the
-  // final attempt) — satisfies the type checker without changing behavior.
+  // unreachable, the loop returns or throws on the last attempt; keeps tsc happy
   throw lastErr ?? new Error("request failed");
+}
+
+// FastAPI's 422 detail is a list of {loc, msg}; stringifying it put raw JSON
+// in front of the operator ("[{"type":"missing","loc":["body","source_uri"]...")
+export function formatDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((e: any) => {
+        const field = (Array.isArray(e?.loc) ? e.loc : []).filter((p: unknown) => p !== "body").join(".");
+        const msg = e?.msg ?? String(e);
+        return field ? `${field.replace(/_/g, " ")}: ${msg}` : msg;
+      })
+      .join("; ");
+  }
+  return JSON.stringify(detail);
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -73,15 +85,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || "GET").toUpperCase();
   const res = await _fetchWithRetry(`${API_BASE}${path}`, { ...options, headers }, method);
   if (res.status === 401) {
-    // The login endpoint itself returning 401 means "wrong credentials" —
-    // a normal, expected business response, not a "your session expired"
-    // signal. Treating it the same as every other 401 (clear token, hard-
-    // redirect to /login) used to fire here too: the redirect discarded
-    // the login page's in-flight React state before its own catch block
-    // could ever call setError(), so a wrong password silently reset the
-    // form with no message at all. Only the session-expiry case gets the
-    // redirect; the login endpoint just throws, same as any other error,
-    // so the caller's own error handling (and message) actually shows.
+    // 401 from the login endpoint means wrong credentials, not an expired
+    // session. It used to clear the token and redirect like any 401, which
+    // threw away the login page's state before its catch could set the error,
+    // so a wrong password just reset the form silently. Only session expiry
+    // redirects; login just throws.
     if (path !== "/api/auth/login") {
       clearToken();
       if (typeof window !== "undefined") window.location.href = "/login";
@@ -97,7 +105,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     let detail = res.statusText;
     try {
       const body = await res.json();
-      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      detail = formatDetail(body.detail);
     } catch {}
     throw new ApiError(res.status, detail);
   }
@@ -117,11 +125,9 @@ export const api = {
   del: <T,>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
-// Evidence file/package and camera stream endpoints are hit via plain
-// <img src>/<a href>/window.open — browsers can't attach an Authorization
-// header to those, so the backend hands out a short-lived resource token
-// via a normal authenticated request first (P0-E). These helpers do that
-// token fetch, then build/open the real URL with `?token=` appended.
+// Evidence files/packages and camera streams load via <img src>, <a href> or
+// window.open, which can't send an Authorization header. So get a short-lived
+// resource token with a normal authenticated request first, then append ?token=.
 export async function fetchResourceToken(tokenPath: string): Promise<string> {
   const { token } = await api.get<{ token: string }>(tokenPath);
   return token;
@@ -133,9 +139,9 @@ export async function buildTokenedUrl(tokenPath: string, resourcePath: string): 
   return `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}`;
 }
 
-/** A resource token's expiry, in epoch ms, or null if it cannot be read.
- *  Read for SCHEDULING only — the backend enforces the same `exp`; a client
- *  that miscomputes this gets a dropped stream, never extra access. */
+/** A resource token's expiry in epoch ms, or null. Only for scheduling; the
+ *  backend enforces exp, so getting this wrong costs a dropped stream, never
+ *  extra access. */
 function tokenExpiresAt(token: string): number | null {
   try {
     const payload = token.split(".")[1];
@@ -147,12 +153,10 @@ function tokenExpiresAt(token: string): number | null {
   }
 }
 
-/** Like buildTokenedUrl, plus the deadline the caller must refresh by.
- *  The backend now ends an MJPEG stream when its token expires (a stream
- *  authorized once used to run indefinitely), so a viewer left open past the
- *  token TTL needs a fresh URL or the picture simply stops updating. The
- *  timestamp makes the URL differ, which is what forces <img> to reconnect
- *  rather than sit on the closed stream. */
+/** buildTokenedUrl plus the time the caller must refresh by. The backend
+ *  ends an MJPEG stream at token expiry, so a viewer left open needs a new
+ *  URL or the picture stops. The timestamp changes the URL, which is what
+ *  makes <img> reconnect. */
 export async function buildTokenedStream(
   tokenPath: string,
   resourcePath: string,
@@ -171,19 +175,14 @@ export async function openTokenedResource(tokenPath: string, resourcePath: strin
 }
 
 
-// --- Backend identity preflight -------------------------------------------
-// The dashboard talks to whatever is listening on NEXT_PUBLIC_API_BASE, and
-// port 8000 is a common default that other local Python/dev servers also
-// claim. When an UNRELATED app held 8000, every call still "worked" at the
-// transport level and the dashboard failed with assorted 404/422 noise from a
-// stranger's API — the one thing it never said is the only thing that was
-// wrong: this is not the SENTINEL backend.
+// Backend identity preflight. The dashboard talks to whatever answers on
+// NEXT_PUBLIC_API_BASE, and 8000 is a popular port. With some other app on
+// it, calls "worked" and failed with random 404/422s, and nothing said the
+// one true thing: this isn't the SENTINEL backend.
 //
-// `/api/health` already returns a service name, so identity is checkable. The
-// check is deliberately separate from `request()`: it takes no token, is not
-// retried (a wrong app answers instantly and consistently — retrying only
-// delays the message), and it never throws, because its whole job is to
-// TURN a failure into a readable string.
+// /api/health returns a service name, so check it. Separate from request():
+// no token, no retry (a wrong app answers the same way instantly), and it
+// never throws, its job is to turn a failure into a readable message.
 export const BACKEND_SERVICE_NAME = "sentinel-vision-backend";
 
 export type ApiPreflight =
@@ -216,9 +215,8 @@ export async function checkBackendIdentity(
   } catch {
     body = null;
   }
-  // A different app that happens to serve JSON (or HTML) on this path is the
-  // exact case being caught, so the service name must MATCH, not merely be
-  // absent-and-assumed-fine.
+  // another app serving JSON (or HTML) here is exactly the case, so the name
+  // has to match, not just be missing
   if (!body || body.service !== BACKEND_SERVICE_NAME) {
     const saw = body && typeof body.service === "string" ? `"${body.service}"` : "no service name";
     return {

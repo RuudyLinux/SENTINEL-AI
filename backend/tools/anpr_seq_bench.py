@@ -4,7 +4,7 @@
     python tools/anpr_seq_bench.py score OUT_DIR/result.json truth.json
 
 `run` replays frames (SEQ_DIR/*.jpg, in order) through the live pipeline's own
-plate path — worker._read_plate_for_track, then plate_tracker voting — for every
+plate path (worker._read_plate_for_track, then plate_tracker voting) for every
 ByteTrack vehicle track, at a fixed AI rate. It writes each track's best plate
 crop for review and what the system would have PUBLISHED for that track
 (corroborated + gate-passing), plus its best single read.

@@ -1,33 +1,22 @@
-"""Deterministic judge-demo scenario trigger (Phase 6, DEMO_MODE only).
+"""Deterministic demo scenario trigger, DEMO_MODE only.
 
-The primary demo scenario needs a vehicle carrying the exact seeded
-watchlist plate (GJ05AB1234) to appear on camera, a few minutes apart, on
-two different cameras. The only real test footage available
-(app/demo_assets/car-detection.mp4) doesn't contain that plate — no real OCR read
-of it can be produced from it — so a literal wait for real ANPR to read
-that exact plate off that footage is not deterministic or repeatable for a
-live judge demo.
+The main demo needs the seeded watchlist plate GJ05AB1234 to show up on two
+cameras a few minutes apart. The only real footage we have
+(app/demo_assets/car-detection.mp4) doesn't contain that plate, so waiting for
+real ANPR to read it isn't something a live demo can rely on.
 
-This module stands in for ONLY the OCR-image-decode step, exactly as
-documented in README.md ("Judge demo runbook") — every other step is the
-real code: `upsert_vehicle_for_plate`
-(real correlation), `rules_engine.evaluate` (real watchlist match, real
-explainable alert, real cooldown, real auto-incident), `get_route` (real
-cross-camera route). The ANPR quality gate itself is never touched, weakened,
-or bypassed — this doesn't call `read_plate`/`passes_anpr_gate` at all; it
-supplies the value a real high-confidence read WOULD have produced, the same
-way an operator manually adding a watchlist entry supplies a value without
-running OCR on it.
+This replaces only the OCR read, as the README runbook says. Everything else
+is the real code: upsert_vehicle_for_plate, rules_engine.evaluate (watchlist
+match, alert, cooldown, auto-incident) and get_route. The ANPR gate isn't
+touched; read_plate/passes_anpr_gate aren't called, we just supply the value
+a confident read would have, like an operator typing in a watchlist entry.
 
-Every row this creates is clearly attributable: `Detection.model_version`
-is set to "demo-fixture" (never "yolov8n-coco-*" like a real detection), and
-every call is audit-logged as `trigger_demo_scenario`.
+Rows are easy to tell apart: Detection.model_version is "demo-fixture" and
+every call is audit-logged as trigger_demo_scenario.
 
-Evidence (snapshot + video clip) is real, not fabricated: if the target
-camera is actually running, its current MJPEG frame (`worker.LATEST_FRAMES`)
-and its live event-clip ring buffer (`clips`) are genuine, currently-decoding
-footage from that camera — used exactly as the live pipeline would, just
-triggered on demand instead of waiting for a real detection.
+Snapshot and clip are real when the camera is running: its current MJPEG
+frame (worker.LATEST_FRAMES) and its live clip ring buffer, triggered on
+demand instead of by a detection.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -46,22 +35,17 @@ from . import worker, clips
 DEMO_MODEL_VERSION = "demo-fixture"
 
 
-DEMO_FRAME_WAIT_TIMEOUT_S = 3.0  # bounded — see _wait_for_live_frame
+DEMO_FRAME_WAIT_TIMEOUT_S = 3.0  # see _wait_for_live_frame
 
 
 async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -> bytes | None:
-    """A camera worker started moments ago (POST /demo/reset now starts the
-    two demo cameras — see routers/system.py) needs a brief real interval to
-    open app/demo_assets/car-detection.mp4 and decode its first frame before
-    worker.LATEST_FRAMES has anything in it. Polls briefly rather than
-    either fabricating a frame or giving up instantly — bounded, so a
-    genuinely non-running camera still returns None (honest "no frame")
-    within a few seconds, never hangs.
+    """A worker started moments ago (POST /demo/reset starts both demo
+    cameras, routers/system.py) needs a moment to open the video and decode a
+    frame before LATEST_FRAMES has anything. Poll briefly; a camera that
+    isn't running still gets None within a few seconds.
 
-    `timeout_s` reads the module-level DEMO_FRAME_WAIT_TIMEOUT_S at CALL
-    time (not as a function-signature default, which would bind at import
-    time) specifically so tests can `monkeypatch.setattr(demo_scenario,
-    "DEMO_FRAME_WAIT_TIMEOUT_S", ...)` and have it actually take effect."""
+    timeout_s reads DEMO_FRAME_WAIT_TIMEOUT_S at call time, not as a default
+    argument (bound at import), so tests can monkeypatch it."""
     if timeout_s is None:
         timeout_s = DEMO_FRAME_WAIT_TIMEOUT_S
     loop = asyncio.get_event_loop()
@@ -76,10 +60,8 @@ async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -
 
 
 async def _save_demo_snapshot(camera_id: str, camera_code: str) -> str | None:
-    """Saves the camera's current real MJPEG frame as evidence, if the
-    camera is actually running. Returns None (no fake snapshot) if not —
-    the caller then simply has no snapshot for this sighting, same as the
-    live pipeline when nothing has decoded yet."""
+    """Save the camera's current MJPEG frame as evidence if it's running.
+    None otherwise, same as the live pipeline before anything decodes."""
     jpeg_bytes = await _wait_for_live_frame(camera_id)
     if not jpeg_bytes:
         return None
@@ -94,10 +76,9 @@ class DemoScenarioError(Exception):
 
 
 async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1234") -> dict:
-    """Fires one deterministic sighting of `plate` on each of the two demo
-    cameras (C-014 then C-019, 4 minutes apart), through the real
-    correlation/alerting code path. DEMO_MODE only — caller enforces this;
-    this function refuses too as a second guard."""
+    """One sighting of `plate` on each demo camera (C-014, then C-019 four
+    minutes later) through the real correlation/alerting path. DEMO_MODE
+    only; the caller checks and so does this."""
     if not settings.demo_mode:
         raise DemoScenarioError("trigger_scenario called outside DEMO_MODE — refusing")
 
@@ -110,8 +91,7 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
     if retired:
         raise DemoScenarioError(f"Demo cameras are retired: {sorted(retired)} — reinstate them to run the scenario")
 
-    # A high-confidence read is required to clear the real ANPR gate — same
-    # threshold the live pipeline enforces, not bypassed here.
+    # confident enough to clear the real ANPR gate, same threshold as live
     confidence = 0.85
     if not passes_anpr_gate(plate, confidence):
         raise DemoScenarioError(f"'{plate}' would not clear the real ANPR quality gate at confidence {confidence}")
@@ -127,20 +107,12 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
             snapshot_path=snapshot_path,
         )
         db.add(det)
-        # Root-cause fix (found live): this and the commit below were bare
-        # db.flush()/db.commit() calls, unguarded against SQLite lock
-        # contention — the exact bug class PR #1 fixed in worker.py, just
-        # never applied here. Caught in practice: triggering the demo
-        # scenario while the two demo cameras' real workers were actively
-        # writing (heartbeats, frame processing) produced a genuine
-        # unhandled 500. Same bounded retry contract as the rest of the
-        # pipeline now applies here too.
+        # retried like the rest of the pipeline; bare flush/commit here gave
+        # a 500 when the demo cameras' workers were writing at the same time
         await safe_flush(db, "demo_scenario", reapply=lambda _det=det: db.add(_det))
-        # `corroborated=True`: the scenario models a vehicle read confidently and
-        # repeatedly across a real multi-camera journey, which is exactly the
-        # case that legitimately escalates to CRITICAL. Passing False here would
-        # demo an uncorroborated single-frame read, which the pipeline correctly
-        # caps at HIGH — an accurate demo of the wrong thing.
+        # corroborated=True: this models a car read confidently and repeatedly
+        # across cameras, which is what legitimately reaches CRITICAL. False
+        # would demo a single-frame read the pipeline caps at HIGH.
         vehicle = await upsert_vehicle_for_plate(db, plate, sighting_confidence, corroborated=True)
         plate_row = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera.id, detection_id=det.id,
@@ -154,16 +126,10 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
         vehicle_target_confidence = vehicle.plate_confidence
 
         def _reapply_plate_commit(_det=det, _plate_row=plate_row, _vehicle=vehicle):
-            # `det` and `plate_row` are freshly db.add()'d (never committed
-            # before this point in the loop) — a rollback only detaches
-            # them, so re-add() alone restores them. `vehicle` may instead
-            # be a pre-existing PERSISTENT row whose last_seen/
-            # plate_confidence were only FLUSHED (not committed) by
-            # upsert_vehicle_for_plate just above — a rollback here expires
-            # those back to their last-committed value, so they're
-            # explicitly reassigned from the locals captured right after
-            # that call, never by re-reading vehicle.* (same reasoning as
-            # worker.py's identical reapply pattern).
+            # det and plate_row are new, so rollback just detaches them and
+            # re-add() restores them. vehicle may be an existing row whose
+            # last_seen/plate_confidence were only flushed above; rollback
+            # expires those, so reassign from the locals (same as worker.py)
             db.add(_det)
             db.add(_plate_row)
             db.add(_vehicle)
@@ -175,8 +141,7 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
         for alert in alerts:
             incident = db.query(models.Incident).filter(models.Incident.alert_id == alert.id).first()
             event_type = "watchlist_match" if alert.vehicle_id else "zone_entry"
-            # Real video clip from this camera's own live ring buffer, same
-            # mechanism the real pipeline uses on a real alert (worker.py).
+            # real clip from this camera's ring buffer, like worker.py on an alert
             background.spawn(
                 clips.build_event_clip(
                     camera.id, camera.camera_code, alert.id, det.id,

@@ -1,8 +1,7 @@
-"""Dedicated plate detection: candidate regions, confidence provenance, quads.
+"""Plate detection: candidate regions, confidence source, quads.
 
-Synthetic crops only — no model weights, no GPU, no camera. The classical
-localizer is real CV, so these assert on the geometry it must respect rather
-than on a hoped-for detection rate (which needs ground truth and belongs in
+Synthetic crops, no weights, GPU or camera. Checks the geometry the
+classical localizer must respect, not a detection rate (that's
 tools/anpr_bench.py).
 """
 import asyncio
@@ -18,8 +17,8 @@ from app.pipeline.anpr import OcrRead
 
 
 def _vehicle_with_plate(plate_y: int = 150, plate_w: int = 120, plate_h: int = 30) -> np.ndarray:
-    """A dark vehicle-ish rectangle with a light, high-contrast plate region
-    carrying glyph-like bars — enough edge structure for the localizer."""
+    """Dark vehicle-ish rectangle with a light high-contrast plate carrying
+    glyph-like bars."""
     crop = np.full((220, 300, 3), 60, dtype=np.uint8)
     x = (300 - plate_w) // 2
     cv2.rectangle(crop, (x, plate_y), (x + plate_w, plate_y + plate_h), (235, 235, 235), -1)
@@ -40,8 +39,7 @@ class TestDetection:
         assert confidences == sorted(confidences, reverse=True)
 
     def test_the_candidate_list_is_bounded(self):
-        """Each candidate the caller reads is a full OCR pass — the most
-        expensive operation in the camera loop."""
+        """Each candidate read is a full OCR pass."""
         boxes = plate_detector.detect_plates(_vehicle_with_plate())
         assert len(boxes) <= plate_detector.MAX_CANDIDATES
 
@@ -53,8 +51,8 @@ class TestDetection:
             assert 0 <= box.y1 < box.y2 <= height
 
     def test_a_featureless_crop_yields_nothing(self):
-        """Returning nothing is correct and makes the caller read the whole
-        crop; inventing a region would send OCR somewhere arbitrary."""
+        """Nothing found = read the whole crop; inventing a region would send
+        OCR somewhere random."""
         assert plate_detector.detect_plates(np.full((200, 300, 3), 128, dtype=np.uint8)) == []
 
     def test_empty_and_degenerate_input_is_refused(self):
@@ -64,15 +62,13 @@ class TestDetection:
 
     @pytest.mark.parametrize("plate_y", [40, 100, 170])
     def test_plates_are_found_at_varying_heights(self, plate_y):
-        """Position feeds the score but must never hard-reject: a truck's plate
-        sits much higher than a car's."""
+        """Position affects the score but never rejects; truck plates sit higher."""
         assert plate_detector.detect_plates(_vehicle_with_plate(plate_y=plate_y))
 
 
 class TestConfidenceProvenance:
     def test_classical_detections_are_labelled_heuristic(self):
-        """A geometric plausibility score is NOT a model probability, and a
-        caller must be able to tell which it is looking at."""
+        """A geometric score isn't a model probability; callers can tell which."""
         for box in plate_detector.detect_plates(_vehicle_with_plate()):
             assert box.source == "heuristic"
 
@@ -86,8 +82,7 @@ class TestConfidenceProvenance:
         assert wide > square
 
     def test_a_missing_configured_model_falls_back_without_raising(self, monkeypatch):
-        """A configured-but-absent weights file is the documented no-asset path,
-        not a crash and not a silent pretence that a model ran."""
+        """Missing weights take the no-asset path, no crash, no fake model run."""
         plate_detector.get_plate_model.cache_clear()
         try:
             monkeypatch.setattr(settings, "plate_model_name", "definitely-not-here.pt")
@@ -107,8 +102,8 @@ class TestCropping:
         assert plate_crop.shape[1] >= box.width
 
     def test_a_quad_is_translated_into_the_cropped_image_space(self):
-        """The quad is in vehicle-crop coordinates; after cropping it must be
-        re-origined or perspective correction warps the wrong region."""
+        """The quad is in vehicle-crop coords and must be re-origined after
+        cropping, or the warp hits the wrong region."""
         crop = _vehicle_with_plate()
         box = plate_detector.detect_plates(crop)[0]
         if box.quad is None:
@@ -124,9 +119,8 @@ class TestCropping:
 
 
 class TestFullFrameOffsetting:
-    """`_read_plate_for_track` converts a crop-space plate box to full-frame
-    coordinates. A bbox in the wrong space draws the plate marker in the wrong
-    place on evidence, so the arithmetic is pinned directly."""
+    """_read_plate_for_track converts crop-space boxes to full frame; get it
+    wrong and the marker lands in the wrong place on evidence."""
 
     def test_the_stored_bbox_is_offset_by_the_vehicle_box_origin(self, monkeypatch):
         box = plate_detector.PlateBox(x1=40, y1=120, x2=150, y2=150, confidence=0.7, source="heuristic")
@@ -150,8 +144,8 @@ class TestFullFrameOffsetting:
         assert plate_bbox == [50, 130, 160, 160]
 
     def test_a_localization_miss_records_a_null_bbox_not_a_guess(self, monkeypatch):
-        """Falling back to whole-crop OCR must store NO plate box. Storing the
-        vehicle box instead would claim a localization that never happened."""
+        """Whole-crop fallback stores NO plate box. The vehicle box would claim
+        a localization that didn't happen."""
         monkeypatch.setattr(plate_detector, "detect_plates", lambda crop: [])
         monkeypatch.setattr(
             worker, "read_plate_structured",
@@ -169,9 +163,9 @@ class TestFullFrameOffsetting:
 
 
 def test_plate_model_path_is_resolved_from_the_backend_not_the_database(monkeypatch, tmp_path):
-    """DB_PATH may point anywhere (a Docker volume, a test directory); the plate
-    weights ship with the backend. Resolving next to the database silently lost
-    the plate detector whenever the two were apart."""
+    """DB_PATH can be anywhere (docker volume, test dir), the weights ship
+    with the backend. Resolving next to the DB lost the detector whenever
+    they were apart."""
     from app.config import BASE_DIR
     weights = BASE_DIR / "qa-plate-probe.pt"
     weights.write_bytes(b"not a real model")

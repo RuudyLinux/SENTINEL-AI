@@ -1,17 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
 
 /**
- * Critical-flow smoke test.
+ * Critical-flow smoke test: log in, reach the live control room, search a
+ * plate, open a vehicle's journey and evidence.
  *
- * Covers the path a judge or an operator actually walks: log in, reach the live
- * control room, search a plate, and open a vehicle's journey and evidence.
- *
- * It runs against a REAL backend on a throwaway database, so it deliberately
- * does not assert that detections exist — no camera is streaming in CI, and a
- * test that demanded real detections would either be a lie or permanently red.
- * What it does assert is that every screen loads its real state and reports
- * honestly, including the empty and not-found cases, which is exactly where a
- * frontend/backend contract break shows up.
+ * Runs against a real backend on a throwaway DB, so it doesn't expect
+ * detections (nothing streams in CI). It checks every screen loads its real
+ * state and reports it, empty and not-found cases included, which is where a
+ * frontend/backend contract break shows.
  */
 
 const ADMIN = { username: "admin", password: "sentinel123" };
@@ -35,8 +31,7 @@ test.describe("critical operator flow", () => {
   });
 
   test("rejects a wrong password with a real message", async ({ page }) => {
-    // Regression guard: a 401 from the login endpoint used to hard-redirect and
-    // silently reset the form, showing the user nothing at all.
+    // a 401 from login used to hard-redirect and reset the form with no message
     await fillCredentials(page, "definitely-not-the-password");
     await expect(page.getByText(/invalid|incorrect|unauthor/i)).toBeVisible();
     await expect(page).toHaveURL(/\/login/);
@@ -46,8 +41,8 @@ test.describe("critical operator flow", () => {
     await login(page);
     await page.goto("/vision");
     await expect(page.getByRole("heading", { name: /live ai detection/i })).toBeVisible();
-    // The WebSocket must actually connect — a dead feed showing a healthy page
-    // is the exact failure this screen exists to make visible.
+    // the websocket has to actually connect; a dead feed on a healthy-looking
+    // page is what this screen is meant to expose
     await expect(page.getByText("LIVE STREAM")).toBeVisible({ timeout: 20_000 });
     // Filter chips drive what the operator sees; they must render.
     await expect(page.getByRole("button", { name: /plates/i })).toBeVisible();
@@ -75,17 +70,13 @@ test.describe("critical operator flow", () => {
   test("an unknown vehicle id shows a real error, not a blank page", async ({ page }) => {
     await login(page);
     await page.goto("/vehicles/veh_doesnotexist");
-    // `.first()`: the error panel legitimately states the problem in both its
-    // heading and its body, so the phrase appearing more than once is correct
-    // behavior, not an ambiguity to resolve by narrowing the wording.
+    // .first(): the error panel says it in the heading and the body, both fine
     await expect(page.getByText(/not found|unavailable|could not/i).first()).toBeVisible({ timeout: 20_000 });
   });
 
   test("the operator screens all load their real state", async ({ page }) => {
     await login(page);
-    // Headings are matched exactly as the screens actually title themselves —
-    // a loose regex here would keep passing after a screen was renamed or
-    // replaced, which defeats the point of a smoke test.
+    // exact headings; a loose regex would keep passing after a screen was renamed
     for (const [path, heading] of [
       ["/live", /^Live Cameras$/],
       ["/alerts", /^Alert Center$/],
@@ -98,8 +89,7 @@ test.describe("critical operator flow", () => {
     ] as const) {
       await page.goto(path);
       await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
-      // Nothing may render a stuck spinner or a silent blank: every screen owes
-      // the operator either real data, a real empty state, or a real error.
+      // no stuck spinner or blank: real data, a real empty state or a real error
       await expect(page.locator("text=/undefined|NaN|\\[object Object\\]/")).toHaveCount(0);
     }
   });

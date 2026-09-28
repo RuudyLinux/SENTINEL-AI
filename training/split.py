@@ -1,36 +1,21 @@
 """Vehicle-disjoint dataset splitting.
 
-The one rule, and the reason this file exists:
-
     ONE vehicle identity  ->  ONE split. Always.
 
-Consecutive frames of a vehicle are near-duplicates. Splitting on frames puts an
-image of the *same plate, same lighting, same angle* into both train and test,
-and the model is then scored on its own training data. That is the standard way
-an ANPR accuracy number becomes fiction, and it is undetectable from the number
-itself — it just looks like a very good model.
+Consecutive frames of a vehicle are near-duplicates. Split on frames and the
+same plate, light and angle is in train and test, and the model is scored on
+its training data. That's the usual way ANPR accuracy numbers become fiction,
+and the number itself can't tell you.
 
-Assignment is by STABLE HASH of the identity, not by shuffling
--------------------------------------------------------------
-`hash(f"{seed}:{identity}")` mapped onto the split ratios, rather than
-`random.shuffle` over a list. Two properties follow, both of which matter:
+Assignment is a stable hash of the identity, not a shuffle:
+1. Order independent: doesn't depend on dict/set order or file order.
+   Python's hash() is salted per process, hence sha256.
+2. Growth stable: adding 500 vehicles next month leaves existing ones where
+   they were. With shuffling one new record reshuffles everything and the
+   test set silently changes.
 
-1. **Order independence.** The result cannot depend on dict/set iteration
-   order, or on the order records happen to appear in the file. Python's
-   `hash()` is salted per process, so `hashlib.sha256` is used instead — a
-   `random.shuffle` seeded the same way would still be stable, but only if the
-   input list order were, which is exactly the assumption that silently breaks.
-
-2. **Growth stability.** Adding 500 new vehicles next month leaves every
-   existing vehicle in the split it was already in. With shuffling, appending
-   one record reshuffles everything, the test set silently changes, and results
-   measured before and after are no longer comparable — while still looking
-   like they are.
-
-Ratios are therefore approximate on small corpora: a hash assigns each identity
-independently, so a 70/15/15 request over 20 vehicles will not land exactly on
-14/3/3. That is the honest trade for stability, and `plan_split` reports the
-achieved counts so the deviation is visible rather than assumed away.
+So ratios are approximate on small corpora (70/15/15 over 20 vehicles won't
+be exactly 14/3/3); plan_split reports the achieved counts.
 """
 from __future__ import annotations
 
@@ -43,15 +28,14 @@ from schema import PlateRecord, VALID_SPLITS, bucket_for
 
 @dataclass(frozen=True)
 class SplitConfig:
-    """Everything needed to reproduce a split exactly. Recorded in the manifest
-    alongside the dataset version and code revision."""
+    """Everything needed to reproduce a split. Goes in the manifest with the
+    dataset version and code revision."""
     seed: str = "sentinel-anpr-v1"
     train: float = 0.70
     val: float = 0.15
     test: float = 0.15
-    # The record attribute that defines identity. `vehicle_id` is the default
-    # and the correct choice; `plate_text` is offered because a corpus lacking
-    # reliable vehicle ids can still be split safely on the registration.
+    # identity attribute. vehicle_id is the right default; plate_text is for a
+    # corpus without reliable vehicle ids
     identity_field: str = "vehicle_id"
 
     def __post_init__(self) -> None:
@@ -113,12 +97,9 @@ def identity_of(record: PlateRecord, config: SplitConfig) -> str:
 
 
 def assign_identity(identity: str, config: SplitConfig) -> str:
-    """Deterministically place one identity into a split.
-
-    SHA-256 of `seed:identity` gives a uniform fraction in [0, 1); the split
-    ratios partition that interval. `hashlib` rather than the builtin `hash()`
-    because the latter is salted per process (PYTHONHASHSEED) and would produce
-    a different split on every run.
+    """Place one identity in a split: sha256(seed:identity) as a fraction in
+    [0, 1), partitioned by the ratios. hashlib because builtin hash() is
+    salted per process (PYTHONHASHSEED).
     """
     digest = hashlib.sha256(f"{config.seed}:{identity}".encode("utf-8")).digest()
     # 8 bytes is ample resolution and keeps the arithmetic in native int range.
@@ -131,16 +112,12 @@ def assign_identity(identity: str, config: SplitConfig) -> str:
 
 
 def assign_splits(records: list[PlateRecord], config: SplitConfig | None = None) -> list[PlateRecord]:
-    """Set `.split` on every record, in place, by its identity.
+    """Set .split on every record in place by its identity. Same identity,
+    same split, since it's a pure function of the identity.
 
-    Records sharing an identity are guaranteed the same split because the split
-    is a pure function of the identity string — there is no per-record
-    randomness that could separate them.
-
-    Records with an EMPTY identity are left unassigned (`split=""`) rather than
-    being defaulted into train: an observation whose vehicle is unknown cannot
-    be guaranteed disjoint from anything, so it must not silently become
-    training data. `qc.checks` reports them.
+    Empty identity stays unassigned (split="") instead of defaulting to
+    train: an unknown vehicle can't be guaranteed disjoint, so it mustn't
+    quietly become training data. qc.checks reports them.
     """
     config = config or SplitConfig()
     for record in records:
@@ -186,10 +163,8 @@ def plan_split(records: list[PlateRecord], config: SplitConfig | None = None) ->
 def find_identity_leakage(
     records: list[PlateRecord], config: SplitConfig | None = None,
 ) -> dict[str, set[str]]:
-    """Identities appearing in more than one split — the fatal case.
-
-    Returns `{identity: {splits}}`, empty when clean. This is what the CI gate
-    asserts on.
+    """Identities in more than one split, the fatal case. {identity: {splits}},
+    empty when clean. The CI gate asserts on this.
     """
     config = config or SplitConfig()
     seen: dict[str, set[str]] = defaultdict(set)
@@ -201,14 +176,12 @@ def find_identity_leakage(
 
 
 def find_image_leakage(records: list[PlateRecord]) -> dict[str, set[str]]:
-    """The same `image_id` in more than one split.
+    """The same image_id in more than one split.
 
-    Distinct from identity leakage: one frame can legitimately contain two
-    vehicles, and if those two vehicles hash into different splits the FRAME is
-    in both. That is a real leak — the same pixels are in train and test — even
-    though no identity crosses. Reported separately because the fix differs:
-    identity leakage is a splitter bug, image leakage is a decision about
-    multi-vehicle frames.
+    Not identity leakage: one frame can hold two vehicles that hash to
+    different splits, and then the same pixels are in both. Reported
+    separately because the fix differs (splitter bug vs a decision about
+    multi-vehicle frames).
     """
     seen: dict[str, set[str]] = defaultdict(set)
     for record in records:
@@ -218,14 +191,10 @@ def find_image_leakage(records: list[PlateRecord]) -> dict[str, set[str]]:
 
 
 def find_repeated_plate_text(records: list[PlateRecord]) -> dict[str, set[str]]:
-    """Plate strings appearing under more than one `vehicle_id`.
-
-    **Reported, never auto-failed.** Two records with the same registration are
-    usually the same vehicle given two ids by mistake — but not always: a
-    transcription can legitimately coincide (a partial label like `KL34F`), and
-    cloned or misread plates exist in real traffic. Treating this as leakage
-    automatically would delete genuine data; treating it as invisible would hide
-    a real identity bug. So it is surfaced for a human.
+    """Plate strings under more than one vehicle_id. Reported, never
+    auto-failed: usually one vehicle given two ids by mistake, but partial
+    labels (KL34F) can coincide and cloned or misread plates exist. A human
+    decides.
     """
     by_text: dict[str, set[str]] = defaultdict(set)
     for record in records:

@@ -1,17 +1,13 @@
-"""Bounded per-camera event video clips (Phase 3 P0).
+"""Per-camera event clips, bounded.
 
-A small ring buffer of recently-seen JPEG-encoded frames per camera feeds
-both the pre-event window and any active clip build — bounded, never
-unbounded: old ring entries are evicted by wall-clock age
-(`clip_pre_event_seconds`), and a clip build only subscribes to new frames
-for its configured post-event window (`clip_post_event_seconds`) before it
-unregisters itself. Nothing here ever buffers a whole camera stream.
+A small ring buffer of recent JPEG frames per camera feeds the pre-event
+window and any clip being built. Entries age out after
+clip_pre_event_seconds, and a clip build only listens for new frames for
+clip_post_event_seconds, then unregisters. Nothing buffers a whole stream.
 
-The camera loop (`worker.py`) calls `push_frame()` once per frame with the
-same JPEG bytes it already encodes for the MJPEG/snapshot endpoints — no
-extra encoding work. On a real alert, `worker.py` calls `build_event_clip()`
-as a background task so the camera's own read/inference loop is never
-blocked waiting for the post-event window to elapse.
+worker.py pushes the JPEG it already encodes via push_frame(), and on an
+alert runs build_event_clip() as a background task so the camera loop never
+waits out the post-event window.
 """
 import asyncio
 import logging
@@ -38,9 +34,9 @@ logger = logging.getLogger(__name__)
 
 _RING: dict[str, deque[tuple[float, bytes]]] = {}
 
-# At most this many clips encode at once. One ffmpeg/libx264 encode of 1080p
-# already uses several cores; a busy zone raises many alerts in the same second,
-# and unbounded parallel encodes starved the camera loops and exhausted RAM.
+# max clips encoding at once. one 1080p libx264 encode already uses several
+# cores, and a busy zone fires many alerts a second; unbounded encodes
+# starved the camera loops and ran out of RAM
 _ENCODE_SLOTS = threading.BoundedSemaphore(2)
 _ENCODE_THREADS = 2  # per encode, so clips use at most 4 threads in all
 _SUBSCRIBERS: dict[str, list[asyncio.Queue]] = {}
@@ -60,8 +56,7 @@ def push_frame(camera_id: str, jpeg_bytes: bytes) -> None:
 
 
 def release_camera(camera_id: str) -> None:
-    """Drop a camera's ring buffer (call on stop_worker — mirrors
-    detector.release_model)."""
+    """Drop a camera's ring buffer, called from stop_worker."""
     _RING.pop(camera_id, None)
 
 
@@ -74,11 +69,9 @@ def _timed_recent_frames(camera_id: str) -> list[tuple[float, bytes]]:
 
 
 def _playback_fps(timed_frames: list[tuple[float, bytes]]) -> float:
-    """The rate the frames were actually captured at, so the clip plays in
-    real time. Encoding at the fixed nominal `clip_fps` was only right when
-    frames arrived at that rate; the camera loop now takes only the newest
-    frame (~2-3fps under AI load), and a 10fps encode played evidence 3-5x
-    too fast — a clip that misstates how long something took."""
+    """The rate frames were actually captured at, so clips play in real time.
+    The loop only takes the newest frame now (~2-3fps under AI), and encoding
+    at the nominal 10fps played evidence 3-5x too fast."""
     if len(timed_frames) < 2:
         return settings.clip_fps
     span = timed_frames[-1][0] - timed_frames[0][0]
@@ -88,30 +81,23 @@ def _playback_fps(timed_frames: list[tuple[float, bytes]]) -> float:
 
 
 def _encode_clip(frames: list[bytes], path: str, fps: "float | None" = None) -> bool:
-    """Synchronous, CPU-bound: decode each buffered JPEG and encode it to a
-    bounded MP4. Runs off the event loop via asyncio.to_thread (see caller).
-    Returns False (and writes nothing) if no frame in the batch decodes.
+    """CPU-bound: decode each buffered JPEG and encode a bounded MP4. Run via
+    to_thread. False (nothing written) if no frame decodes.
 
-    Encodes via a piped ffmpeg subprocess (libx264/H.264), not
-    cv2.VideoWriter — this machine's OpenCV FFMPEG backend has no working
-    H.264 encoder (its bundled OpenH264 DLL fails to load; confirmed live:
-    every avc1/h264/H264/X264 fourcc fails to open), and the only fourcc
-    that DOES work there, mp4v (MPEG-4 Part 2 / FMP4), is not a codec
-    browsers can decode — a clip written that way loaded as a real 768x432
-    file but Chrome's <video> reported networkState NETWORK_NO_SOURCE and
-    never played a frame. ffmpeg's own statically-linked libx264 (bundled
-    via imageio-ffmpeg, already a transitive dependency) sidesteps the
-    missing system codec entirely and produces an ordinary browser-playable
-    H.264/yuv420p MP4."""
+    Uses a piped ffmpeg (libx264) instead of cv2.VideoWriter. This OpenCV
+    build has no working H.264 encoder (its OpenH264 DLL won't load, every
+    avc1/h264/X264 fourcc fails), and the one fourcc that works, mp4v, isn't
+    something browsers decode: Chrome's <video> sat at NETWORK_NO_SOURCE.
+    imageio-ffmpeg (already a dependency) ships a static libx264, which gives
+    a normal H.264/yuv420p MP4."""
     with _ENCODE_SLOTS:
         return _encode_clip_now(frames, path, fps)
 
 
 def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> bool:
-    # Frames are decoded one at a time as they are written to ffmpeg. Decoding
-    # the whole batch first held every raw frame at once: at 1080p that is
-    # 6.2 MB a frame, ~750 MB for one 15s clip at 8 frames/s, and several
-    # clips from one busy zone ran the machine out of memory (measured live).
+    # Decode one frame at a time while feeding ffmpeg. Decoding the whole
+    # batch first held every raw frame: 6.2 MB each at 1080p, ~750 MB for a
+    # 15s clip at 8 fps, and a few clips from a busy zone ran out of memory.
     decoded = (
         arr for arr in (cv2.imdecode(np.frombuffer(b, dtype=np.uint8), cv2.IMREAD_COLOR) for b in frames)
         if arr is not None
@@ -125,27 +111,21 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps or settings.clip_fps:.3f}",
         "-i", "-",
-        # -threads: libx264 otherwise takes every core for one clip. A busy
-        # zone raised an alert about every 2 s in a 10-minute live run, and
-        # the encodes held the machine at 90-100% CPU and halved the AI rate.
+        # -threads: libx264 grabs every core otherwise. A busy zone alerting
+        # every ~2s kept the box at 90-100% CPU and halved the AI rate.
         "-an", "-c:v", "libx264", "-preset", "veryfast", "-threads", str(_ENCODE_THREADS), "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(path),
     ]
-    # stderr goes to a temporary FILE, not a pipe, and this is the whole
-    # point rather than a style choice. A pipe has a fixed OS buffer: with
-    # stderr=PIPE and nobody reading it, an ffmpeg chatty enough to fill that
-    # buffer blocks writing to stderr while this thread is blocked writing
-    # frames to stdin, and neither side can move. No timeout rescues that --
-    # `wait(timeout=...)` is only reached once the frame loop has finished,
-    # and the frame loop is exactly where the deadlock happens. Draining
-    # stderr after the loop (communicate) has the same hole. The old code
-    # never hit it only because `-loglevel error` keeps ffmpeg quiet, which
-    # is a property of the argument list, not of this function. A file has no
-    # such limit, and it is read once the process has exited.
+    # stderr to a temp FILE, not a pipe, on purpose. Nobody reads a PIPE
+    # while we're writing frames, so a chatty ffmpeg fills the OS buffer and
+    # blocks on stderr while we block on stdin: deadlock, and wait(timeout)
+    # is never reached because we're stuck in the frame loop. communicate()
+    # afterwards has the same hole. `-loglevel error` only hides it. A file
+    # has no limit and gets read after exit.
     #
-    # `with proc` on top closes stdin whichever way the block exits; leaving
-    # it open was the ResourceWarning ("unclosed file") the test suite showed.
+    # `with proc` closes stdin however the block exits (the "unclosed file"
+    # ResourceWarning in tests).
     err = b""
     with tempfile.TemporaryFile() as errfile:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errfile)
@@ -160,10 +140,9 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         except Exception as exc:
             proc.kill()
             proc.wait(timeout=10)
-            # Most often a BrokenPipeError: ffmpeg rejected its arguments and
-            # exited while this side was still feeding it frames. That used to
-            # return a bare False, identical to "no frame decoded", so a
-            # misconfigured encoder looked exactly like an empty ring buffer.
+            # usually BrokenPipeError: ffmpeg rejected its args and exited
+            # while we were still writing. log it, or a broken encoder looks
+            # just like an empty ring buffer
             errfile.seek(0)
             detail = errfile.read().decode("utf-8", "replace").strip()[-500:]
             logger.warning("clip encode failed (%s): %s", type(exc).__name__, detail or exc)
@@ -172,9 +151,7 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         err = errfile.read()
 
     if proc.returncode != 0:
-        # Non-fatal by contract (the caller treats False as "no clip"), but
-        # the reason is worth having: a silent False here used to be
-        # indistinguishable from "no frame decoded".
+        # still just False for the caller, but log why
         logger.warning(
             "clip encode failed (ffmpeg exit %s): %s",
             proc.returncode,
@@ -193,12 +170,10 @@ async def build_event_clip(
     event_type: str,
     source_timestamp: datetime | None,
 ) -> None:
-    """Background task: waits out the bounded post-event window collecting
-    live frames as the camera loop produces them, stitches pre+post into a
-    bounded MP4, and writes an Evidence(evidence_type="clip") row. Never
-    blocks the camera's own loop. If the camera drops mid-capture and no
-    frames end up available, no clip/Evidence row is created — no fake
-    evidence."""
+    """Background task: collect frames for the post-event window, stitch pre +
+    post into a bounded MP4 and write an Evidence(evidence_type="clip") row.
+    Never blocks the camera loop. No frames (camera dropped) = no clip and no
+    Evidence row."""
     pre_frames = _timed_recent_frames(camera_id)
 
     max_post_frames = int(settings.clip_post_event_seconds * 30) + 10  # generous upper bound, still finite
@@ -228,15 +203,13 @@ async def build_event_clip(
 
     fname = f"{camera_code}_clip_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.mp4"
     path = settings.evidence_dir / fname
-    # Decode + VideoWriter encoding is CPU-bound OpenCV work — offloaded to a
-    # worker thread so it never blocks THIS process's single asyncio event
-    # loop (which every camera's own read/inference loop also shares).
+    # CPU-bound encode, off the event loop every camera shares
     wrote = await asyncio.to_thread(_encode_clip, frames, str(path), _playback_fps(timed))
     if not wrote:
         return
 
-    # In a worker thread: this is a blocking SQLite write, and on the event loop
-    # a contended commit (busy timeout 30s) froze every camera's loop with it.
+    # in a thread: a contended commit (30s busy timeout) on the loop froze
+    # every camera with it
     await asyncio.to_thread(
         _record_clip_evidence, camera_id, alert_id, detection_id, incident_id,
         event_type, source_timestamp, str(path),

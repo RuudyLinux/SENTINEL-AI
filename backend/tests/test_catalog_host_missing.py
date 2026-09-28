@@ -1,4 +1,4 @@
-"""3. Missing catalogue host — never fabricates cameras, fails clearly."""
+"""No catalogue host configured: fail clearly, never invent cameras."""
 import asyncio
 
 import pytest

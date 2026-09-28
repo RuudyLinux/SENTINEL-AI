@@ -1,18 +1,12 @@
-"""The two primitives that have to survive a second process.
+"""The two primitives that have to work across processes.
 
-These replace `time.monotonic()`-based dicts in rules_engine, self_heal and
-auth. The behaviours pinned here are the ones that made those dicts wrong
-outside a single process:
-
-- a claim and its recording are one operation, so two callers cannot both see
-  a key as free;
-- time is wall-clock, because a monotonic reading cannot be compared between
-  processes and resets on restart;
-- a backwards clock step expires a claim rather than freezing it;
-- the tables are bounded, and the bound can never release a claim or a
-  lockout that is currently doing its job.
+What made the old monotonic dicts wrong outside one process:
+- claiming and recording are one step, so two callers can't both see a key free
+- wall clock, since monotonic can't be compared across processes and resets
+- a backwards clock step expires a claim instead of freezing it
+- tables are bounded, and the bound never releases a claim or lockout that's
+  still doing its job
 """
-import pytest
 
 from app.runtime_state import ExpiringClaims, SlidingWindow
 
@@ -48,8 +42,8 @@ class TestExpiringClaims:
         assert claims.claim("cam_1:track_9", 45.0) is True
 
     def test_the_boundary_is_exclusive(self):
-        """Exactly `ttl` seconds later, the claim has expired — matching the
-        `now - last < COOLDOWN_SECONDS` comparison this replaces."""
+        """Expired exactly ttl seconds later, like the `now - last <
+        COOLDOWN_SECONDS` check it replaces."""
         clock = FakeClock()
         claims = ExpiringClaims(clock=clock)
         claims.claim("k", 45.0)
@@ -62,8 +56,8 @@ class TestExpiringClaims:
         assert claims.claim("cam_2:track_9", 45.0) is True
 
     def test_a_refused_claim_does_not_extend_the_window(self):
-        """A busy camera re-checks every inference cycle. If each refusal
-        pushed the expiry out, the alert would never fire again."""
+        """Refusals don't push the expiry out, or a busy camera re-checking
+        every cycle would never fire again."""
         clock = FakeClock()
         claims = ExpiringClaims(clock=clock)
         claims.claim("k", 45.0)
@@ -83,9 +77,8 @@ class TestExpiringClaims:
         ExpiringClaims(clock=FakeClock()).release("never-claimed")
 
     def test_a_backwards_clock_expires_the_claim(self):
-        """NTP correcting the clock backwards must not freeze a claim. Failing
-        this way fires a possible duplicate; failing the other way suppresses
-        real alerts until the clock catches up."""
+        """A backwards NTP step doesn't freeze a claim. Worst case is a
+        duplicate, not real alerts suppressed until the clock catches up."""
         clock = FakeClock()
         claims = ExpiringClaims(clock=clock)
         claims.claim("k", 45.0)
@@ -99,8 +92,7 @@ class TestExpiringClaims:
         assert len(claims) <= 50
 
     def test_eviction_prefers_expired_entries(self):
-        """Dropping an expired claim changes no behaviour; dropping a live one
-        releases a suppression that is still wanted."""
+        """Dropping expired claims changes nothing; dropping live ones would."""
         clock = FakeClock()
         claims = ExpiringClaims(max_keys=10, clock=clock)
         for i in range(10):
@@ -132,8 +124,7 @@ class TestSlidingWindow:
         assert window.record("bob", 60.0, limit=5) == 1
 
     def test_it_slides_rather_than_resetting(self):
-        """The window must roll forward continuously: four failures spread
-        over ninety seconds are never five in sixty."""
+        """The window rolls: four failures over 90s are never five in 60."""
         clock = FakeClock()
         window = SlidingWindow(clock=clock)
         for _ in range(4):
@@ -148,8 +139,7 @@ class TestSlidingWindow:
         assert window.count("bob", 60.0) == 1
 
     def test_forget_clears_one_key(self):
-        """A successful login clears that account's failures, and only that
-        account's."""
+        """Success clears that account's failures, only that one's."""
         window = SlidingWindow(clock=FakeClock())
         window.record("bob", 60.0, limit=5)
         window.record("eve", 60.0, limit=5)
@@ -165,16 +155,15 @@ class TestSlidingWindow:
         assert window.count("bob", 60.0) == 0
 
     def test_the_table_is_bounded_against_attacker_supplied_keys(self):
-        """The login limiter is keyed by a username an unauthenticated caller
-        chooses. Unbounded, that is remote memory growth with no credential."""
+        """Keys are usernames an anonymous caller picks; unbounded is remote
+        memory growth."""
         window = SlidingWindow(max_keys=50, clock=FakeClock())
         for i in range(500):
             window.record(f"attacker-{i}", 60.0, limit=5)
         assert len(window) <= 50
 
     def test_eviction_never_clears_an_entry_at_the_limit(self):
-        """Otherwise flooding novel usernames becomes a way to unlock the
-        account you are actually attacking."""
+        """Otherwise flooding new usernames unlocks the account under attack."""
         window = SlidingWindow(max_keys=20, clock=FakeClock())
         for _ in range(5):
             window.record("victim", 60.0, limit=5)
@@ -190,10 +179,9 @@ class TestSlidingWindow:
 
 
 def test_the_default_clock_is_wall_clock_not_monotonic():
-    """Both stores this replaces used `time.monotonic()`, which is measured
-    from a per-process origin: two processes cannot compare readings, and a
-    restart resets it — silently re-firing every suppressed alert. The value
-    has to be one a second process and a later run would recognise."""
+    """Monotonic readings can't be compared between processes and reset on
+    restart (re-firing suppressed alerts). The value has to make sense to
+    another process and a later run."""
     import time as _time
 
     claims = ExpiringClaims()

@@ -1,24 +1,17 @@
-"""BUG investigation D2: can concurrent cross-camera alerts for ONE vehicle
-open TWO incidents?
+"""Can concurrent cross-camera alerts for one vehicle open two incidents?
 
-`rules_engine.evaluate` does read-then-create for incidents
-(`_find_correlatable_incident` -> `db.add(models.Incident(...))`), the same
-shape as the vehicle race that WAS real (see test_vehicle_upsert_race.py).
-Two cameras seeing a watchlisted vehicle seconds apart is routine, and a
-duplicate incident is exactly the operator-flooding that correlation exists
-to prevent.
+rules_engine.evaluate reads then creates (_find_correlatable_incident, then
+add Incident), same shape as the vehicle race that was real
+(test_vehicle_upsert_race.py). Two cameras seeing a watchlisted car seconds
+apart is routine.
 
-It was attacked 8 times during the debugging pass and never reproduced. The
-structural reason: the entire read-decide-create block contains NO await, so
-two tasks on one event loop cannot interleave inside it — whichever runs
-second necessarily runs after the first has finished creating.
+Tried 8 times, never reproduced: the read-decide-create block has no await,
+so two tasks on one loop can't interleave inside it.
 
-A partial unique index was deliberately NOT added. An incident legitimately
-recurs for the same vehicle over time, so a constraint could reject a valid
-write from inside the camera loop — a worse failure mode than a rare
-duplicate. Instead the INVARIANT is stress-tested here, so if the window
-ever opens (a future `await` added inside that block would open it), this
-fails loudly and the fix can be designed against a real reproduction.
+No partial unique index: an incident can legitimately recur for a vehicle,
+and a constraint rejecting a write inside the camera loop is worse than a
+rare duplicate. The invariant is stress-tested instead, so an await added
+there later fails this loudly.
 """
 import asyncio
 import uuid
@@ -62,9 +55,8 @@ def _detection(session, camera) -> models.Detection:
 
 
 def test_concurrent_cross_camera_alerts_never_open_two_incidents_for_one_vehicle(db_session):
-    """Each round: one watchlisted vehicle, two cameras on two separate
-    sessions (exactly how two camera workers behave), both evaluating
-    concurrently. Invariant: exactly ONE incident for that vehicle."""
+    """Per round: one watchlisted vehicle, two cameras on separate sessions
+    (like two workers) evaluating at once. Exactly one incident."""
     failures = []
 
     for round_index in range(ROUNDS):
@@ -130,10 +122,8 @@ def test_concurrent_cross_camera_alerts_never_open_two_incidents_for_one_vehicle
 
 
 def test_the_second_alert_correlates_rather_than_opening_its_own_incident(db_session):
-    """The positive half of the invariant: the losing task must ATTACH to the
-    winner's incident (recorded with a correlation reason), not be silently
-    dropped. A test that only counted incidents would pass if the second
-    alert vanished entirely."""
+    """The losing alert attaches to the winner's incident with a reason. Only
+    counting incidents would pass if the second alert just vanished."""
     rules_engine._alert_claims.clear()
     plate = f"GJ05DC{uuid.uuid4().hex[:4].upper()}"
     db_session.add(models.WatchlistEntry(

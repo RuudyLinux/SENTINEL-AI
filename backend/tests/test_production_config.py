@@ -1,7 +1,5 @@
-"""Hardening pass: DEMO_MODE=false (production mode) must reject an
-insecure/default JWT secret at startup rather than silently signing real
-tokens with a publicly-known dev value. Demo mode itself must stay
-completely unaffected."""
+"""DEMO_MODE=false refuses an insecure or default JWT secret at startup;
+demo mode still starts without one."""
 import pytest
 
 from app.config import Settings
@@ -26,9 +24,8 @@ def test_production_mode_accepts_a_real_generated_secret():
 
 
 def test_demo_mode_starts_without_a_secret_but_never_signs_with_the_public_one():
-    # Demo mode must still start with no JWT_SECRET configured, but the
-    # bundled secret is in this repository, so signing with it would let
-    # anyone mint an Administrator token. A random per-process one replaces it.
+    # demo mode starts without JWT_SECRET, but the bundled secret is public,
+    # so a random per-process one is used instead
     bundled = "sentinel-vision-dev-secret-change-in-production"
     s = Settings(demo_mode=True, jwt_secret=bundled)
     assert s.demo_mode is True

@@ -1,5 +1,4 @@
-"""Tamper-evident audit chain (10/10 roadmap P9): app/audit.py's hash chain,
-and the GET /api/audit/verify-chain endpoint that walks it."""
+"""Audit hash chain (app/audit.py) and GET /api/audit/verify-chain."""
 import pytest
 
 from app import audit, models
@@ -60,10 +59,8 @@ class TestVerifyChain:
             assert result["valid"] is False
             assert result["broken_at"] == victim.chain_seq
         finally:
-            # The chain is a single global, append-only log shared by every
-            # test in this suite (and by test_a_deleted_row_... below) — leave
-            # it intact rather than permanently poisoning verify_chain for
-            # every test that runs after this one.
+            # one global append-only log shared by the whole suite; put it
+            # back or verify_chain fails for every later test
             victim.resource = original_resource
             db_session.commit()
 
@@ -71,10 +68,8 @@ class TestVerifyChain:
         audit.log_action(db_session, None, "test_action_delete_before")
         victim = audit.log_action(db_session, None, "test_action_delete_target")
         after = audit.log_action(db_session, None, "test_action_delete_after")
-        # Snapshot every field verify_chain depends on, so the row can be
-        # restored afterward — this table is one global, append-only log
-        # shared by the rest of the suite; a real deletion left in place
-        # would permanently poison verify_chain for every test after this one.
+        # snapshot what verify_chain looks at so the row can be restored
+        # afterwards, same reason as above
         victim_fields = {
             "id": victim.id, "user_id": victim.user_id, "username": victim.username,
             "action": victim.action, "resource": victim.resource, "result": victim.result,

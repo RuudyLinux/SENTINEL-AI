@@ -1,4 +1,4 @@
-"""False-positive feedback + precision metrics (10/10 roadmap P6)."""
+"""False-positive feedback and precision metrics."""
 import uuid
 
 import pytest

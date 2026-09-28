@@ -1,18 +1,12 @@
-"""Two defects that only ever announced themselves as warnings.
+"""Two bugs that only showed up as warnings, both in our own modules:
 
-A warning is not noise when it names your own module. Both of these did, and
-both were real:
+1. ws.py built a coroutine and dropped it whenever there was no running loop
+   ("coroutine '_flush_loop' was never awaited" on every sync publish).
+2. clips.py opened an ffmpeg stderr pipe and never read or closed it. The
+   unclosed handle was the visible ResourceWarning; the unread pipe is
+   worse, it fills and blocks the writer.
 
-1. `ws.py` built a coroutine and then threw it away whenever there was no
-   running event loop. Python said so on every synchronous publish
-   ("coroutine '_flush_loop' was never awaited").
-2. `clips.py` opened an ffmpeg stderr pipe it never read or closed. The
-   unclosed handle was the visible half (a ResourceWarning); the unread half
-   is worse, because a pipe nobody drains fills up and blocks the process
-   writing to it.
-
-Warnings are escalated to errors here rather than asserted on text, so these
-stay failures rather than drifting back into the suite's warning summary.
+Warnings are made errors here instead of matching text, so these stay failures.
 """
 import asyncio
 import subprocess
@@ -37,8 +31,7 @@ class TestFlushTaskWithoutALoop:
         assert manager._flush_task is None, "no loop means no task, and no coroutine either"
 
     def test_the_event_is_still_buffered(self):
-        """The guard must not cost the buffering it protects — the event has
-        to survive to the next publish that does have a loop."""
+        """The event still survives to the next publish that has a loop."""
         manager = ws_module.ConnectionManager()
         manager._buffer("detection", "detection_batch", {"id": "d1"})
         assert manager._buffers["detection_batch"] == [{"type": "detection", "id": "d1"}]
@@ -80,11 +73,9 @@ class TestClipEncoderPipes:
     @pytest.fixture(autouse=True)
     def _resolve_ffmpeg_before_popen_is_patched(self):
         """imageio_ffmpeg finds its binary once per process (lru_cache) by
-        spawning it via subprocess. Tests below replace subprocess.Popen with
-        deliberately broken fakes; if one of them happened to run first, the
-        lookup ran under the fake, failed, and cached "no ffmpeg" for every
-        later test in the session — the intermittent random-order failure of
-        every real clip encode. Resolving it up front makes order irrelevant."""
+        spawning it. Tests below swap Popen for broken fakes; if one ran first
+        the lookup failed and cached "no ffmpeg" for the session, so every real
+        clip encode failed under random order. Resolve it up front."""
         imageio_ffmpeg.get_ffmpeg_exe()
 
     def test_a_successful_encode_leaves_no_open_pipe(self, tmp_path):
@@ -95,13 +86,11 @@ class TestClipEncoderPipes:
         assert out.exists() and out.stat().st_size > 0
 
     def test_stderr_is_drained_not_merely_closed(self, tmp_path, monkeypatch):
-        """The deadlock case: ffmpeg writing more to stderr than the pipe
-        buffer holds. `-loglevel error` keeps the real command quiet, so the
-        protection has to be verified against a command that is not."""
+        """ffmpeg writing more to stderr than the pipe holds. -loglevel error
+        keeps the real command quiet, so test with one that isn't."""
         captured = {}
-        # Bound BEFORE patching: `clips.subprocess` is the stdlib module
-        # itself, so a replacement that calls `subprocess.Popen` by name would
-        # call itself.
+        # grab it before patching: clips.subprocess IS the stdlib module, so a
+        # fake calling subprocess.Popen by name would call itself
         real_popen = subprocess.Popen
 
         def noisy_popen(cmd, **kwargs):
@@ -113,17 +102,14 @@ class TestClipEncoderPipes:
 
         monkeypatch.setattr(subprocess, "Popen", noisy_popen)
         out = tmp_path / "loud.mp4"
-        # Without draining this blocks until the 60s timeout rather than
-        # returning; the test would hang instead of failing, which is exactly
-        # how the bug would have shown up in production.
+        # without draining this blocks until the 60s timeout, i.e. hangs
+        # instead of failing, same as it would in production
         assert clips._encode_clip(_tiny_frames(40), str(out)) is True
         assert captured["cmd"][captured["cmd"].index("-loglevel") + 1] == "debug"
 
     def test_a_failing_encode_reports_the_reason(self, tmp_path, caplog, monkeypatch):
-        """A bare False was indistinguishable from 'nothing decoded'.
-
-        A rejected argument kills ffmpeg while frames are still being written,
-        so this exercises the exception path — the one that was silent.
+        """A bare False looked the same as "nothing decoded". A rejected
+        argument kills ffmpeg mid-write, so this hits the exception path.
         """
         real_popen = subprocess.Popen
 
@@ -138,8 +124,8 @@ class TestClipEncoderPipes:
         assert any("clip encode failed" in r.getMessage() for r in caplog.records)
 
     def test_a_nonzero_exit_reports_the_reason(self, tmp_path, caplog, monkeypatch):
-        """The other failure shape: ffmpeg accepts the frames, then exits
-        non-zero (here, an output container it cannot write)."""
+        """Other shape: ffmpeg takes the frames, then exits non-zero (can't
+        write the output container)."""
         real_popen = subprocess.Popen
 
         def bad_output_popen(cmd, **kwargs):

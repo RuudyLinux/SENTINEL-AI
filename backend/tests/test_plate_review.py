@@ -1,6 +1,5 @@
-"""Human-in-the-loop ANPR review (10/10 roadmap P7): low-confidence Plate
-sightings are flagged pending_review rather than silently treated as
-settled, and the review-queue endpoints accept/correct/reject them."""
+"""ANPR review: low-confidence sightings are pending_review, and the queue
+endpoints accept/correct/reject them."""
 import uuid
 
 import pytest
@@ -71,7 +70,7 @@ class TestReviewQueueApi:
         body = resp.json()
         assert body["review_status"] == "corrected"
         assert body["corrected_text"] == "GJ05AB1204"
-        # OCR fields untouched — three separate, all-preserved facts.
+        # OCR fields untouched, three separate facts
         assert body["plate_text_normalized"] == "GJ05AB1234"
 
     def test_reject_removes_it_from_the_active_queue_but_keeps_the_row(self, client, db_session, auth):

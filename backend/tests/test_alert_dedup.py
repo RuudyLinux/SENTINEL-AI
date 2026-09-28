@@ -1,4 +1,4 @@
-"""8. Alert dedup (cooldown) — prevents a tracked object re-firing an alert every inference cycle."""
+"""Alert cooldown: a tracked object doesn't re-fire every inference cycle."""
 import asyncio
 
 from app.pipeline import rules_engine
@@ -6,10 +6,9 @@ from app.runtime_state import ExpiringClaims
 
 
 class _Clock:
-    """The cooldown moved off `time.monotonic()` onto wall-clock, because a
-    monotonic reading cannot be compared between processes and resets on
-    restart. Driving the store's own clock tests the same behaviour without
-    depending on which clock function it reads."""
+    """The cooldown uses wall clock now (monotonic can't be shared between
+    processes and resets on restart). Driving the store's clock tests the
+    same thing without caring which clock it reads."""
 
     def __init__(self, now=1000.0):
         self.now = now
@@ -23,12 +22,8 @@ def _fixed_clock(monkeypatch, clock):
 
 
 def _cooldown(key):
-    """`_on_cooldown` is `async def` — it dispatches a Redis-backed claim to a
-    thread rather than blocking the camera loop's event loop, and stays a
-    plain synchronous dict lookup for the in-process store these tests use
-    (`ExpiringClaims.is_local` is True, so no thread dispatch happens here
-    either — `asyncio.run` is only what lets a sync test call an async
-    function at all)."""
+    """_on_cooldown is async for the Redis store; with the local store used
+    here it's a plain dict lookup, asyncio.run just lets a sync test call it."""
     return asyncio.run(rules_engine._on_cooldown(key))
 
 

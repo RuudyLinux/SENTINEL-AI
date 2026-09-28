@@ -14,11 +14,9 @@ export default function AlertsPage() {
   const params = useSearchParams();
   const [severity, setSeverity] = useState("ALL");
 
-  // Scoped by camera SERVER-side. This page used to fetch the 200 most recent
-  // alerts system-wide and filter by camera in the browser, so a camera whose
-  // alerts were not among those 200 showed an empty list — indistinguishable
-  // from a camera with no alerts. Severity stays a client-side filter over the
-  // scoped set so the counters below can show every severity at once.
+  // Filtered by camera on the server. Filtering the 200 newest system-wide in
+  // the browser showed an empty list for a camera with older alerts. Severity
+  // stays client side so the counters can show every severity.
   const cameraFilter = params.get("camera_id");
   const alertsPath = cameraFilter ? `/api/alerts?camera_id=${encodeURIComponent(cameraFilter)}` : "/api/alerts";
   const { data: alertsData, error, reload } = useApiData<any[]>(alertsPath, { pollMs: 5000 });

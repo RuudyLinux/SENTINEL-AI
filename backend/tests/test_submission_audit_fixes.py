@@ -1,11 +1,10 @@
-"""Regressions for the defects found in the final submission audit.
+"""Regressions for the final audit findings.
 
-1. A resource token (evidence file / package / camera stream) was accepted as
-   a full session token by every authenticated endpoint and by /ws.
-2. The Auditor role — "audit-log and compliance visibility" — could
-   acknowledge, dismiss and escalate alerts, open/assign/close incidents, and
-   accept/correct/reject plate reads.
-3. Disabling a watchlist_plate or zone_entry rule did not stop its alerts.
+1. Resource tokens (evidence file/package, stream) were accepted as full
+   session tokens by every endpoint and /ws.
+2. The Auditor role could ack/dismiss/escalate alerts, open/assign/close
+   incidents and accept/correct/reject plate reads.
+3. Disabling a watchlist_plate or zone_entry rule didn't stop its alerts.
 """
 import asyncio
 import uuid
@@ -16,6 +15,14 @@ import pytest
 from app import models
 from app.pipeline import rules_engine
 from app.security import create_access_token, create_resource_token, hash_password
+
+
+@pytest.fixture(autouse=True)
+def _one_frame_zone_entry(monkeypatch):
+    # these tests fire a zone alert from one tracked frame; the multi-frame
+    # confirmation has its own tests in test_zone_alert_accuracy.py
+    from app.config import settings as _settings
+    monkeypatch.setattr(_settings, "zone_entry_min_frames", 1)
 
 
 def _auth(token: str) -> dict:

@@ -1,12 +1,8 @@
-"""Optional SSRF egress policy (workstream C3) — pipeline/egress_policy.py.
+"""Optional SSRF egress policy (pipeline/egress_policy.py).
 
-`docs/THREAT_MODEL.md` recorded camera SSRF as role-gated only, with no
-private-IP blocklist. This is that blocklist, opt-in so it cannot break
-deployments whose cameras legitimately live on private ranges.
-
-The tests cover both directions deliberately: that the policy blocks what it
-claims to when enabled, and — just as important — that it changes NOTHING
-while disabled, which is the default every existing deployment runs.
+Opt-in so deployments with cameras on private ranges keep working. Tests
+both that it blocks what it should when on, and that it changes nothing when
+off, the default.
 """
 import pytest
 
@@ -47,9 +43,8 @@ class TestBlockedTargets:
         ("rtsp://192.168.1.20:554/stream", "private"),
         ("rtsp://172.16.4.4:554/stream", "private"),
         ("rtsp://169.254.169.254/latest/meta-data/", "link-local"),
-        # Python's ipaddress puts 0.0.0.0/8 in the PRIVATE set, so this is
-        # caught by the private check before reaching the unspecified one.
-        # Blocked either way, which is what matters.
+        # ipaddress counts 0.0.0.0/8 as private, so the private check catches
+        # it first. blocked either way
         ("rtsp://0.0.0.0:554/stream", "private"),
         ("rtsp://224.0.0.1:554/stream", "reserved, multicast or unspecified"),
     ])
@@ -61,12 +56,9 @@ class TestBlockedTargets:
 
 class TestAllowedTargets:
     def test_a_public_address_is_allowed(self, policy_on):
-        """A literal global address, so no DNS lookup happens during the test.
-
-        NOT a documentation range (203.0.113.0/24 etc): Python's `ipaddress`
-        classifies those as PRIVATE, so they are correctly blocked by this
-        policy and cannot stand in for a public camera.
-        """
+        """Literal global address, no DNS during the test. Not a documentation
+        range like 203.0.113.0/24: ipaddress calls those private, so they'd be
+        blocked."""
         assert blocked_reason("rtsp", "rtsp://8.8.8.8:554/stream") is None
 
     @pytest.mark.parametrize("source_type,uri", [
@@ -75,32 +67,26 @@ class TestAllowedTargets:
         ("mock_vms", ""),
     ])
     def test_non_network_sources_are_not_policed(self, policy_on, source_type, uri):
-        """A file on disk or a local capture device reaches no network, so
-        there is nothing for an egress policy to decide."""
+        """A file or local device reaches no network, nothing to decide."""
         assert blocked_reason(source_type, uri) is None
 
     def test_a_uri_with_no_extractable_host_is_not_blocked(self, policy_on):
-        """It names no target to connect to; the existing open-timeout path
-        already handles it, and blocking here would be a confusing error."""
+        """No target to connect to; the open timeout handles it."""
         assert blocked_reason("rtsp", "not a url at all !!!") is None
         assert blocked_reason("rtsp", "") is None
 
     def test_an_unresolvable_hostname_is_not_blocked(self, policy_on):
-        """Resolution failure yields nothing to judge. The connection attempt
-        will fail on its own, bounded by the open timeout."""
+        """Resolution failed, nothing to judge; the connect fails on its own."""
         assert blocked_reason("rtsp", "rtsp://nonexistent.invalid:554/s") is None
 
 
 class TestEnforcedAtTheEndpoints:
-    """The policy function is only useful if it is actually consulted. Both
-    call sites are covered: the probe endpoint AND camera registration —
-    gating only the probe would leave the same reach available by simply
-    skipping the probe and registering the camera, whose worker opens the
-    stream moments later.
+    """Both call sites consult it: the probe and camera registration.
+    Gating only the probe would let you skip it and register the camera,
+    whose worker opens the stream right after.
 
-    Only the BLOCKED paths are exercised over HTTP. They return 400 before
-    any connection is attempted or any worker is started, so these stay fast
-    and cannot leave a background RTSP task running in the suite.
+    Only blocked paths go over HTTP; they 400 before any connection or
+    worker, so they're fast and leave nothing running.
     """
 
     def _auth(self, admin_token):
@@ -135,22 +121,14 @@ class TestEnforcedAtTheEndpoints:
         assert db_session.query(models.Camera).filter(models.Camera.camera_code == code).count() == 0
 
     def test_a_non_network_camera_is_unaffected_by_the_policy(self, client, admin_token, db_session, policy_on):
-        """A camera that reaches no network must register normally even with
-        the policy at its strictest.
+        """A no-network camera registers fine with the policy at its strictest.
 
-        Uses `mock_vms`, NOT `video_file`. The first version of this test
-        registered a real video_file camera pointing at the bundled clip, and
-        `create_camera` starts a worker for it — a live FFmpeg decode with no
-        teardown. That reproducibly aborted the whole test process a moment
-        later with
+        mock_vms, not video_file. With video_file create_camera starts a live
+        FFmpeg decode with no teardown, and about 1 run in 3 died with
 
             Assertion fctx->async_lock failed at libavcodec/pthread_frame.c:178
 
-        (pytest exit 3, no traceback, ~1 run in 3), which is exactly the
-        hazard tests/conftest.py's `client` fixture comment documents: API
-        route tests have no business starting real camera AI workers.
-        `mock_vms` is equally non-network, so it proves the same property
-        without decoding anything.
+        (exit 3, no traceback), the hazard conftest's client fixture is about.
         """
         import uuid
 

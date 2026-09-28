@@ -1,14 +1,9 @@
-"""Frame drawing and snapshot/row helpers, extracted from worker.py.
+"""Frame drawing, snapshots and row capture/restore, split out of worker.py.
 
-Four small, generic functions with no camera-loop state of their own --
-each takes exactly the frame/row/values it operates on and returns a
-result, nothing implicit. `_draw_boxes` and `_save_snapshot` work on a raw
-frame; `_snapshot_attrs`/`_restore_row` are the capture/restore halves of
-the "reassign these fields after a rollback expired them" pattern used
-throughout the ANPR and correlation retry paths (see worker.py's own
-_PLATE_REAPPLY_FIELDS/_TRACK_REAPPLY_FIELDS for why that pattern exists --
-those field lists stayed in worker.py, next to the code that actually uses
-them, rather than following these generic helpers here).
+_draw_boxes and _save_snapshot work on a raw frame. _snapshot_attrs and
+_restore_row are the two halves of "reassign fields after rollback expired
+them" used by the ANPR/correlation retries; the field lists stay in worker.py
+next to their users.
 """
 from datetime import datetime, timezone
 from typing import Any

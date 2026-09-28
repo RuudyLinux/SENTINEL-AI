@@ -1,22 +1,14 @@
-"""Vehicle.plate_corroborated — A1 precision hardening.
+"""vehicles.plate_corroborated.
 
-Records whether a vehicle's plate has ever been corroborated across frames, so a
-watchlist match can require BOTH a confident read and multi-frame agreement
-before escalating to CRITICAL.
+Whether a vehicle's plate was ever corroborated across frames, so a
+watchlist match needs a confident read AND multi-frame agreement for
+CRITICAL. Its own column because confidence doesn't separate right from
+wrong reads on the benchmark (docs/ANPR_ACCURACY.md, "A1": correct
+0.262-0.990, wrong 0.260-0.956).
 
-Why a separate column rather than deriving it from confidence: measured on the
-labelled benchmark (docs/ANPR_ACCURACY.md, "A1"), OCR confidence does NOT
-separate correct reads from wrong ones. Correct reads span 0.262-0.990; wrong
-plate-shaped reads span 0.260-0.956, and six of seven wrong reads sit at or
-above the lowest correct read's confidence. Corroboration is independent
-evidence, and blending the two would destroy exactly the distinction this column
-exists to preserve.
-
-NULLABLE with NO backfill, deliberately. Existing rows were written by a
-pipeline that escalated on confidence alone; marking them corroborated would
-assert evidence that was never gathered. NULL reads as "not corroborated", which
-caps those vehicles' watchlist alerts at HIGH until a fresh corroborated
-sighting arrives — the safe direction for a missing safety signal.
+Nullable, no backfill. Old rows escalated on confidence alone; NULL = not
+corroborated, which caps their watchlist alerts at HIGH until a fresh
+corroborated sighting.
 
 Revision ID: 7c4a1f0b9e23
 Revises: 3b1e7c9d4a02

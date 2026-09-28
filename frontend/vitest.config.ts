@@ -1,9 +1,7 @@
 import { defineConfig } from "vitest/config";
 
 /**
- * Unit tests only. `e2e/` is Playwright's — it drives a real browser against a
- * running stack and cannot execute under vitest, so collecting it here just
- * produces a confusing failure in an unrelated test run.
+ * Unit tests only. e2e/ is Playwright's and can't run under vitest.
  */
 export default defineConfig({
   test: {

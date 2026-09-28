@@ -1,24 +1,18 @@
-"""End-to-end coherence of the V2 plate pipeline.
+"""The V2 plate pipeline end to end.
 
-The unit tests cover each stage in isolation. This drives the REAL chain in
-`worker._run_anpr` and asserts the stages actually compose:
+Drives the real worker._run_anpr chain and checks the stages compose:
 
     vehicle detection -> ByteTrack id -> plate localization -> OCR
       -> vote/aggregate -> vehicle identity -> sighting row -> cross-camera route
 
-Only the two genuinely external things are faked — the plate DETECTOR and the
-OCR ENGINE — because a real EasyOCR pass on a synthetic frame measures nothing.
-Everything between and after them is the real code: cropping the detected region
-out, perspective correction, preprocessing variants, offsetting the box to
-full-frame, the whole-crop fallback, track association, voting, the persistence
-gate, sighting dedup and route reconstruction.
+Only the plate detector and the OCR engine are faked (real EasyOCR on a
+synthetic frame measures nothing). Cropping, perspective correction,
+variants, full-frame offsets, whole-crop fallback, track association,
+voting, the persistence gate, sighting dedup and routes are real.
 
-That boundary is deliberate and is itself under test. Faking
-`worker._read_plate_for_track` instead would be faking production code, and the
-original defect this pipeline exists to fix — OCR being handed the entire
-vehicle crop rather than a plate region — would then pass unnoticed. See
-`TestOcrReceivesThePlateNotTheVehicle`, which asserts on the image OCR actually
-received.
+Faking _read_plate_for_track instead would fake production code and let the
+original bug (OCR handed the whole vehicle crop) pass.
+TestOcrReceivesThePlateNotTheVehicle checks the image OCR actually got.
 """
 import itertools
 import asyncio
@@ -69,27 +63,20 @@ def _detection(track_id: int = 284) -> dict:
     return {"cls": "car", "confidence": 0.88, "bbox": [10.0, 10.0, 200.0, 180.0], "track_id": track_id}
 
 
-# The plate's position INSIDE the vehicle crop, and the vehicle box's origin in
-# the frame. Kept as module constants because two things must agree on them: the
-# stubbed detector below, and the full-frame `plate_bbox` the sighting is
-# asserted to store.
+# plate position inside the vehicle crop, and the vehicle box origin in the
+# frame. shared by the stub detector and the expected full-frame plate_bbox
 _PLATE_BOX_IN_CROP = (40, 120, 150, 150)
 _VEHICLE_ORIGIN = (10, 10)
 
 
 def _stub_detection_and_ocr(monkeypatch, text: str, confidence: float, seen=None):
-    """Stub the two REAL external dependencies — the plate detector and the OCR
-    engine — and nothing else.
+    """Stub only the plate detector and the OCR engine.
 
-    Deliberately NOT stubbing `worker._read_plate_for_track`: that is production
-    code, and everything it does (cropping the detected region out, perspective
-    correction, building preprocessing variants, offsetting the box to
-    full-frame, the whole-crop fallback) would then go uncovered. Stubbing there
-    would let the original defect this pipeline exists to fix — OCR being handed
-    the entire vehicle crop — pass these tests unnoticed.
+    Not _read_plate_for_track: that's production code (cropping, warping,
+    variants, offsets, fallback), and stubbing it would let OCR get the
+    whole vehicle crop unnoticed.
 
-    `seen`, when given, collects the images OCR actually received, so a test can
-    assert on WHAT was read rather than only on what came back.
+    `seen` collects the images OCR received, so tests can check what was read.
     """
     x1, y1, x2, y2 = _PLATE_BOX_IN_CROP
     box = worker.plate_detector.PlateBox(
@@ -109,12 +96,9 @@ def _stub_detection_and_ocr(monkeypatch, text: str, confidence: float, seen=None
 
 
 def _drive(db_session, monkeypatch, camera, frame, reads, track_id: int = 284):
-    """Feed a sequence of (text, confidence) OCR results through the real
-    pipeline, one per inference cycle, as if the vehicle stayed in frame.
-
-    Only the detector and the OCR engine are stubbed — see
-    `_stub_detection_and_ocr`. Localization geometry, preprocessing, the
-    persistence gate, voting and sighting cardinality are all real code here.
+    """Run (text, confidence) OCR results through the real pipeline, one per
+    cycle, as if the vehicle stayed in frame. Only detector and OCR are
+    stubbed (_stub_detection_and_ocr).
     """
     # Always re-OCR, so every scripted read is actually consumed rather than
     # being skipped by the stability throttle.
@@ -134,13 +118,10 @@ def _drive(db_session, monkeypatch, camera, frame, reads, track_id: int = 284):
     return results
 
 
-# Unique-per-test plate texts. These tests assert on COUNTS of Vehicle/Plate
-# rows for a given plate ("exactly one vehicle", "no phantom vehicle"), and the
-# suite shares one on-disk database — so a hardcoded literal makes the result
-# depend on whether some other test happened to create that plate first. Caught
-# by the --random-order gate: under alphabetical ordering these passed purely
-# by luck of scheduling. Numbered in the 3xxx range to stay clear of the
-# GJ05AB1234 literal other modules use, and shaped to satisfy PLATE_RE.
+# Unique plate per test. These assert on row counts per plate and the suite
+# shares one DB, so a fixed literal depends on whether another test made that
+# plate first; --random-order caught it. 3xxx range to stay clear of
+# GJ05AB1234, shaped to match PLATE_RE.
 _plate_counter = itertools.count(3000)
 
 
@@ -150,8 +131,8 @@ def _fresh_plate() -> str:
 
 class TestPipelineCoherence:
     def test_the_full_chain_produces_one_vehicle_and_one_sighting(self, db_session, monkeypatch, frame):
-        """Four OCR frames of the SAME tracked vehicle are one sighting of one
-        vehicle — not four vehicles, and not four route hops."""
+        """Four frames of one tracked vehicle are one sighting of one vehicle,
+        not four vehicles or four hops."""
         camera = _camera(db_session, "INT-C1")
         plate = _fresh_plate()
         results = _drive(db_session, monkeypatch, camera, frame, [
@@ -169,17 +150,14 @@ class TestPipelineCoherence:
         assert sighting.confidence == pytest.approx(0.94), "the sighting records the PEAK read"
         assert sighting.reads_count == 4, "all four corroborating reads are counted"
         assert sighting.track_id == "284", "the ByteTrack id is carried into the sighting"
-        # The localizer works in the VEHICLE CROP's coordinate space; the stored
-        # bbox is full-frame, offset by the vehicle box origin (10, 10). Asserted
-        # explicitly because a bbox in the wrong space draws a plate marker in
-        # the wrong place on an evidence image.
+        # localizer works in crop coords; stored bbox is full frame, offset by
+        # the vehicle origin (10, 10)
         assert sighting.plate_bbox == [50.0, 130.0, 160.0, 160.0]
         assert sighting.vehicle_class == "car"
         assert all(r[0] is not None for r in results)
 
     def test_a_single_bad_frame_cannot_replace_an_established_plate(self, db_session, monkeypatch, frame):
-        """The headline guarantee, asserted against the PERSISTED row rather
-        than the in-memory tally."""
+        """Checked on the persisted row, not the in-memory tally."""
         camera = _camera(db_session, "INT-C2")
         plate = _fresh_plate()
         misread = _fresh_plate()  # a DIFFERENT valid plate: the outlier read
@@ -188,9 +166,7 @@ class TestPipelineCoherence:
             (misread, 0.95),  # one high-confidence misread
         ])
 
-        # Scoped by camera: ByteTrack ids are only unique per camera, so a
-        # query on track_id alone would also match another camera's track 284 —
-        # exactly the ambiguity the pipeline's (camera, track) keying avoids.
+        # by camera too, track ids are only unique per camera
         plates = db_session.query(models.Plate).filter(
             models.Plate.camera_id == camera.id, models.Plate.track_id == "284",
         ).all()
@@ -201,8 +177,7 @@ class TestPipelineCoherence:
         ).first() is None, "a single outlier read must not create a phantom vehicle"
 
     def test_tracking_continues_while_the_vehicle_stays_visible(self, db_session, monkeypatch, frame):
-        """The sighting is extended, not duplicated, as the vehicle remains in
-        frame — last_seen advances so dwell time stays truthful."""
+        """Extended, not duplicated, while the car stays; last_seen advances."""
         camera = _camera(db_session, "INT-C3")
         _drive(db_session, monkeypatch, camera, frame, [("GJ05CD1111", 0.80)])
         first = db_session.query(models.Plate).filter(models.Plate.plate_text_normalized == "GJ05CD1111").one()
@@ -219,8 +194,7 @@ class TestPipelineCoherence:
         assert first.reads_count == 3
 
     def test_a_track_row_links_the_bytetrack_id_to_the_vehicle(self, db_session, monkeypatch, frame):
-        """models.Track was dead schema before V2. Track 284 IS GJ05AB1234 must
-        be a stored, queryable fact."""
+        """"Track 284 is GJ05AB1234" is a stored, queryable fact."""
         camera = _camera(db_session, "INT-C4")
         _drive(db_session, monkeypatch, camera, frame, [("GJ05EF2222", 0.9), ("GJ05EF2222", 0.92)])
         vehicle = db_session.query(models.Vehicle).filter(models.Vehicle.plate_text == "GJ05EF2222").one()
@@ -240,9 +214,8 @@ class TestCrossCameraRoute:
     def test_the_same_plate_on_two_cameras_is_one_vehicle_with_a_two_hop_journey(
         self, db_session, monkeypatch, frame,
     ):
-        """Cross-camera identity: the plate is the join key, so the second
-        camera extends the SAME vehicle's journey rather than creating a new
-        vehicle."""
+        """The plate is the join key: the second camera extends the same
+        vehicle's journey."""
         cam_a = _camera(db_session, "INT-R1", lat=23.02, lng=72.57)
         cam_b = _camera(db_session, "INT-R2", lat=23.07, lng=72.65)
 
@@ -275,15 +248,13 @@ class TestCrossCameraRoute:
         assert summary["total_sightings"] == 2
         assert summary["first_seen"] is not None and summary["last_seen"] is not None
         assert summary["last_seen"] >= summary["first_seen"]
-        # Just written, so it is genuinely live — and the score must add up.
+        # just written, so live, and the score adds up
         assert summary["is_live"] is True
         assert summary["risk_score"] == sum(f["points"] for f in summary["risk_factors"])
 
     def test_a_route_carries_no_position_between_cameras(self, db_session, monkeypatch, frame):
-        """Honesty check: the route is a reconstructed camera-to-camera journey.
-        Every hop must be an OBSERVATION at a camera — there must be no
-        interpolated position, heading or speed field implying the system knows
-        where the vehicle went in between."""
+        """Every hop is an observation at a camera. No interpolated position,
+        heading or speed implying we know what happened in between."""
         camera = _camera(db_session, "INT-H1")
         _drive(db_session, monkeypatch, camera, frame, [("GJ05KL5555", 0.9)], track_id=31)
         vehicle = db_session.query(models.Vehicle).filter(models.Vehicle.plate_text == "GJ05KL5555").one()
@@ -300,9 +271,8 @@ class TestCrossCameraRoute:
 
 class TestLegacyPathPreserved:
     def test_a_detection_with_no_track_id_still_records_a_sighting(self, db_session, monkeypatch, frame):
-        """ByteTrack does not assign an id on an object's first frames. That
-        read must still be persisted, via the pre-V2 whole-crop path, rather
-        than being dropped for lack of a track."""
+        """No track id yet on an object's first frames; the read still goes
+        through the old whole-crop path instead of being dropped."""
         camera = _camera(db_session, "INT-L1")
         monkeypatch.setattr(worker, "read_plate", lambda crop: ("GJ05MN6666", "GJ05MN6666", 0.9))
         monkeypatch.setattr(worker, "_save_snapshot", lambda f, prefix: "/evidence/x.jpg")
@@ -319,8 +289,7 @@ class TestLegacyPathPreserved:
         assert plate_row.track_id is None, "no track id is recorded as null, never invented"
 
     def test_the_v2_switch_restores_per_frame_behaviour(self, db_session, monkeypatch, frame):
-        """PLATE_PIPELINE_V2=false is a real escape hatch: back to one Plate row
-        per passing OCR frame."""
+        """PLATE_PIPELINE_V2=false: one Plate row per passing frame again."""
         camera = _camera(db_session, "INT-L2")
         monkeypatch.setattr(worker.settings, "plate_pipeline_v2", False)
         monkeypatch.setattr(worker, "read_plate", lambda crop: ("GJ05OP7777", "GJ05OP7777", 0.9))
@@ -339,14 +308,9 @@ class TestLegacyPathPreserved:
 
 
 class TestOcrReceivesThePlateNotTheVehicle:
-    """The wiring these tests exist to protect.
-
-    The defect this whole pipeline was built to fix is OCR being handed the
-    WHOLE VEHICLE CROP — a car, complete with bumper stickers and dealer badges
-    — instead of a plate region. That is a wiring property: it lives between the
-    detector and the OCR call, in `_read_plate_for_track`. Stubbing that function
-    would make these assertions impossible, which is why the suite stubs the
-    detector and the OCR engine on either side of it instead.
+    """OCR must get a plate region, not the whole vehicle crop (bumper
+    stickers, dealer badges and all). That lives in _read_plate_for_track,
+    which is why the stubs sit on either side of it.
     """
 
     def test_ocr_is_given_the_localized_plate_region(self, db_session, monkeypatch, frame):
@@ -364,11 +328,9 @@ class TestOcrReceivesThePlateNotTheVehicle:
         variants = seen[0]
         assert variants, "OCR was handed no image at all"
         _name, image = variants[0]
-        # Asserted on SHAPE, not size: the plate crop is upscaled to a readable
-        # glyph height before OCR, so it can legitimately end up wider in pixels
-        # than the vehicle crop it came from. What it cannot be is vehicle-SHAPED.
-        # The vehicle crop is 190x170 (aspect ~1.1); the detected plate region is
-        # 110x30 (aspect ~3.7), and upscaling preserves that ratio.
+        # Shape, not size: the plate crop gets upscaled and can end up wider
+        # than the vehicle crop. It can't be vehicle-shaped though: vehicle
+        # 190x170 (~1.1), plate 110x30 (~3.7), upscaling keeps the ratio.
         vehicle_height, vehicle_width = frame[10:180, 10:200].shape[:2]
         vehicle_aspect = vehicle_width / vehicle_height
         image_aspect = image.shape[1] / image.shape[0]
@@ -380,9 +342,8 @@ class TestOcrReceivesThePlateNotTheVehicle:
     def test_a_localization_miss_falls_back_to_the_whole_vehicle_crop(
         self, db_session, monkeypatch, frame,
     ):
-        """A miss must degrade the read, never drop it — and the sighting must
-        record `plate_bbox = NULL` rather than a box describing a region the
-        read did not come from."""
+        """A miss degrades the read, doesn't drop it, and stores plate_bbox =
+        NULL rather than a box the read didn't come from."""
         camera = _camera(db_session, "INT-W2")
         plate = _fresh_plate()
         seen: list = []
@@ -414,9 +375,7 @@ class TestOcrReceivesThePlateNotTheVehicle:
     def test_the_stored_plate_box_is_in_full_frame_coordinates(
         self, db_session, monkeypatch, frame,
     ):
-        """The localizer works in the vehicle crop's space; the stored box must
-        be offset to the frame, or an evidence image draws the plate marker in
-        the wrong place."""
+        """Box offset to the frame, or evidence draws the marker in the wrong place."""
         camera = _camera(db_session, "INT-W3")
         plate = _fresh_plate()
         _stub_detection_and_ocr(monkeypatch, plate, 0.9)
@@ -437,18 +396,11 @@ class TestOcrReceivesThePlateNotTheVehicle:
 
 
 class TestPersistenceScenarios:
-    """The persistence gate, asserted against PERSISTED ROWS rather than the
-    in-memory tally.
+    """The persistence gate, checked on persisted rows.
 
-    The behavior under test: a plate becomes TRUSTED intelligence only once
-    enough independent frames agree on it. Before this gate, the first
-    gate-passing read created a durable Vehicle identity — one lucky frame, one
-    plate-shaped-but-wrong read clearing the confidence floor, and the system
-    held a vehicle that was never there.
-
-    What the gate must NOT do is discard real observations: a vehicle crossing
-    frame in a single inference cycle gets exactly one read and will never get
-    another.
+    A plate is trusted once enough frames agree; the first passing read used
+    to create a vehicle outright. A car seen in one cycle still gets its one
+    read kept.
     """
 
     def _sighting(self, db_session, plate_text):
@@ -459,9 +411,8 @@ class TestPersistenceScenarios:
         )
 
     def test_one_strong_read_is_recorded_but_not_trusted(self, db_session, monkeypatch, frame):
-        """A single 0.95 read is a real observation and is kept — but it is NOT
-        corroborated, so it goes to the review queue instead of being presented
-        as a settled vehicle identity."""
+        """One 0.95 read is kept but not corroborated, so it goes to review
+        instead of becoming a settled identity."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-P1")
         plate = _fresh_plate()
@@ -486,9 +437,8 @@ class TestPersistenceScenarios:
         assert sighting.reads_count == 2
 
     def test_two_conflicting_reads_reach_no_consensus(self, db_session, monkeypatch, frame):
-        """Two frames reading two DIFFERENT plates is not two observations of
-        one plate — it is a track the system is confused about, and neither
-        candidate may be promoted to trusted."""
+        """Two different plates on one track isn't two observations; neither
+        gets promoted."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-P3")
         first, second = _fresh_plate(), _fresh_plate()
@@ -521,8 +471,7 @@ class TestPersistenceScenarios:
     def test_require_consensus_withholds_an_uncorroborated_read_entirely(
         self, db_session, monkeypatch, frame,
     ):
-        """Strict mode: the operator has chosen to hold nothing uncorroborated.
-        No Vehicle, no Plate — not even a pending_review one."""
+        """Strict mode: nothing uncorroborated at all, not even pending_review."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         monkeypatch.setattr(worker.settings, "plate_require_consensus", True)
         camera = _camera(db_session, "INT-P5")
@@ -537,8 +486,7 @@ class TestPersistenceScenarios:
     def test_min_observations_one_restores_the_previous_behaviour(
         self, db_session, monkeypatch, frame,
     ):
-        """The escape hatch is real: one env var returns the pre-gate behavior
-        of persisting a trusted plate on the first passing read."""
+        """One env var brings back persisting on the first passing read."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 1)
         camera = _camera(db_session, "INT-P6")
         plate = _fresh_plate()
@@ -552,8 +500,7 @@ class TestPersistenceScenarios:
     def test_repeated_low_confidence_garbage_never_persists(
         self, db_session, monkeypatch, frame,
     ):
-        """Consistency is not correctness. Five identical reads below the
-        confidence floor are five failures, not corroboration."""
+        """Five identical reads under the floor are five failures, not agreement."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-P7")
         plate = _fresh_plate()
@@ -567,8 +514,8 @@ class TestPersistenceScenarios:
     def test_a_plate_shaped_read_with_an_impossible_state_code_never_persists(
         self, db_session, monkeypatch, frame,
     ):
-        """`QQ00QQ0000` satisfies the format regex at high confidence. Only the
-        state-code check stops it becoming a vehicle record."""
+        """QQ00QQ0000 passes the regex at high confidence; only the state
+        code check stops it."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-P8")
         _drive(db_session, monkeypatch, camera, frame, [("QQ00QQ0000", 0.97)] * 3)
@@ -580,16 +527,14 @@ class TestPersistenceScenarios:
 
 
 class TestConsensusStateIsolation:
-    """Consensus must never leak between vehicles. Two ways it could: the same
-    ByteTrack id on two cameras, and a track id reused after the original
-    vehicle left."""
+    """Votes never leak between vehicles: same track id on two cameras, or
+    a track id reused after the first car left."""
 
     def test_the_same_track_id_on_two_cameras_is_two_vehicles(
         self, db_session, monkeypatch, frame,
     ):
-        """ByteTrack ids are only unique per model instance, and detector.py
-        keeps one instance PER CAMERA — so track 284 on C1 and track 284 on C2
-        are unrelated objects and must not pool votes."""
+        """Track ids are per model instance, one per camera, so 284 on C1 and
+        284 on C2 are unrelated."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         first_camera = _camera(db_session, "INT-I1")
         second_camera = _camera(db_session, "INT-I2")
@@ -612,18 +557,15 @@ class TestConsensusStateIsolation:
     def test_a_reused_track_id_does_not_inherit_the_previous_vehicles_votes(
         self, db_session, monkeypatch, frame,
     ):
-        """A track id that retired and was later reissued to a different vehicle
-        must start from nothing. The TTL prune is what guarantees it — ByteTrack
-        never announces that a track ended."""
+        """A reissued track id starts from nothing; the TTL prune makes sure."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-I3")
         departed, arrived = _fresh_plate(), _fresh_plate()
 
         _drive(db_session, monkeypatch, camera, frame, [(departed, 0.9)], track_id=284)
 
-        # The first vehicle leaves: its track goes stale and is pruned. Aged
-        # directly rather than by sleeping — time.monotonic() has ~15.6ms
-        # granularity on Windows, so a short real sleep can measure as zero.
+        # first vehicle leaves and its track is pruned. aged directly, not by
+        # sleeping: monotonic is ~15.6ms granular on Windows
         state = plate_tracker.get(str(camera.id), "284")
         state.last_seen_mono -= worker.settings.plate_track_ttl_seconds + 1.0
         plate_tracker.touch(str(camera.id), "999")  # any touch triggers the sweep
@@ -640,10 +582,9 @@ class TestConsensusStateIsolation:
         assert result.competing_text is None
 
     def test_stopping_a_camera_drops_its_consensus_state(self, db_session, monkeypatch, frame):
-        """`release_camera` is called from `stop_worker` alongside
-        `release_model`, which restarts ByteTrack's id sequence — so the votes
-        must go at the same moment the ids do, or a restarted camera's track 1
-        would inherit the previous session's track 1."""
+        """release_camera runs with release_model, which restarts ByteTrack's
+        ids, so votes go at the same time or a restarted camera's track 1
+        inherits the old track 1."""
         monkeypatch.setattr(worker.settings, "plate_min_observations", 2)
         camera = _camera(db_session, "INT-I4")
         plate = _fresh_plate()

@@ -14,9 +14,8 @@ export default function AiRulesPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Same double-submit guard as the watchlist and camera forms: without it a
-  // rapid second click fires a second POST, and this endpoint has no natural
-  // key to collide on, so the duplicate lands as a second identical rule.
+  // double-submit guard like the other forms; nothing here to collide on, so
+  // a second click would just make a second identical rule
   async function create(e: React.FormEvent) {
     e.preventDefault();
     if (busy) return;

@@ -1,33 +1,18 @@
-"""Per-track plate identity: temporal aggregation, confidence voting, OCR gating.
+"""Per-track plate identity: votes across frames, and when to run OCR.
 
-Fixes three related problems in the original pipeline at once:
+Ties a ByteTrack track to the plate read off it, so one bad frame can't
+overwrite a good result, and so a car sitting at a signal updates one Plate
+row instead of adding one per cycle (get_route() builds journeys from those
+rows, so that used to mean dozens of fake hops).
 
-1. **No vehicle-track <-> plate association.** `Detection.track_id` was
-   persisted, but nothing carried it into the ANPR path, so ByteTrack's track
-   284 and the plate GJ05AB1234 read off it were never tied together. Every
-   passing OCR frame was an independent event.
-
-2. **No temporal aggregation.** One bad OCR frame could overwrite a reliable
-   result, because there was no "result" — only the latest read.
-
-3. **Unbounded Plate row growth.** A vehicle stopped at a signal produced one
-   Plate row per inference cycle for as long as it sat there. Since
-   `correlate.get_route()` builds a vehicle's cross-camera journey FROM Plate
-   rows, that turned a single sighting into dozens of identical route hops.
-
-The model is one accumulator per `(camera_id, track_id)`. Reads vote; the
-winner is decided by summed confidence (so four consistent mid-confidence reads
-beat one lucky high-confidence outlier), and the *reported* confidence is the
-winner's PEAK observed confidence, which is the honest answer to "how well did
-we ever actually read this plate":
+One accumulator per (camera_id, track_id). Reads vote by summed confidence,
+so four steady mid-confidence reads beat one lucky outlier. Reported
+confidence is the winner's peak:
 
     GJ05AB1234 @ 0.72, 0.91, 0.94, 0.89  ->  GJ05AB1234 @ 0.94, 4 reads
 
-State is process-local and in-memory, keyed and pruned exactly like
-`rules_engine._zone_presence` / `_last_alert_at` — the same convention already
-used for per-track state in this codebase. It is a cache, never a system of
-record: the durable answer is the Plate/Vehicle row it produces, so losing this
-on restart costs re-OCR, not data.
+In-memory and per-process, pruned like rules_engine._zone_presence. It's a
+cache; the Plate/Vehicle rows are the record, so a restart only costs re-OCR.
 """
 import time
 from dataclasses import dataclass, field
@@ -40,22 +25,16 @@ class _Vote:
     summed_confidence: float = 0.0
     peak_confidence: float = 0.0
     reads: int = 0
-    # The most recent raw (un-normalized) OCR string that normalized to this
-    # text. Kept for the audit trail — Plate.plate_text_raw records what OCR
-    # literally returned, not only what we cleaned it up to.
+    # latest raw OCR string that normalized to this text, for plate_text_raw
     raw: str = ""
-    # Which preprocessing variant produced the most recent read of this text,
-    # and how many variants agreed on it. Provenance for the audit trail: the
-    # two are stored separately from confidence and are never folded into it.
+    # provenance of the latest read of this text; never folded into confidence
     variant: str = ""
     variants_agreeing: int = 1
 
 
 @dataclass(frozen=True)
 class Consensus:
-    """Temporal evidence for one tracked vehicle's plate. See
-    `TrackPlateState.consensus` for what each field means and why they are not
-    combined into a single number."""
+    """Temporal evidence for one track's plate, see TrackPlateState.consensus."""
     text: str
     peak_confidence: float
     observations: int
@@ -66,12 +45,7 @@ class Consensus:
 
     @property
     def is_corroborated(self) -> bool:
-        """Whether enough independent frames agreed to treat this as settled.
-
-        Purely a count of agreeing observations against the configured
-        threshold — it does not consult confidence, because confidence is a
-        separate signal the caller weighs separately.
-        """
+        # count of agreeing frames only, confidence is weighed separately
         return self.observations >= settings.plate_min_observations
 
 
@@ -85,27 +59,20 @@ class TrackPlateState:
     last_seen_mono: float = field(default_factory=time.monotonic)
     last_ocr_mono: float = 0.0
     last_persist_mono: float = 0.0
-    # Where the plate was last localized, in FULL-FRAME pixel coordinates.
-    # None while OCR is still falling back to the whole vehicle crop.
+    # last plate location, full-frame pixels. None while OCR falls back to
+    # the whole vehicle crop
     last_plate_bbox: list[float] | None = None
-    # The plate crop image OCR last actually read, held only until the sighting
-    # row is written and its evidence saved. In-memory and per-track, bounded by
-    # the same TTL prune as the rest of this state — a plate crop is a few KB,
-    # and one per live track is the same order as the frame buffers the worker
-    # already holds.
+    # last crop OCR read, kept until the sighting's evidence is saved. a few
+    # KB per live track, pruned with the rest
     last_plate_crop: object | None = None
-    # Set once this track's Plate row exists, so subsequent frames UPDATE that
-    # row instead of inserting another one (problem 3 above).
+    # once set, later frames update this Plate row instead of inserting
     plate_row_id: str | None = None
     vehicle_id: str | None = None
-    # The models.Track row for this ByteTrack id. Written for every tracked
-    # vehicle, whether or not its plate is ever read — a vehicle we can follow
-    # but cannot identify is still real, trackable intelligence.
+    # models.Track row, written for every tracked vehicle, read plate or not
     track_row_id: str | None = None
     last_track_persist_mono: float = 0.0
-    # Text this track's Plate row was last written with — a change means the
-    # vote winner flipped and the row must be rewritten even if nothing else
-    # would have triggered a persist.
+    # text the Plate row was last written with; if the winner flips the row
+    # needs rewriting
     persisted_text: str | None = None
 
     def best(self) -> "tuple[str, float, int] | None":
@@ -117,24 +84,16 @@ class TrackPlateState:
         return text, vote.peak_confidence, vote.reads
 
     def consensus(self) -> "Consensus | None":
-        """The full temporal picture for this track, or None if nothing was read.
+        """Winning text plus the signals behind it, or None if nothing read.
 
-        Reports the winning text alongside every signal that decided it, kept
-        separate rather than collapsed into one score:
+        peak_confidence: best OCR confidence ever seen for the text.
+        observations / total_observations: agreeing passing reads vs all.
+        agreement: their ratio; 4 of 4 is stronger than 2 of 4 at the same
+        confidence. competing_*: the runner-up, so an operator can see what
+        the track was torn between.
 
-        - `peak_confidence` — the best the OCR engine ever actually reported for
-          this text. The honest answer to "how well did we ever read this".
-        - `observations` — how many gate-passing reads agreed on it.
-        - `total_observations` — how many gate-passing reads there were in all.
-        - `agreement` — observations / total_observations, i.e. how UNANIMOUS the
-          track's reads were. A plate read 4 times with 4 agreeing is stronger
-          evidence than one read 4 times with 2 agreeing and 2 saying something
-          else, even at identical confidence.
-        - `competing` — the runner-up text, if any, so an operator can see what
-          the track was confused between rather than only the winner.
-
-        Nothing here is multiplied into a fabricated probability. The gate
-        (`has_consensus`) reasons over the fields explicitly.
+        Not multiplied into a made-up probability; has_consensus looks at the
+        fields directly.
         """
         best = self.best()
         if best is None:
@@ -159,11 +118,8 @@ class TrackPlateState:
         return sum(v.reads for v in self.votes.values())
 
     def is_stable(self) -> bool:
-        """True once the winning read has enough corroboration to stop
-        re-OCRing this track every cycle. Requires both a minimum number of
-        agreeing reads AND a peak confidence above the stability floor — a
-        plate read four times at 0.36 each is consistent but not trustworthy,
-        and should keep being re-checked while the vehicle is still visible."""
+        """Enough agreeing reads AND a high enough peak to stop re-OCRing
+        every cycle. Four reads at 0.36 are consistent but not trustworthy."""
         best = self.best()
         if best is None:
             return False
@@ -180,9 +136,7 @@ def _key(camera_id: str, track_id: str) -> tuple[str, str]:
 
 
 def _prune(now_mono: float) -> None:
-    """Drop tracks not seen for longer than the TTL. ByteTrack retires a track
-    id when the object leaves frame and never tells us, so this is the only
-    thing bounding the dict on a camera that has been running for days."""
+    # ByteTrack never says a track is gone, the TTL is what bounds this dict
     ttl = settings.plate_track_ttl_seconds
     stale = [k for k, s in _TRACKS.items() if now_mono - s.last_seen_mono > ttl]
     for k in stale:
@@ -190,7 +144,6 @@ def _prune(now_mono: float) -> None:
 
 
 def touch(camera_id: str, track_id: str) -> TrackPlateState:
-    """Mark a track as seen this frame, creating its accumulator if new."""
     now = time.monotonic()
     _prune(now)
     key = _key(camera_id, track_id)
@@ -203,17 +156,9 @@ def touch(camera_id: str, track_id: str) -> TrackPlateState:
 
 
 def should_ocr(camera_id: str, track_id: str) -> bool:
-    """Whether to spend an OCR pass on this track this frame.
-
-    This is the pipeline's main CPU saving. Previously every vehicle detection
-    on every inference cycle ran a full EasyOCR pass — by far the most
-    expensive operation in the loop. Now:
-
-    - a track with no confident plate yet is read every cycle (nothing to lose);
-    - a track with a stable plate is re-verified only every
-      `plate_reverify_seconds`, which catches a genuine mid-track correction
-      without paying for OCR on a car we have already read four times.
-    """
+    """Whether to spend an OCR pass on this track this frame. Main CPU saving
+    in the pipeline: unsettled tracks get read every cycle, stable ones only
+    every plate_reverify_seconds (still catches a mid-track correction)."""
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is None or not state.is_stable():
         return True
@@ -231,16 +176,10 @@ def record_read(
     variants_agreeing: int = 1,
     plate_crop=None,
 ) -> TrackPlateState:
-    """Add one gate-passing OCR read to this track's vote tally.
-
-    Only reads that already cleared the quality gate should reach here — voting
-    must not be polluted by reads the gate rejected, or a persistent misread of
-    a bumper sticker would out-vote the real plate.
-
-    `variant`/`variants_agreeing` are recorded as provenance for the audit
-    trail. They do NOT influence the vote weight: the vote is decided by summed
-    OCR confidence across frames, and letting cross-variant agreement also
-    inflate a frame's weight would count the same corroboration twice.
+    """Add one gate-passing read to the track's votes. Only gate-passing reads
+    belong here, or a steady misread of a bumper sticker could out-vote the
+    plate. variant/variants_agreeing are provenance and don't weight the vote
+    (that would count the same corroboration twice).
     """
     state = touch(camera_id, track_id)
     state.last_ocr_mono = time.monotonic()
@@ -261,57 +200,32 @@ def record_read(
 
 
 def consensus(camera_id: str, track_id: str) -> "Consensus | None":
-    """The temporal consensus for one track, or None if it has no reads."""
     state = _TRACKS.get(_key(camera_id, track_id))
     return state.consensus() if state is not None else None
 
 
 def has_consensus(camera_id: str, track_id: str) -> bool:
-    """Whether this track's plate has enough temporal evidence to be persisted
-    as a trusted sighting.
+    """Whether the plate has enough frames behind it to be a trusted sighting.
 
-    The behavior change this exists for: previously the FIRST gate-passing OCR
-    read created a Vehicle and a Plate row. One lucky frame — one
-    plate-shaped-but-wrong read clearing the confidence floor — became a durable
-    vehicle identity, and the benchmark says that class of read is real and
-    common (plate-shaped-but-wrong reads outnumber correct ones on the labelled
-    corpus). Requiring corroboration across frames is the defence the temporal
-    layer was built to provide, and it was not being used to gate persistence.
+    One plate-shaped but wrong read clearing the confidence floor used to
+    become a durable vehicle identity, and on the labelled corpus those reads
+    outnumber correct ones.
 
-    What "not enough evidence" does NOT mean here is "throw the read away". A
-    vehicle that crosses the frame inside a single inference cycle gets exactly
-    one read and will never get another; dropping it would lose a real sighting
-    to protect against a hypothetical one. So an uncorroborated read is still
-    persisted — as an UNTRUSTED observation, flagged `pending_review` by
-    `review_status_for` regardless of how confident that single read was, so it
-    reaches an operator instead of being presented as settled intelligence.
-
-    `settings.plate_require_consensus` turns this into a hard gate for
-    deployments that would rather lose the fast-vehicle sighting than hold an
-    uncorroborated one; it is off by default because silently discarding real
-    observations is the worse failure for an investigative system.
-
-    Setting `plate_min_observations = 1` restores the previous behavior
-    outright, so the change is revertible in one env var.
+    Not enough evidence doesn't mean throw it away: a car crossing in one
+    cycle only ever gets one read. It's persisted as untrusted and
+    review_status_for marks it pending_review however confident it was.
+    plate_require_consensus makes this a hard gate instead (off by default,
+    losing real sightings is worse). plate_min_observations=1 turns it off.
     """
     result = consensus(camera_id, track_id)
     return result is not None and result.is_corroborated
 
 
 def should_persist(camera_id: str, track_id: str, new_read: bool) -> bool:
-    """Whether this track's Plate sighting row needs a write this frame.
-
-    Without this the sighting row would be re-written on every single frame for
-    as long as a vehicle stays in view — the exact per-frame write pressure the
-    rest of this pipeline is carefully tuned to avoid (see worker.py's
-    heartbeat throttle and db.py's WAL notes). A write happens when there is
-    something real to record:
-
-    - the row does not exist yet (first confident read of this vehicle here);
-    - a new OCR read just landed (confidence/vote count actually changed);
-    - the vote winner changed since the row was written;
-    - the refresh interval elapsed, so `last_seen` advances and the sighting's
-      dwell time stays truthful for a vehicle sitting in frame.
+    """Whether the sighting row needs a write this frame, instead of every
+    frame while the car is in view. Yes if: no row yet, a new read landed, the
+    vote winner changed, or the refresh interval passed (keeps last_seen and
+    dwell honest for a parked car).
     """
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is None:
@@ -327,24 +241,15 @@ def should_persist(camera_id: str, track_id: str, new_read: bool) -> bool:
 
 
 def mark_ocr_attempt(camera_id: str, track_id: str) -> None:
-    """Record that OCR ran for this track but produced nothing usable.
-
-    Without this, a track whose plate is genuinely unreadable (rear of a truck,
-    plate out of frame, heavy motion blur) would be re-OCR'd on every single
-    inference cycle forever, since `should_ocr` keys off stability and an
-    unreadable track never becomes stable. The timestamp alone does not make it
-    stable — it just lets the reverify interval throttle the retries."""
+    """OCR ran and got nothing usable. An unreadable track (truck rear, plate
+    out of frame, blur) never gets stable, so without the timestamp it'd be
+    re-OCR'd every cycle forever; this lets the reverify interval throttle it."""
     state = touch(camera_id, track_id)
     state.last_ocr_mono = time.monotonic()
 
 
 def should_persist_track(camera_id: str, track_id: str) -> bool:
-    """Whether the models.Track row for this ByteTrack id needs a write.
-
-    Same throttle reasoning as `should_persist`: written on first sight, then
-    refreshed on an interval so `last_seen`/`detection_count` stay meaningful
-    without one write per frame per tracked object.
-    """
+    # same throttle as should_persist: first sight, then on the refresh interval
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is None:
         return False
@@ -367,8 +272,7 @@ def get(camera_id: str, track_id: str) -> TrackPlateState | None:
 def bind_plate_row(
     camera_id: str, track_id: str, plate_row_id: str, vehicle_id: str, plate_text: str,
 ) -> None:
-    """Remember which Plate/Vehicle row this track already owns, so later
-    frames update it rather than inserting a duplicate sighting."""
+    # later frames update this row instead of inserting another sighting
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is not None:
         state.plate_row_id = plate_row_id
@@ -378,13 +282,11 @@ def bind_plate_row(
 
 
 def release_camera(camera_id: str) -> None:
-    """Drop every track for a camera whose worker is stopping — mirrors
-    `detector.release_model` / `clips.release_camera`, called from the same
-    place (`worker.stop_worker`)."""
+    # called from worker.stop_worker next to detector.release_model
     for key in [k for k in _TRACKS if k[0] == str(camera_id)]:
         _TRACKS.pop(key, None)
 
 
 def reset() -> None:
-    """Test-isolation hook — module state is process-global by design."""
+    # for tests, module state is process-global
     _TRACKS.clear()

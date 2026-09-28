@@ -1,19 +1,12 @@
-"""Account administration must not be able to lock everyone out.
+"""Account admin must not be able to lock everyone out.
 
-`POST /api/users/{id}/disable` had no self-disable guard, and nothing in the
-API ever set `active` back to True. Disabling takes effect immediately —
-`auth.py` rejects a login from an inactive user and `get_current_user` rejects
-their existing token — so an administrator who disabled their own account got
-200 and then 401 on the very next request, with no route back.
+Disable had no self-disable guard and nothing ever re-enabled an account.
+Disabling applies at once (login and existing tokens both check active), so
+an admin who disabled themselves got a 200, then a 401 on the next request,
+with no way back short of editing the database.
 
-Measured before the fix: disable returned 200 and the caller's next
-`GET /api/users` returned 401.
-
-Administrator gates user management, camera registration, rule deletion and
-the governance purge, so recovery meant editing the database by hand. Since
-this endpoint is Administrator-gated, self-disable is the ONLY route to zero
-administrators: any other caller disabling an administrator is an active
-administrator who remains.
+Only an active admin can call disable and they remain, so blocking
+self-disable is enough to never reach zero admins.
 """
 import uuid
 
@@ -106,9 +99,9 @@ class TestDisableIsReversible:
 
 class TestDisabledLoginIsAudited:
     def test_using_a_revoked_account_leaves_a_trace(self, client, auth, db_session):
-        """Correct credentials against a disabled account returned 403 and
-        recorded nothing — a revoked operator still holding a working password
-        is exactly the event an audit log exists for."""
+        """Right password on a disabled account returned 403 and logged
+        nothing; a revoked operator with a working password is exactly what
+        the audit log is for."""
         created, password = _make_user(client, auth)
         client.post(f"/api/users/{created['id']}/disable", headers=auth)
 

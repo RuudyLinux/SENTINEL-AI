@@ -1,51 +1,29 @@
-"""Camera capacity benchmark (10/10 roadmap P4) — measure before claiming.
+"""Camera capacity benchmark: how many cameras can one machine handle.
 
-Answers "how many cameras can one deployment safely process?" the same way
-`tools/anpr_bench.py` answers ANPR accuracy: by actually running the real
-pipeline and reporting real numbers, never by inspecting a config value.
-`sentinel_grid_max_autoconnect` (see config.py) is explicitly a conservative
-GUESS pending this measurement — this tool is what turns it into one.
+Runs the real pipeline and reports real numbers, like anpr_bench does for
+ANPR, instead of trusting a config value (sentinel_grid_max_autoconnect was
+a guess until this).
 
-What it does
-------------
-For each camera COUNT in `--stages` (default "1,3,5"), it:
+For each camera count in --stages (default "1,3,5"):
+1. register that many video_file cameras on the demo video with person,
+   vehicle and ANPR on, so the full pipeline (YOLO, ByteTrack, plate
+   localization, EasyOCR)
+2. start their workers, staggered like grid cameras
+3. sample worker.CAMERA_STATS (fps / inference / read EMAs) and process
+   CPU/RSS every second for --duration seconds
+4. stop everything and delete that stage's cameras, so stages don't bleed
 
-1. Registers that many `video_file` cameras against the repo's bundled demo
-   video (`app/demo_assets/car-detection.mp4`), each with AI person/vehicle/
-   ANPR enabled — i.e. the FULL real pipeline (YOLOv8 detection, ByteTrack,
-   plate localization, EasyOCR), not a stub.
-2. Starts their real worker tasks (`pipeline.worker.start_worker`), staggered
-   the same way `sentinel_grid_stagger_seconds` staggers real grid cameras.
-3. Samples `worker.CAMERA_STATS` (per-camera FPS/inference-ms/read-ms EMAs,
-   already computed by the live pipeline for its own diagnostics) and
-   process-wide CPU/RSS (psutil) once per second for `--duration` seconds.
-4. Stops every worker, tears down that stage's camera rows, and moves to the
-   next stage — so stage N's load never carries into stage N+1's numbers.
+Per stage: mean/p95 FPS, inference and read latency, process CPU% and RSS,
+and how many cameras never produced a sample (reported, not averaged away).
+JSON via --json, Markdown via --md.
 
-What it reports
-----------------
-Per stage: mean/p95 FPS, inference latency, frame-read latency, process
-CPU%, process RSS, and how many cameras never produced a single stats
-sample (a real, honest "this one didn't come up" signal, not silently
-dropped from the average). Written as JSON (machine-readable) and Markdown
-(the operating-envelope statement the roadmap asks for) — see `--json`/`--md`.
+Caveats:
+- one machine, now, the demo clip decoded N times; not N real 1080p RTSP
+  streams. The report says so, keep that when quoting it.
+- a stage that can't start is the answer too, reported as failed.
+- uses whatever DB app.config points at unless DB_PATH is set; point it at a
+  scratch file on a machine with real data.
 
-Honesty notes
--------------
-- This measures ONE machine, right now, on the bundled 720p demo clip decoded
-  N times over — not N different real 1080p RTSP streams, not a different
-  host, not 80,000 cameras. The report says so; do not strip that caveat out
-  when relaying the numbers.
-- If a stage cannot even start (e.g. not enough decode bandwidth), that is
-  itself the answer this tool exists to find — it is reported as a failed
-  stage, not silently skipped.
-- Uses the SAME database file `app.config.settings` already points at unless
-  `DB_PATH` is overridden — set `DB_PATH` to a scratch file before running
-  this against a machine with real operational data, so benchmark camera
-  rows never land in a real deployment's database.
-
-Usage
------
     cd backend
     .venv/Scripts/python.exe tools/camera_bench.py --stages 1,3,5 --duration 20 \\
         --json camera_bench_results.json --md camera_bench_report.md
@@ -65,14 +43,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 DEMO_VIDEO = Path(__file__).resolve().parent.parent / "app" / "demo_assets" / "car-detection.mp4"
 
-# Which clip the benchmark drives, overridable with --video.
-#
-# This matters more than it looks. The bundled default is 320x240, 4 seconds,
-# and contains NO vehicles — raw YOLO sees only a "tv" in it — so a run against
-# it measures decode-and-inference overhead on an empty frame, NOT the cost of
-# the work a real camera creates: detection boxes, tracking, plate
-# localization and OCR all scale with what is actually in frame. Numbers from
-# the default clip are a floor, and must be quoted as one.
+# Clip to drive, --video to override. The bundled default is 320x240, 4s,
+# and has NO vehicles (YOLO sees a "tv"), so it measures decode + inference on
+# an empty frame, not detection/tracking/OCR load. Treat those numbers as a floor.
 BENCH_VIDEO = DEMO_VIDEO
 
 
@@ -84,22 +57,16 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[idx]
 
 
-# Children-first, because the rows a benchmark run PRODUCES reference the
-# cameras it created. Deleting only the camera rows raised
+# Children first: the rows a run produces point at its cameras, and deleting
+# only cameras failed with
 #
 #     sqlalchemy.exc.IntegrityError: (sqlite3.IntegrityError)
 #     FOREIGN KEY constraint failed
 #     [SQL: DELETE FROM cameras WHERE cameras.id IN (?)]
 #
-# and aborted the whole run before any report was written. It never showed up
-# while the benchmark drove the bundled demo clip, because that clip contains
-# no vehicles: with nothing detected there were no detections, plates or
-# alerts to reference the camera. Pointing the tool at a clip with real
-# vehicles — which is the entire point of measuring capacity — made the
-# cleanup fail every time.
-#
-# Same ordering as tests/conftest.py's camera wipe, scoped to this run's
-# cameras so a benchmark never touches data it did not create.
+# before any report was written. The empty demo clip never produced rows, so
+# it only showed up with a clip that has real vehicles. Same order as
+# tests/conftest.py, limited to this run's cameras.
 _BENCH_DEPENDENTS_CHILDREN_FIRST = (
     "Evidence", "IncidentNote", "IncidentAlert", "Incident",
     "Alert", "Plate", "Track", "Detection", "Zone", "SelfHealEvent",
@@ -236,7 +203,7 @@ def _write_markdown(results: list[dict], path: Path) -> None:
 
 
 async def main_async(stages: list[int], duration: float, stagger: float) -> list[dict]:
-    from app import models  # noqa: F401 — import registers every table on Base.metadata;
+    from app import models  # noqa: F401 - import registers every table on Base.metadata;
     # without it create_all() below sees an empty metadata and creates nothing.
     from app.db import Base, engine, SessionLocal
 

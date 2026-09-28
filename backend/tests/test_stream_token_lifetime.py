@@ -1,14 +1,11 @@
-"""A live stream must not outlive the token that authorized it.
+"""A live stream doesn't outlive the token that authorized it.
 
-`GET /api/streams/{id}/mjpeg` validated its resource token once, at connect,
-and then held the response open forever. `settings.stream_token_ttl_seconds`
-(default 3600) therefore bounded nothing for the one endpoint whose access
-lasts long enough for a bound to matter: a tab left open kept receiving live
-video days later, and deactivating the operator's account did not interrupt
-the feed — the account check also runs only at connect.
+/api/streams/{id}/mjpeg checked its token once at connect and then streamed
+forever, so stream_token_ttl_seconds bounded nothing: an open tab got live
+video days later, even after the account was disabled.
 
-The stream now stops at the token's `exp`. Re-authorizing means asking for a
-new token, which re-runs the full RBAC and active-account check.
+Now it stops at the token's exp, and continuing means a new token, which
+reruns the RBAC and active-account checks.
 """
 import asyncio
 import uuid
@@ -83,10 +80,9 @@ class TestStreamDeadline:
         assert timedelta(seconds=60) < (deadline - datetime.utcnow()) <= timedelta(seconds=120)
 
     def test_an_unreadable_token_does_not_become_an_unlimited_stream(self):
-        """The first version of this fix failed open here. `jwt.decode`
-        verifies `exp`, so an EXPIRED token cannot be decoded at all and
-        `resource_token_expiry` returns None for it — exactly the input the
-        bound exists for. None must never mean "stream forever"."""
+        """The first fix failed open here: an expired token can't be decoded,
+        so resource_token_expiry returns None for exactly the case this is
+        about. None must never mean stream forever."""
         assert resource_token_expiry("not-a-jwt") is None
         fallback = streams._stream_deadline("not-a-jwt")
         assert fallback <= datetime.utcnow() + timedelta(seconds=settings.stream_token_ttl_seconds)

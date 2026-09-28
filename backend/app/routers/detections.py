@@ -16,14 +16,9 @@ def list_detections(
     cls: Optional[str] = None,
     from_ts: Optional[datetime] = Query(None, alias="from"),
     to_ts: Optional[datetime] = Query(None, alias="to"),
-    # Bounded, matching self_heal.py's convention. An unvalidated int here
-    # meant `limit=-1` reached SQLite as `LIMIT -1`, which means NO limit, and
-    # `limit=100000000` had the same effect — either one returns the entire
-    # detections table (the largest table the platform writes, one row per
-    # detected object per frame per camera) in a single JSON response, to any
-    # authenticated user. Measured on a 120-row test database: the default
-    # returned 100, `limit=-1` returned all 120, `limit=100000000` returned
-    # all 120.
+    # Bounded like self_heal.py. limit=-1 reaches SQLite as LIMIT -1 (no
+    # limit) and limit=100000000 is the same thing: the whole detections
+    # table, the biggest one we have, in one response to any logged-in user.
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),

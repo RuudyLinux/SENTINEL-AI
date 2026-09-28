@@ -31,8 +31,8 @@ export default function DataTable<T extends { id: string }>({
             <tr
               key={row.id}
               onClick={() => onRowClick?.(row)}
-              // A clickable row is the only route to the alert/incident/evidence
-              // detail pages, so it must be reachable and operable by keyboard.
+              // clickable rows are the only way to the detail pages, so they
+              // need keyboard access
               tabIndex={onRowClick ? 0 : undefined}
               onKeyDown={onRowClick ? (e) => {
                 if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onRowClick(row); }
@@ -44,16 +44,11 @@ export default function DataTable<T extends { id: string }>({
                 return (
                   <td
                     key={c.key}
-                    // `whitespace-nowrap` alone let one long value set the
-                    // width of the whole table. Reproduced on the audit page:
-                    // a single failed login carrying a 5,000-character
-                    // username (unauthenticated input — see the matching bound
-                    // in backend app/audit.py) rendered the table 36,215px
-                    // wide, so every other column sat off-screen behind a
-                    // horizontal scroll nobody would think to drag. The cap
-                    // ellipsizes that cell instead of letting it deform the
-                    // grid; the full value stays available on hover, and every
-                    // ordinary cell is far below the cap and looks unchanged.
+                    // whitespace-nowrap alone let one long value set the whole
+                    // table's width: a failed login with a 5,000-char username
+                    // (see app/audit.py) made the audit table 36,215px wide.
+                    // The cap ellipsizes the cell, full value on hover; normal
+                    // cells are way under it.
                     className="px-3 py-2 whitespace-nowrap max-w-xs truncate"
                     title={typeof value === "string" ? value : undefined}
                   >

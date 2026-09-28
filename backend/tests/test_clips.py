@@ -1,5 +1,4 @@
-"""Event video clips — ring buffer bounding + encode."""
-import time
+"""Event clips: ring buffer bounds and encoding."""
 
 import cv2
 import numpy as np
@@ -61,9 +60,8 @@ def test_encode_clip_returns_false_for_undecodable_frames(tmp_path):
 
 
 def test_clip_plays_at_the_rate_frames_were_captured(tmp_path):
-    """Frames captured at 2.5fps must make a clip of real duration. Encoding at
-    the fixed nominal clip_fps (10) played evidence 4x too fast once the camera
-    loop started taking only the newest frame."""
+    """2.5fps frames make a clip of real duration. At the nominal 10fps the
+    evidence played 4x too fast."""
     import imageio_ffmpeg
 
     timed = [(100.0 + i * 0.4, _tiny_jpeg()) for i in range(11)]  # 4s at 2.5fps
@@ -81,10 +79,9 @@ def test_playback_fps_falls_back_for_degenerate_input():
 
 
 def test_encode_holds_one_decoded_frame_at_a_time(tmp_path, monkeypatch):
-    """Decoding the whole batch before encoding held every raw frame at once
-    (6.2 MB each at 1080p) and ran the demo machine out of memory when a busy
-    zone raised several clips together. Each frame must be decoded only when
-    it is about to be written."""
+    """Decoding the whole batch first held every raw frame (6.2 MB each at
+    1080p) and ran the demo machine out of memory. Decode each frame right
+    before writing it."""
     real_imdecode = cv2.imdecode
     live = []
 

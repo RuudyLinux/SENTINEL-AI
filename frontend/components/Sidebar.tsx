@@ -50,8 +50,7 @@ function NavGroup({ items, pathname }: { items: typeof PRIMARY; pathname: string
               active ? "bg-accent/10 text-accent font-medium" : "text-slate-300 hover:bg-panel2 hover:text-slate-100"
             }`}
           >
-            {/* Active indicator — a static left accent bar, not a moving/animated
-                highlight, so it reads instantly without drawing attention to itself. */}
+            {/* static accent bar for the active item, nothing animated */}
             <span
               className={`absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-accent transition-opacity duration-150 ${
                 active ? "opacity-100" : "opacity-0"

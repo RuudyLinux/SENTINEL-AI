@@ -1,15 +1,11 @@
-"""Authorization boundary: no route may be reachable without a credential.
+"""No route is reachable without a credential.
 
-Written after finding that `POST /api/cameras/test-connection` had no
-authorization at all — the only camera route without it, while every other one
-requires Administrator/Control Room Operator. Because it opens an
-operator-supplied URI, that made the backend an unauthenticated SSRF probe:
-anyone able to reach it could ask the server to connect to any internal
-host/port and read the ok/detail response to learn what was listening. It also
-tied up a worker thread for the full source-open timeout per anonymous request.
+POST /api/cameras/test-connection had no auth at all, the only camera route
+like that. It opens a URI you give it, so it was an unauthenticated SSRF
+probe, and it held a worker thread for the whole open timeout per request.
 
-This test enumerates the real route table rather than naming endpoints, so a
-NEW unauthenticated route fails here the moment it is added.
+Walks the real route table instead of naming endpoints, so a new open route
+fails here right away.
 """
 
 import pytest
@@ -21,9 +17,8 @@ from app.main import app
 PUBLIC_ROUTES = {
     ("POST", "/api/auth/login"): "issues the token; cannot itself require one",
     ("GET", "/api/health"): "liveness probe, exposes no data beyond 'the service is up'",
-    # Browsers cannot attach an Authorization header to <img src>/<a href>
-    # navigation, so these validate a short-lived SIGNED RESOURCE TOKEN instead
-    # (security.get_user_from_resource_token). They are not unauthenticated.
+    # <img src>/<a href> can't send a header, so these take a short-lived
+    # signed resource token (get_user_from_resource_token); not open
     ("GET", "/api/evidence/{evidence_id}/file"): "signed resource token",
     ("GET", "/api/evidence/incidents/{incident_id}/package"): "signed resource token",
     ("GET", "/api/streams/{camera_id}/mjpeg"): "signed resource token",
@@ -80,9 +75,8 @@ def test_test_connection_rejects_an_anonymous_caller(client):
 
 
 def test_test_connection_rejects_a_role_that_may_not_manage_cameras(client, db_session):
-    """It must sit behind the same role boundary as camera creation, not merely
-    behind 'any logged-in user' — an Auditor has no business making the server
-    open network connections."""
+    """Same role as camera creation, not just any logged-in user; an Auditor
+    has no business making the server open connections."""
     from app import models
     from app.security import create_access_token, hash_password
 
@@ -118,6 +112,6 @@ def test_test_connection_rejects_a_role_that_may_not_manage_cameras(client, db_s
     "/api/plates",
 ])
 def test_v2_vehicle_endpoints_require_authentication(client, path):
-    """Every endpoint added in V2 — the plate/journey/investigation surface,
-    which exposes vehicle movement history — must refuse an anonymous caller."""
+    """The V2 plate/journey/investigation routes expose vehicle movement and
+    refuse anonymous callers."""
     assert client.get(path).status_code == 401

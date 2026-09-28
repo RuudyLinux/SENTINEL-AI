@@ -1,6 +1,5 @@
-"""Privacy / governance controls (10/10 roadmap P13): configurable retention,
-dry-run-by-default purge, and the double-confirmation required for a real,
-irreversible deletion."""
+"""Governance: configurable retention, dry-run by default, and both flags
+required for a real deletion."""
 import uuid
 from datetime import datetime, timedelta
 
@@ -69,7 +68,7 @@ class TestPurgeExpired:
         assert body["dry_run"] is True
         assert body["deleted_count"] == 0
         assert old.id in body["eligible_ids"]
-        # Row genuinely still exists.
+        # row still there
         assert db_session.query(models.Evidence).filter(models.Evidence.id == old.id).first() is not None
 
     def test_dry_run_false_without_confirm_still_does_not_delete(self, client, db_session, auth, tmp_path):

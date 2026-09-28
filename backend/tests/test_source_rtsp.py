@@ -1,8 +1,10 @@
-"""3. RTSP configuration — TCP transport is actually applied before open()."""
+"""RTSP: TCP transport is set before open()."""
 import os
 
 from app.pipeline import source as source_mod
 from app.pipeline.source import CameraSource
+from app.pipeline import adapters
+from app.config import settings
 
 
 class _FakeCapture:
@@ -21,7 +23,7 @@ def test_rtsp_open_sets_tcp_transport_env_before_videocapture(monkeypatch):
     seen = {}
 
     def fake_video_capture(uri, backend=None):
-        # captured at construction time — proves the env var was set BEFORE this call
+        # captured here, so the env var was set before this call
         seen["env_at_open"] = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
         return _FakeCapture()
 
@@ -42,3 +44,24 @@ def test_rtsp_transport_not_forced_when_disabled(monkeypatch):
     src.open()
     assert src.transport_forced_tcp is False
     assert os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS") is None
+
+
+def test_udp_transport_sets_udp_and_a_bigger_buffer(monkeypatch):
+    seen = {}
+
+    class FakeCap:
+        def __init__(self, *a, **k):
+            seen["opts"] = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+
+        def set(self, *a):
+            return True
+
+        def isOpened(self):
+            return True
+
+    monkeypatch.setattr(adapters.cv2, "VideoCapture", FakeCap)
+    monkeypatch.delenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", raising=False)
+    a = adapters.RTSPAdapter("rtsp://example.invalid/x", transport="udp")
+    assert a.open() is True
+    assert seen["opts"] == f"rtsp_transport;udp|buffer_size;{settings.rtsp_udp_buffer_bytes}"
+    assert a.transport_forced_tcp is False

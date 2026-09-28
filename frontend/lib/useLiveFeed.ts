@@ -2,8 +2,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useLiveSocket, type LiveEvent } from "./useLiveSocket";
 
-/** Canonical backend event names (backend app/ws.py `EventType`). Kept in one
- * place so a filter is never a magic string scattered across components. */
+/** Backend event names (app/ws.py EventType), in one place instead of magic strings. */
 export const EVENT = {
   DETECTION_CREATED: "detection.created",
   DETECTION_BATCH: "detection.batch",
@@ -18,8 +17,8 @@ export const EVENT = {
 export type FeedKind = "detection" | "sighting" | "alert" | "incident" | "system";
 
 export type FeedItem = {
-  /** Stable key for React. The backend does not guarantee a unique id on every
-   * event type, so this is composed locally and never used as a domain id. */
+  /** React key, built locally since not every event has a unique id. Never a
+   * domain id. */
   key: string;
   kind: FeedKind;
   type: string;
@@ -27,8 +26,7 @@ export type FeedItem = {
   data: any;
 };
 
-/** How the event vocabulary maps onto the operator-facing groupings the control
- * room filters by. */
+/** Event types -> the groupings the control room filters by. */
 const KIND_BY_TYPE: Record<string, FeedKind> = {
   [EVENT.DETECTION_CREATED]: "detection",
   [EVENT.VEHICLE_SIGHTING]: "sighting",
@@ -39,12 +37,9 @@ const KIND_BY_TYPE: Record<string, FeedKind> = {
   [EVENT.CAMERA_HEALTH]: "system",
 };
 
-/** Hard cap on retained events.
- *
- * A control room is left open for a whole shift against a live detection
- * stream, so an unbounded list is a guaranteed browser slowdown. Older items
- * fall off the end; the durable record is the database, which the rest of the
- * app queries — this list is a live view, never a store. */
+/** Max events kept. A control room stays open all shift on a live stream, so
+ * unbounded means a slow browser. Old ones fall off; the DB is the record,
+ * this is just a live view. */
 const DEFAULT_LIMIT = 250;
 
 type Options = {
@@ -60,8 +55,8 @@ export function useLiveFeed(options: Options = {}) {
     detection: 0, sighting: 0, alert: 0, incident: 0, system: 0,
   });
   const [paused, setPaused] = useState(false);
-  // Read inside the socket callback, which is registered once — a state value
-  // would be captured stale there, so the live value lives in a ref.
+  // read inside the socket callback (registered once), so it lives in a ref
+  // rather than stale state
   const pausedRef = useRef(false);
   const seq = useRef(0);
   const kinds = options.kinds;
@@ -73,10 +68,8 @@ export function useLiveFeed(options: Options = {}) {
 
   const handle = useCallback(
     (event: LiveEvent) => {
-      // Detections arrive coalesced (backend ws.py batches them so N cameras do
-      // not produce N x inference-rate React updates per second). Unpacking
-      // here means every consumer sees plain events and never has to know that
-      // batching exists.
+      // detections come batched from ws.py; unpacked here so consumers only
+      // see plain events
       const incoming: { type: string; data: any }[] =
         event.type === EVENT.DETECTION_BATCH
           ? (event.data?.events ?? []).map((e: any) => ({ type: e.type ?? EVENT.DETECTION_CREATED, data: e }))
@@ -93,8 +86,8 @@ export function useLiveFeed(options: Options = {}) {
       }
       if (mapped.length === 0 && Object.keys(delta).length === 0) return;
 
-      // Counters keep advancing while paused — the operator paused the SCROLL,
-      // not the system, and a frozen throughput number would misrepresent it.
+      // counters keep going while paused, the operator paused the scroll, not
+      // the system
       setCounts((prev) => {
         const next = { ...prev };
         for (const [kind, n] of Object.entries(delta)) next[kind as FeedKind] += n as number;

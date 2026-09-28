@@ -1,11 +1,9 @@
-"""V2 Phase 1 — plate localization inside a vehicle crop.
+"""Plate localization inside a vehicle crop.
 
-The stage that did not exist before V2: OCR used to be handed the whole vehicle
-bounding box. These tests use synthetic vehicle crops (a plate-shaped bright
-patch with character-like strokes on a dark body) rather than real footage —
-they lock down the CONTRACT (finds a plate-shaped region, rejects nonsense,
-never raises on degenerate input, degrades to None so the caller can fall back),
-not a recognition accuracy figure, which only real frames can honestly measure.
+OCR used to get the whole vehicle box. Synthetic crops (bright plate-shaped
+patch with stroke-like marks on a dark body): these check the contract
+(finds a plate-shaped region, rejects junk, never raises, returns None so the
+caller falls back), not accuracy, which needs real frames.
 """
 import cv2
 import numpy as np
@@ -43,8 +41,8 @@ def test_finds_a_plate_shaped_region_on_a_synthetic_vehicle():
 
 
 def test_located_bbox_is_within_the_crop_bounds():
-    """The bbox is later offset into full-frame coordinates and used to draw on
-    real frames — an out-of-bounds box would produce a broken evidence image."""
+    """The box gets offset to full frame and drawn on evidence; out of
+    bounds would break the image."""
     crop = _vehicle_crop_with_plate()
     _, (x1, y1, x2, y2) = plate_detect.locate_plate(crop)
     h, w = crop.shape[:2]
@@ -53,22 +51,20 @@ def test_located_bbox_is_within_the_crop_bounds():
 
 
 def test_returns_none_on_a_featureless_crop():
-    """A flat surface has no plate. Returning None is what makes the caller fall
-    back to whole-crop OCR instead of OCR-ing a meaningless region."""
+    """Flat surface, no plate: None, and the caller reads the whole crop."""
     assert plate_detect.locate_plate(np.full((300, 400, 3), 90, dtype=np.uint8)) is None
 
 
 def test_returns_none_on_an_empty_or_degenerate_crop():
-    """A clamped bbox at a frame edge can legitimately produce a zero-size crop —
-    that must never raise inside a camera worker."""
+    """A clamped edge box can give a zero-size crop; must not raise in a worker."""
     assert plate_detect.locate_plate(np.zeros((0, 0, 3), dtype=np.uint8)) is None
     assert plate_detect.locate_plate(None) is None
     assert plate_detect.locate_plate(np.zeros((4, 4, 3), dtype=np.uint8)) is None
 
 
 def test_rejects_a_region_that_is_the_wrong_shape_for_a_plate():
-    """A tall bright panel (a window, a reflective strip) is not a plate — the
-    aspect-ratio filter is what stops OCR being pointed at car furniture."""
+    """Tall bright panel (window, reflective strip) isn't a plate; the aspect
+    filter keeps OCR off car furniture."""
     crop = np.full((300, 400, 3), 40, dtype=np.uint8)
     cv2.rectangle(crop, (150, 60), (200, 240), (235, 235, 235), -1)  # aspect ~0.28
     for i in range(6):
@@ -82,8 +78,7 @@ def test_rejects_a_region_that_is_the_wrong_shape_for_a_plate():
 
 
 def test_output_is_ocr_ready_and_upscaled():
-    """Effective glyph height dominates real OCR accuracy, so a small plate crop
-    is upscaled before recognition rather than handed over as-is."""
+    """Small plate crops get upscaled first, glyph height drives accuracy."""
     # A small but realistically-proportioned plate (160x24 -> aspect ~6.7,
     # about what a full 10-glyph Indian plate's text extent measures).
     crop = _vehicle_crop_with_plate(plate_h=24)
@@ -93,9 +88,8 @@ def test_output_is_ocr_ready_and_upscaled():
 
 
 def test_missing_configured_plate_model_falls_back_without_raising(monkeypatch):
-    """A configured-but-absent weights file is a deployment reality (the model
-    is not bundled). It must degrade to classical localization, never crash a
-    camera worker and never silently pretend a model ran."""
+    """Configured but missing weights (not bundled) fall back to classical,
+    no crash and no pretending a model ran."""
     plate_detect._get_plate_model.cache_clear()
     monkeypatch.setattr(settings, "plate_model_name", "definitely-not-a-real-model.pt")
     try:
@@ -107,6 +101,6 @@ def test_missing_configured_plate_model_falls_back_without_raising(monkeypatch):
 
 @pytest.mark.parametrize("plate_y", [150, 200, 240])
 def test_finds_plates_at_varying_heights_on_the_vehicle(plate_y):
-    """Position scoring prefers a low-mounted plate but must not hard-reject a
-    higher one — trucks and buses carry plates well above bumper height."""
+    """Low plates score higher but high ones aren't rejected; trucks and
+    buses carry them well above the bumper."""
     assert plate_detect.locate_plate(_vehicle_crop_with_plate(plate_y=plate_y)) is not None

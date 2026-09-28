@@ -1,15 +1,13 @@
-"""Regression: fire-and-forget work must survive to shutdown, not be destroyed.
+"""Background work has to survive until shutdown drains it.
 
-Found by probing the real shutdown path: a pending `clips.build_event_clip`
-was still running after `_on_shutdown()` returned, and was then destroyed when
-the event loop closed. That task waits up to `clip_post_event_seconds` for
-post-event frames BEFORE writing its Evidence row, so a shutdown inside that
-window silently discarded evidence for a real alert — and produced
-"Task was destroyed but it is pending" noise.
+A pending clips.build_event_clip was still running after _on_shutdown()
+returned and got destroyed when the loop closed. It waits up to
+clip_post_event_seconds before writing Evidence, so that lost evidence for a
+real alert (plus "Task was destroyed but it is pending").
 
-asyncio holds only a weak reference to a running task, so a bare `create_task`
-whose result nobody keeps can also be collected mid-flight. `background.spawn`
-holds a strong reference and lets shutdown drain the set.
+asyncio only keeps a weak ref to a task, so an unstored create_task can also
+be collected mid-flight. background.spawn keeps a strong one and shutdown
+drains the set.
 """
 import asyncio
 
@@ -43,8 +41,8 @@ def test_spawned_work_is_allowed_to_finish_before_shutdown_completes():
 
 
 def test_a_task_that_overruns_the_budget_is_cancelled_deliberately():
-    """A clean exit matters more than one last clip — but the task must be
-    cancelled and logged, not silently destroyed by the closing loop."""
+    """Clean exit beats one last clip, but it's cancelled and logged, not
+    silently destroyed."""
     cancelled: list[str] = []
 
     async def never_finishes():
@@ -82,8 +80,8 @@ def test_a_failing_background_task_never_breaks_shutdown():
 
 
 def test_completed_tasks_are_released_from_the_registry():
-    """The registry is bounded by completion, not by shutdown — a long-running
-    process must not accumulate every clip task it ever spawned."""
+    """Finished tasks leave the registry; a long-running process mustn't
+    keep every clip task it ever spawned."""
 
     async def scenario():
         for i in range(20):
@@ -95,8 +93,7 @@ def test_completed_tasks_are_released_from_the_registry():
 
 
 def test_the_real_shutdown_path_leaves_nothing_pending():
-    """End-to-end against the actual `_on_shutdown`, which is where the defect
-    was originally observed."""
+    """Through the real _on_shutdown, where it was first seen."""
     from app.main import _on_shutdown
 
     async def scenario():

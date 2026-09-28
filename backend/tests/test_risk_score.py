@@ -1,9 +1,7 @@
-"""V2 Phase 3 — explainable risk score.
+"""Explainable risk score.
 
-The contract these lock down is explainability, not a particular number: the
-score must be reproducible, bounded, and fully attributable to named factors.
-An opaque score would be untestable, which is precisely why this one is not
-machine-learned.
+Not about a particular number: reproducible, bounded, and fully accounted
+for by named factors.
 """
 from datetime import datetime
 
@@ -20,8 +18,8 @@ def test_no_signals_scores_zero_with_no_invented_reasons():
 
 
 def test_every_point_is_attributable_to_a_named_factor():
-    """The whole justification for a hand-weighted score: the total must equal
-    the sum of its stated reasons, or the explanation is a decoration."""
+    """The total equals the sum of the stated reasons, or the explanation is
+    decoration."""
     assessment = risk.assess(risk.RiskSignals(
         watchlist_priority="CRITICAL", plate_text="GJ05AB1234",
         zone_severity="HIGH", zone_name="Secure Yard", camera_code="C-014",
@@ -45,9 +43,8 @@ def test_score_is_capped_at_100():
 
 
 def test_a_watchlist_match_alone_is_serious_but_not_maximal():
-    """A watchlist hit must be actionable on its own, while leaving room for
-    corroborating signals to raise it — otherwise the score has no dynamic range
-    on exactly the events that matter most."""
+    """A watchlist hit is actionable alone but leaves room for other signals
+    to push it higher."""
     assessment = risk.assess(risk.RiskSignals(watchlist_priority="CRITICAL", plate_text="GJ05AB1234"))
     assert assessment.score == risk.WATCHLIST_POINTS["CRITICAL"]
     assert assessment.severity == "MEDIUM"
@@ -71,8 +68,8 @@ def test_zone_severity_scales_the_contribution():
 
 
 def test_an_unknown_priority_falls_back_rather_than_crashing():
-    """Watchlist priority is operator-entered data; an unexpected value must
-    degrade to a sane weight, never take down alert evaluation."""
+    """Priority is operator-entered; an odd value gets a sane weight, never
+    breaks alert evaluation."""
     assessment = risk.assess(risk.RiskSignals(watchlist_priority="URGENT"))
     assert assessment.score == risk.WATCHLIST_POINTS["MEDIUM"]
 
@@ -122,8 +119,7 @@ class TestIndividualFactors:
 
 
 def test_assessment_is_deterministic():
-    """Same inputs, same answer — a score used in an evidence package cannot
-    depend on when it was computed."""
+    """Same inputs, same answer, whenever it's computed."""
     signals = risk.RiskSignals(
         watchlist_priority="HIGH", zone_severity="HIGH", plate_confidence=0.9,
         cameras_visited=3, total_sightings=5, at=datetime(2026, 3, 1, 23, 15),

@@ -1,21 +1,16 @@
-"""Two accuracy defects found by the FIRST real ANPR measurement
-(docs/ANPR_ACCURACY.md, 25 labelled Indian plates) — not by inspection.
+"""Two accuracy bugs found by the first real ANPR measurement
+(docs/ANPR_ACCURACY.md, 25 labelled Indian plates).
 
-1. **Two-row plates were scrambled.** OCR fragments were ordered by left-x
-   alone, correct only for single-row plates. India uses two-row plates
-   widely, and on those a pure x-sort interleaves the rows: the real labelled
-   plate `KL07BX7197` was read as `INDBX7197KL07`.
-
-2. **Localization reduced accuracy.** It was documented as "the single largest
-   accuracy lever"; measured, it cut exact match from 0.16 to 0.04 and raised
-   CER from 0.524 to 0.636, because the localizer sometimes returns a
-   sub-region and OCR then reads nothing. Fixed by falling back to the whole
-   crop when the localized read fails the gate, keeping whichever is better.
+1. Two-row plates got scrambled. Fragments were sorted by left x only, which
+   interleaves rows: KL07BX7197 came out as INDBX7197KL07.
+2. Localization made things worse: exact match 0.16 -> 0.04, CER
+   0.524 -> 0.636, because it sometimes returns part of the plate and OCR
+   reads nothing. Now a failed localized read falls back to the whole crop
+   and the better read wins.
 """
 import numpy as np
 import pytest
 
-from app.config import settings
 from app.pipeline.anpr import better_read, order_fragments, read_plate
 
 
@@ -27,9 +22,8 @@ def _fragment(text: str, x: float, y: float, width: float = 60.0, height: float 
 
 class TestTwoRowPlateOrdering:
     def test_a_two_row_plate_is_read_top_row_then_bottom_row(self):
-        """The exact measured failure: a two-row plate whose bottom row starts
-        further LEFT than the top row. A pure x-sort emits the bottom row
-        first; row-aware ordering must not."""
+        """Two-row plate whose bottom row starts further left than the top.
+        An x-sort puts the bottom row first."""
         fragments = [
             _fragment("BX7197", x=10, y=60),   # bottom row, leftmost overall
             _fragment("KL07", x=30, y=10),     # top row
@@ -38,9 +32,8 @@ class TestTwoRowPlateOrdering:
         assert [f[1] for f in ordered] == ["KL07", "BX7197"]
 
     def test_the_measured_ind_marker_case_no_longer_interleaves(self):
-        """`KL07BX7197` was read as `INDBX7197KL07`. The country marker and the
-        two rows must come out in reading order, so downstream normalization
-        has a chance of recovering the plate."""
+        """KL07BX7197 read as INDBX7197KL07. Marker and rows have to come out
+        in reading order so normalization can recover the plate."""
         fragments = [
             _fragment("BX7197", x=5, y=70),
             _fragment("IND", x=8, y=12, width=30),
@@ -49,8 +42,7 @@ class TestTwoRowPlateOrdering:
         assert [f[1] for f in order_fragments(fragments)] == ["IND", "KL07", "BX7197"]
 
     def test_a_single_row_plate_is_still_plain_left_to_right(self):
-        """Regression guard: the fix must not change single-row behavior,
-        which was already correct."""
+        """Single-row behaviour was already right and must stay that way."""
         fragments = [
             _fragment("1234", x=200, y=10),
             _fragment("GJ05", x=10, y=12),
@@ -59,8 +51,7 @@ class TestTwoRowPlateOrdering:
         assert [f[1] for f in order_fragments(fragments)] == ["GJ05", "AB", "1234"]
 
     def test_rows_are_split_by_relative_glyph_height_not_a_fixed_pixel_gap(self):
-        """Crops arrive at wildly different scales. A large-scale two-row plate
-        (tall glyphs, large row gap) must still resolve to two rows."""
+        """Big crop (tall glyphs, big row gap) still resolves to two rows."""
         fragments = [
             _fragment("BX7197", x=20, y=600, width=600, height=200),
             _fragment("KL07", x=60, y=100, width=400, height=200),
@@ -78,9 +69,8 @@ class TestBetterRead:
         assert better_read(localized, whole) is whole
 
     def test_a_gate_passing_read_is_not_replaced_by_a_more_confident_failure(self):
-        """Confidence alone must not win: a high-confidence read that is not
-        plate-shaped is exactly the "confident garbage" the quality gate
-        exists to reject."""
+        """Confidence alone doesn't win; a confident read that isn't
+        plate-shaped is exactly what the gate is for."""
         good = ("GJ05AB1234", "GJ05AB1234", 0.62)
         confident_junk = ("SUCUN", "SUCUN", 0.97)
         assert better_read(good, confident_junk) is good
@@ -92,8 +82,8 @@ class TestBetterRead:
         assert better_read(high, low) is high
 
     def test_a_non_empty_read_beats_an_empty_one_even_if_both_fail_the_gate(self):
-        """A localization miss must never turn a real (if imperfect) read into
-        nothing — that was the measured `GJ01DY6855 -> <empty>` failure."""
+        """A localization miss must never turn a real read into nothing
+        (the measured GJ01DY6855 -> <empty>)."""
         empty = ("", "", 0.0)
         partial = ("GJ00AG855", "GJ00AG855", 0.31)
         assert better_read(empty, partial) is partial
@@ -108,8 +98,7 @@ class TestBetterRead:
 
 
 class TestPlateExtraction:
-    """`extract_plate` pulls a registration out of a read carrying extra
-    characters. Both inputs below are REAL measured OCR outputs."""
+    """extract_plate on real OCR outputs with extra characters."""
 
     @pytest.mark.parametrize("read,expected", [
         ("INDKL07BX7197", "KL07BX7197"),    # "IND" country marker, measured
@@ -126,9 +115,8 @@ class TestPlateExtraction:
 
     @pytest.mark.parametrize("noise", ["QQQQQQQQQQQQ", "SUCUL", "", "12345", "ZZZZ"])
     def test_a_string_with_no_valid_plate_is_never_turned_into_one(self, noise):
-        """The critical safety property: this may only ever recover a plate
-        that is genuinely present, never manufacture one out of noise — the
-        same standard disambiguate_plate is held to."""
+        """Only recovers a plate that's really there, never makes one up
+        from noise (same bar as disambiguate_plate)."""
         from app.pipeline.anpr import extract_plate
         assert extract_plate(noise) == noise
 

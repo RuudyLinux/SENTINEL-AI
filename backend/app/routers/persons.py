@@ -1,9 +1,8 @@
-"""Person module: detection/tracking, plus cross-camera appearance-SIMILARITY
-search (Phase 5). No face recognition and no identity resolution anywhere in this
-module — `/{detection_id}/similar` ranks other person detections by how visually
-similar their crop's color signature is (pipeline/appearance.py), for an
-investigator to review and confirm manually. It never claims to know who anyone
-is, and detections with no stored signature are simply excluded, never guessed at.
+"""Persons: detection/tracking and cross-camera appearance similarity.
+
+No face recognition or identity anywhere. /{detection_id}/similar ranks
+other person detections by colour signature (pipeline/appearance.py) for an
+investigator to check; detections without a signature are left out.
 """
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -38,9 +37,8 @@ def similar_person_detections(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Appearance-SIMILARITY candidates only — not identity verification. Returns
-    [] (not a 404) when the reference detection has no stored signature or simply
-    has no candidates above `min_similarity`."""
+    """Similarity candidates only, not identity. [] (not 404) when the
+    reference has no signature or nothing clears min_similarity."""
     reference = db.query(models.Detection).filter(models.Detection.id == detection_id).first()
     if reference is None:
         raise HTTPException(status_code=404, detail="Detection not found")

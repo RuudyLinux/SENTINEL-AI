@@ -1,8 +1,5 @@
-"""Dataset schema validation.
-
-The central assertion in this file: **annotation validity is not
-vehicle-registration validity.** A label can be unusual without being invalid,
-and the schema must not confuse the two.
+"""Dataset schema validation. Annotation validity is not registration
+validity: a label can be unusual without being invalid.
 """
 import json
 
@@ -42,23 +39,19 @@ class TestAnnotationValidityIsNotRegistrationValidity:
     @pytest.mark.parametrize("text", [
         "KL34F",        # a real partial plate from the benchmark corpus
         "KL498262",     # a real handwritten plate that is not a valid registration
-        "23BH1234AA",   # BH series — valid, but not the state-code grammar
+        "23BH1234AA",   # BH series, valid but not the state-code grammar
         "QQ00QQ0000",   # an impossible registration, but a legal ANNOTATION
         "",             # an unreadable plate, deliberately unlabelled
     ])
     def test_unusual_plate_text_still_parses(self, text):
-        """These are all things a transcriber could legitimately write down. The
-        schema records what was seen; whether it is a valid Indian registration
-        is a separate, downstream question."""
+        """All things a transcriber could legitimately write. Whether they're
+        valid registrations is a separate question downstream."""
         assert record_from_dict(make_record("v", plate_text=text).__dict__).plate_text == text
 
     def test_the_schema_compiles_exactly_one_regex_the_character_policy(self):
-        """Guards against someone 'helpfully' adding a registration-format check
-        later: rejecting non-conforming labels would delete the non-standard
-        plates Phase 2 measured as 5 of 10 recognition failures.
-
-        Inspected via AST so the assertion is about executable code, not about
-        prose — the module docstring legitimately discusses the distinction.
+        """Guards against someone adding a registration-format check later,
+        which would drop the non-standard plates (5 of 10 failures in Phase 2).
+        Checked via AST, since the module docstring talks about the distinction.
         """
         import ast
         import schema
@@ -96,10 +89,9 @@ class TestGlyphHeight:
         assert record.effective_glyph_px() == pytest.approx(55.0)
 
     def test_two_row_plates_estimate_half_the_band(self):
-        """A double-row plate stacks two character bands in the same box, so the
-        glyphs are about half the height a single-row estimate would give.
-        Getting this wrong would put motorcycles in the wrong size bucket — the
-        bucket that matters most for CCTV."""
+        """Two-row plates stack two bands in one box, so glyphs are about half
+        a single-row estimate. Wrong, and motorcycles land in the wrong bucket,
+        the one that matters most for CCTV."""
         single = make_record("v", plate_bbox=[0.0, 0.0, 400.0, 100.0])
         double = make_record("v", plate_bbox=[0.0, 0.0, 400.0, 100.0], plate_row_layout="double")
         assert double.effective_glyph_px() == pytest.approx(single.effective_glyph_px() / 2)
@@ -159,8 +151,8 @@ class TestJsonlRoundTrip:
         assert len(records) == 1 and errors == []
 
     def test_serialization_omits_empty_optional_fields(self):
-        """Keeps the manifest readable and diffable, and avoids writing nulls
-        that later read as 'recorded as unknown' rather than 'not recorded'."""
+        """Keeps the manifest diffable, and a null would read as "recorded
+        unknown" rather than "not recorded"."""
         payload = json.loads(make_record("vehicle_001").to_json())
         assert "plate_quad" not in payload
         assert payload["vehicle_id"] == "vehicle_001"
@@ -168,8 +160,8 @@ class TestJsonlRoundTrip:
 
 class TestPrivacyOfIdentifiers:
     def test_the_record_carries_no_uri_or_credential_field(self):
-        """camera_id is an opaque deployment code by design. A source URI in the
-        manifest would put camera credentials into the dataset."""
+        """camera_id is an opaque code; a URI in the manifest would put camera
+        credentials in the dataset."""
         fields = set(PlateRecord.__dataclass_fields__)
         for forbidden in ("source_uri", "rtsp_url", "password", "username", "camera_url"):
             assert forbidden not in fields

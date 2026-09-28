@@ -1,18 +1,11 @@
-"""Final deep-debug pass — active attacks on POST /api/cameras/upload-video.
+"""Trying to break POST /api/cameras/upload-video.
 
-Everything here is a real attempt to break the endpoint, not a happy-path
-smoke test. Most cases PASS against the existing implementation (recorded as
-"attacked, no bug found"); one — the 0-byte upload (BUG-B) — was a genuine
-finding and is locked down below.
+Most cases already held; the 0-byte upload was a real bug and is pinned below.
 
-Explicitly NOT claimed: content-type sniffing. The endpoint validates the
-extension, not the bytes, so an arbitrary blob named `.mp4` is stored. That
-is bounded rather than dangerous here: `uploads_dir` is written by this
-endpoint and never served over HTTP by anything (verified — no StaticFiles
-mount, no FileResponse from it; the only other reference is a writability
-check in routers/system.py), so an uploaded blob is inert on disk and can
-only ever be handed to cv2.VideoCapture as a camera source. See the final
-report's residual-risk list.
+Content is only checked against a deny-list of clearly non-video types, not
+fully sniffed. That's fine here: uploads_dir is never served over HTTP (no
+StaticFiles, no FileResponse; routers/system.py only checks it's writable),
+so a stored blob is inert and can only be handed to cv2.VideoCapture.
 """
 import pytest
 
@@ -33,8 +26,7 @@ def _upload(client, auth, filename: str, content: bytes):
 
 
 class TestPathTraversal:
-    """The UUID-rename defense: a client filename must NEVER influence the
-    path on disk. Every case here previously passed and must keep passing."""
+    """A client filename never affects the path on disk."""
 
     @pytest.mark.parametrize("evil_name", [
         "../../../../etc/passwd.mp4",
@@ -75,9 +67,8 @@ class TestExtensionAllowList:
 
 class TestEmptyUpload:
     def test_a_zero_byte_upload_is_rejected_and_leaves_no_file(self, client, auth):
-        """BUG-B: a 0-byte upload was accepted with 200 and left a permanent
-        0-byte file on disk, usable as a camera source that could never
-        open."""
+        """A 0-byte upload got a 200 and stayed on disk as a camera source
+        that could never open."""
         before = {p.name for p in settings.uploads_dir.iterdir()}
         resp = _upload(client, auth, "empty.mp4", b"")
         assert resp.status_code == 400, "a 0-byte file is not a video and must be rejected"
@@ -87,9 +78,8 @@ class TestEmptyUpload:
 
 
 class TestContentValidation:
-    """C2: the extension allow-list alone accepted an arbitrary blob renamed
-    `.mp4` — measured, a PE executable and a ZIP were both stored. Now
-    definitively-non-video content is refused."""
+    """The extension check alone stored an exe and a zip renamed .mp4;
+    clearly non-video content is refused now."""
 
     @pytest.mark.parametrize("label,payload", [
         ("windows executable", b"MZ\x90\x00\x03\x00\x00\x00"),
@@ -109,8 +99,7 @@ class TestContentValidation:
         assert {p.name for p in settings.uploads_dir.iterdir()} == before, f"{label} left a file on disk"
 
     def test_a_real_mp4_header_is_accepted(self, client, auth):
-        """The demo asset's actual first bytes — the check must not reject
-        genuine video."""
+        """The demo video's real first bytes still pass."""
         real_mp4_head = b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00isomiso2mp41"
         assert _upload(client, auth, "real.mp4", real_mp4_head + b"\x00" * 64).status_code == 200
 
@@ -121,16 +110,13 @@ class TestContentValidation:
         b"\x00\x01\x02\x03unrecognised but plausible",    # unknown -> allowed on purpose
     ])
     def test_video_and_unrecognised_content_is_still_allowed(self, client, auth, payload):
-        """Deny-list, not allow-list: an unusual or unknown container must
-        NOT be rejected just because this check does not recognise it."""
+        """Deny-list: an unknown container isn't rejected just for being unknown."""
         assert _upload(client, auth, "clip.mp4", payload).status_code == 200
 
 
 class TestSizeCap:
     def test_an_over_cap_upload_is_rejected_and_cleaned_up(self, client, auth, monkeypatch):
-        """The streaming size cap must both reject AND delete the partial
-        file — an enforced cap that leaves the oversized bytes on disk is not
-        a cap."""
+        """The size cap rejects AND deletes the partial file."""
         monkeypatch.setattr(settings, "max_upload_mb", 1)
         before = {p.name for p in settings.uploads_dir.iterdir()}
 
@@ -152,8 +138,7 @@ class TestAuthorization:
 
 class TestConcurrentUploads:
     def test_simultaneous_uploads_never_collide_on_a_filename(self, client, auth):
-        """Names are UUIDs, so concurrent uploads must never overwrite each
-        other — the classic "two users upload clip.mp4" data-loss bug."""
+        """UUID names, so two people uploading clip.mp4 don't overwrite each other."""
         names = set()
         for _ in range(8):
             resp = _upload(client, auth, "same-name.mp4", b"\x00\x01payload")

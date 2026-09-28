@@ -1,29 +1,17 @@
-"""CAMERA CONTROL CENTER — bulk camera operations (Self-Heal spec Parts 3-6).
+"""Camera Control Center: bulk camera operations.
 
-Reuses the exact same per-camera actions the existing single-camera
-endpoints already use (routers/cameras.py's start_camera/stop_camera/
-restart_camera, pipeline.worker.start_worker/stop_worker,
-pipeline.supervisor.connect/disconnect) — this router adds no new camera
-lifecycle logic, only a bounded-concurrency loop over the existing one, plus
-progress broadcast and one audit-log entry per bulk call.
+Same per-camera actions as the single-camera endpoints (cameras.py,
+worker.start_worker/stop_worker, supervisor.connect/disconnect), run with
+bounded concurrency, with progress broadcasts and one audit entry per call.
 
-Action semantics (mapped onto what this codebase actually has — no
-fabricated states):
-  connect   — open the camera's stream/worker; AI stays whatever it's
-              already configured to (identical to POST /{id}/start).
-  start     — alias of connect. This codebase has no real distinction
-              between "connect" and "start" for a camera worker (both mean
-              "make the stream flow") — aliased rather than inventing a
-              fake difference.
-  start_ai  — ensures the camera is connected, then enables AI
-              (ai_person/ai_vehicle/ai_anpr = True). Never starts a second
-              AI worker for an already-running camera (worker.py's
-              start_worker/get_model already no-op/reuse per camera).
-  stop      — disables AI (ai_person/ai_vehicle/ai_anpr = False) while
-              KEEPING the stream connected — "AI STOPPED", camera stays
-              online. Distinct from disconnect.
-  restart   — disconnect then reconnect (identical to POST /{id}/restart).
-  disconnect— fully stops the worker (identical to POST /{id}/stop).
+Actions:
+  connect    open the stream/worker; AI unchanged (= POST /{id}/start)
+  start      same as connect; there's no real difference for a worker
+  start_ai   connect if needed, then ai_person/ai_vehicle/ai_anpr = True.
+             Never a second worker for a running camera
+  stop       AI flags False, stream stays connected ("AI STOPPED")
+  restart    disconnect then reconnect (= POST /{id}/restart)
+  disconnect stop the worker (= POST /{id}/stop)
 """
 import asyncio
 import uuid
@@ -48,18 +36,14 @@ router = APIRouter(prefix="/api/cameras/bulk", tags=["camera-control"])
 
 BulkAction = Literal["connect", "start", "start_ai", "restart", "stop", "disconnect"]
 
-# Disruptive actions the frontend must show a confirmation dialog for
-# (Part 4) — exposed so the UI doesn't have to hardcode its own copy of
-# this list.
+# actions the UI must confirm; exposed so it doesn't keep its own copy
 DISRUPTIVE_ACTIONS = {"restart", "disconnect", "stop"}
 
-MAX_CONCURRENT = 5  # bounded batching (Part 4) — never fire dozens of simultaneous operations
+MAX_CONCURRENT = 5  # never fire dozens of operations at once
 
-# Duplicate-click / overlapping-bulk-op guard: camera_ids currently being
-# acted on by ANY in-flight bulk call. A camera already in here is skipped
-# (not double-actioned) rather than racing two bulk operations against the
-# same worker. In-memory, process-local — cleared as each camera finishes,
-# regardless of the outcome.
+# Cameras some in-flight bulk call is working on. A camera already here is
+# skipped instead of racing two bulk ops on one worker (double clicks,
+# overlapping calls). In memory, removed as each camera finishes either way.
 _IN_PROGRESS: set[str] = set()
 
 
@@ -69,13 +53,9 @@ class BulkRequest(BaseModel):
 
 
 async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code: str) -> bool:
-    """Final-review audit finding: this used to be a plain `db.commit()`,
-    bypassing this same PR's own SQLite-lock retry — inconsistent with
-    every other write path in the app under exactly the sustained
-    multi-camera contention this PR exists to survive, and worse, a bulk
-    call runs up to MAX_CONCURRENT of these concurrently (more simultaneous
-    writers than a single API request normally creates). Now goes through
-    db_retry.safe_commit like worker.py's writes."""
+    """Through safe_commit like the pipeline writes; a bulk call runs up to
+    MAX_CONCURRENT of these at once, more writers than one request normally
+    makes."""
     camera.ai_person = enabled  # type: ignore[assignment]
     camera.ai_vehicle = enabled  # type: ignore[assignment]
     camera.ai_anpr = enabled  # type: ignore[assignment]
@@ -89,11 +69,9 @@ async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code
 
 
 async def _apply_one(action: BulkAction, camera_id: str) -> dict:
-    """Runs one camera's action against a SHORT-LIVED session of its own
-    (never the request's shared session — these run concurrently under the
-    semaphore below) and never raises; every outcome (including an
-    exception) becomes a result dict so one camera's failure can never abort
-    the batch."""
+    """One camera's action on its own short-lived session (these run
+    concurrently, so never the request's session). Never raises; every
+    outcome becomes a result dict so one failure can't abort the batch."""
     db = SessionLocal()
     try:
         camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
@@ -117,25 +95,22 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
             refusal = ai_capacity.blocked(camera_id)
             if refusal is not None:
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": refusal}
-            ai_capacity.try_acquire(camera_id)
+            got_slot = ai_capacity.try_acquire(camera_id)
             if camera.source_type == "sentinel_grid":
                 supervisor.connect(camera_id)
             else:
                 start_worker(camera_id)
             if not await _set_ai(db, camera, True, code):
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Connected, but AI-enable write did not persist (database busy) — retry"}
-            detail = "AI started"
+            detail = "AI started" if got_slot else "AI on, waiting for its turn on an AI slot"
         elif action == "stop":
             ai_capacity.release(camera_id)
             if not await _set_ai(db, camera, False, code):
                 return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "AI-disable write did not persist (database busy) — retry"}
             detail = "AI stopped"
         elif action == "restart":
-            # Audit finding: raw stop_worker+start_worker bypassed
-            # supervisor.py's AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping
-            # for a sentinel_grid camera. supervisor.restart is the single
-            # shared implementation also used by the single-camera restart
-            # endpoint (routers/cameras.py) — reused, not duplicated.
+            # supervisor.restart keeps the grid bookkeeping right, same as the
+            # single-camera restart endpoint
             await supervisor.restart(camera_id, str(camera.source_type))
             detail = "Restarted"
         elif action == "disconnect":
@@ -158,11 +133,9 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
     except Exception as exc:
         return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": f"{type(exc).__name__}: {exc}"}
     finally:
-        # close_session, not db.close(): this session is used by safe_commit,
-        # which hands the actual commit to a worker thread. If this coroutine is
-        # cancelled while that thread is mid-commit, a plain close() races it and
-        # raises IllegalStateChangeError — the same defect fixed in worker.py's
-        # camera loop. See db_retry.close_session.
+        # close_session, not db.close(): safe_commit runs the commit on a
+        # thread, and a cancelled close() races it (IllegalStateChangeError,
+        # see db_retry.close_session)
         close_session(db)
 
 

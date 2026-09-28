@@ -1,6 +1,5 @@
-"""Global + advanced search. 'Natural-language search' is a keyword/regex
-parser mapping free text to structured filters (doc §58) — not an LLM/NLP
-model; documented non-goal.
+"""Global and advanced search. The "natural language" part is a keyword/regex
+parser that maps text to filters (doc §58), not an NLP model.
 """
 import re
 from fastapi import APIRouter, Depends, Query
@@ -14,22 +13,16 @@ from ..pipeline.anpr import normalize_plate
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
-# Word-bounded: without \b the pattern matched INSIDE longer words, so a query
-# word such as "ZTIME1BC234" had "ME1BC234" carved out as a plate and the rest
-# ("ZTI") used as the text filter — a search for one thing returning another.
+# \b so it doesn't match inside a longer word: ZTIME1BC234 got ME1BC234
+# carved out as a plate and ZTI used as the text filter
 PLATE_TOKEN_RE = re.compile(r"\b[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{3,4}\b", re.IGNORECASE)
 TIME_AFTER_RE = re.compile(r"after\s+(\d{1,2})\s*(am|pm)?", re.IGNORECASE)
 TIME_BEFORE_RE = re.compile(r"before\s+(\d{1,2})\s*(am|pm)?", re.IGNORECASE)
 
 
 def _to_24_hour(hour: int, meridiem: str) -> int:
-    """12-hour clock to 24-hour.
-
-    Both ends of the clock are special and only one used to be handled: `12pm`
-    is noon (12, not 24) and `12am` is MIDNIGHT (0, not 12). The `am` case was
-    missing, so "after 12am" parsed to hour 12 — noon — and an operator asking
-    for overnight activity was quietly given an afternoon filter.
-    """
+    """12h to 24h. 12pm is noon (12) and 12am is midnight (0); the am case was
+    missing, so "after 12am" became noon."""
     meridiem = (meridiem or "").lower()
     if meridiem == "pm" and hour != 12:
         return hour + 12
@@ -39,15 +32,12 @@ def _to_24_hour(hour: int, meridiem: str) -> int:
 
 
 def parse_natural_language(text: str) -> dict:
-    """Very small heuristic parser: extracts a plate token and after/before hour hints.
+    """Tiny heuristic parser: a plate token and after/before hour hints.
 
-    Also returns `text`: the query with every recognized phrase REMOVED, for
-    the caller to use as the free-text match. Without that, a recognized
-    phrase stayed in the pattern and text+filter searches could never match
-    anything — "GJ05AB1234 after 6pm" searched for the literal string
-    "%GJ05AB1234 after 6pm%", which no camera name or incident title contains,
-    so the sections came back empty while the response advertised that it had
-    understood both the plate and the time.
+    Also returns `text`, the query with recognized phrases removed, for the
+    free-text match. Leaving them in meant "GJ05AB1234 after 6pm" searched
+    for that literal string and found nothing, while the response said it had
+    understood the plate and the time.
     """
     filters: dict = {"raw_query": text}
     residual = text
@@ -87,11 +77,9 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     filters = parse_natural_language(q)
     results: dict = {"query": q, "parsed_filters": filters, "cameras": [], "vehicles": [], "plates": [], "incidents": [], "alerts": []}
 
-    # The free-text pattern is built from the query with recognized phrases
-    # REMOVED (see parse_natural_language), so text and filters compose. An
-    # empty residual means the operator typed only filter phrases ("after
-    # 6pm"); that must not become "%%", which matches every row — it means
-    # "no text constraint", and the hour filters below carry the query.
+    # Text pattern is the query minus recognized phrases so text and filters
+    # combine. Nothing left (just "after 6pm") means no text constraint, not
+    # "%%", which matches everything.
     text = filters.get("text") or ""
     like = like_pattern(text) if text else None
 
@@ -105,20 +93,14 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
                 | (models.Camera.location.ilike(like, escape=LIKE_ESCAPE))
             ).limit(20)
         ]
-    # With no text there is nothing to match a camera on: a camera has no
-    # timestamp, so an hour filter cannot select one. The section stays empty
-    # rather than returning every camera in the system.
+    # no text, nothing to match cameras on (they have no timestamp for the
+    # hour filter), so that section stays empty
 
-    # The parsed hour hints are now APPLIED, not merely reported. They used to
-    # be extracted, returned in `parsed_filters`, and rendered to the operator
-    # by the search page — while every query ignored them. Someone searching
-    # "vehicles after 6pm" was shown `after_hour: 18` next to results that had
-    # never been filtered by time, which in an investigative tool invites a
-    # wrong conclusion from a screen that looks correct.
+    # Hour hints are applied, not just echoed back in parsed_filters; the page
+    # used to show after_hour: 18 next to unfiltered results.
     #
-    # Hour-of-day, not a date range: "after 6pm" is a recurring-time question
-    # ("what moves through here in the evening"), which is what the phrasing
-    # actually asks. `extract` compiles on both SQLite and PostgreSQL.
+    # Hour of day, not a date range: "after 6pm" asks what happens in the
+    # evenings. extract() works on SQLite and PostgreSQL.
     def _hour_conditions(column):
         conditions = []
         if "after_hour" in filters:
@@ -127,18 +109,14 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
             conditions.append(extract("hour", column) < filters["before_hour"])
         return conditions
 
-    # `entity` is applied by SUPPRESSING the sections it excludes. There is no
-    # persons section in this response, so a person-focused query cannot add
-    # one — but it can stop returning vehicles the operator did not ask about,
-    # which is the honest half of the behaviour the filter advertises.
+    # entity works by hiding the sections it excludes. there's no persons
+    # section to add, but it can stop returning vehicles nobody asked for
     wants_vehicles = filters.get("entity") != "person"
 
-    # Every section below is built the same way: apply only the constraints the
-    # query actually carries, and return nothing when it carries none for that
-    # section. `like` is None for a query made entirely of recognized phrases
-    # (searching a bare plate leaves no residual text) — passing that straight
-    # to `.ilike()` raises ArgumentError, which turned an ordinary plate search
-    # into a 500.
+    # Each section applies only the constraints the query has and returns
+    # nothing when it has none for it. like is None for a query that's all
+    # recognized phrases (a bare plate), and .ilike(None) raised
+    # ArgumentError, a 500 on a plain plate search.
     if wants_vehicles:
         plate_filter = filters.get("plate")
         vehicle_hours = _hour_conditions(models.Vehicle.last_seen)
@@ -169,11 +147,8 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
             for i in incidents_q.limit(20)
         ]
 
-    # Bug fix: this previously filtered `Alert.camera_id.ilike(like)` — matching
-    # an opaque internal id column against the operator's free text, so the
-    # alerts section of a global search was permanently empty. Alerts are now
-    # found the way an operator would actually look for them: by the camera they
-    # fired on (code/name, resolved above) and by the vehicle plate involved.
+    # alerts by the camera they fired on (code/name from above) and the plate;
+    # this used to ilike the opaque camera_id column, so it was always empty
     alert_filters = []
     camera_ids = [c["id"] for c in results["cameras"]]
     if camera_ids:
@@ -184,10 +159,7 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     if alert_filters:
         from sqlalchemy import or_
         alerts_q = db.query(models.Alert).filter(or_(*alert_filters))
-        # Same hour scoping as the vehicle and incident sections. Leaving
-        # alerts unfiltered would reproduce, in one section, exactly the
-        # inconsistency this change exists to remove: a response that claims
-        # a time filter while part of it ignores that filter.
+        # same hour scoping as vehicles and incidents
         for condition in _hour_conditions(models.Alert.timestamp):
             alerts_q = alerts_q.filter(condition)
         alert_rows = alerts_q.order_by(models.Alert.timestamp.desc()).limit(20).all()

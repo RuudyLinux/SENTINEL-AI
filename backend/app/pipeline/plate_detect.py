@@ -1,13 +1,7 @@
-"""Backward-compatible facade over `plate_detector` + `plate_preprocess`.
+"""Old entry point, delegating to plate_detector + plate_preprocess.
 
-The plate-localization logic moved to `plate_detector` (candidate regions with
-explicit confidence and provenance) and `plate_preprocess` (perspective
-correction and preprocessing variants). This module stays because it is the
-published import path — `tools/anpr_bench.py`, `tools/live_detect_probe.py` and
-the existing test suite all call `plate_detect.locate_plate` — and breaking a
-working contract to rename a module buys nothing.
-
-Everything here delegates. No localization logic lives in this file.
+Kept because tools/anpr_bench.py, tools/live_detect_probe.py and the tests
+call plate_detect.locate_plate. No logic of its own.
 """
 import numpy as np
 
@@ -24,26 +18,18 @@ from .plate_detector import (  # noqa: F401  (re-exported for existing callers/t
 
 
 def _preprocess_for_ocr(plate_crop: np.ndarray) -> np.ndarray:
-    """Upscale + contrast-normalize a plate region before OCR.
-
-    Preserved verbatim in behavior (upscale to `plate_ocr_target_height`, then
-    grayscale + CLAHE) — it is now expressed as the `clahe` preprocessing
-    variant, which is the production default precisely so that this path is
-    unchanged.
-    """
+    """Upscale + contrast-normalize a plate before OCR. Same behaviour as
+    before (upscale, gray, CLAHE), now just the default `clahe` variant."""
     variants = plate_preprocess.build_variants(plate_crop, quad=None, variant_names=("clahe",))
     return variants[0][1] if variants else plate_crop
 
 
 def locate_plate(vehicle_crop: np.ndarray) -> "tuple[np.ndarray, list[float]] | None":
-    """Find the plate inside a vehicle crop.
+    """Find the plate in a vehicle crop.
 
-    Returns `(ocr_ready_plate_image, [x1, y1, x2, y2])` with the bbox in the
-    vehicle crop's own coordinate space, or None when no plausible plate region
-    was found (caller falls back to whole-crop OCR).
-
-    Kept as the single-best-box API the pre-existing callers expect.
-    `plate_detector.detect_plates` is the richer interface for new code.
+    (ocr_ready_image, [x1, y1, x2, y2]) in crop coordinates, or None (caller
+    reads the whole crop). Single best box for old callers;
+    plate_detector.detect_plates is the richer one.
     """
     boxes = plate_detector.detect_plates(vehicle_crop)
     if not boxes:

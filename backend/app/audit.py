@@ -1,19 +1,14 @@
-"""Audit logging with a tamper-evident hash chain (10/10 roadmap P9).
+"""Audit logging with a tamper-evident hash chain.
 
-Each row's `entry_hash` is sha256(prev_hash + this row's own canonical
-fields); `prev_hash` is the entry_hash of the row before it in the chain
-(the genesis row uses "0"*64). Deleting or editing ANY row breaks every
-`entry_hash` computed after it — that propagating break, not any single row
-in isolation, is what `verify_chain` in this module (and
-`GET /api/audit/verify-chain`) detects. This is deliberately NOT
-"blockchain" — no consensus, no mining, no distributed ledger — just the
-same hash-chaining primitive blockchains use for the one property this
-system actually needs: tamper evidence on an append-only log.
+entry_hash = sha256(prev_hash + the row's canonical fields), prev_hash is the
+previous row's entry_hash ("0"*64 for the first). Edit or delete any row and
+every hash after it breaks; verify_chain (GET /api/audit/verify-chain) looks
+for that. Just hash chaining for tamper evidence on an append-only log, no
+consensus or ledger.
 
-`chain_seq` orders the chain (AuditLog.id is a random uid, not insertion-
-ordered) and is UNIQUE, so a concurrent-write race that would otherwise
-silently mis-order the chain instead raises an IntegrityError, which is
-retried against a freshly-read tail rather than swallowed.
+chain_seq orders the chain (ids are random) and is unique, so a concurrent
+writer raises IntegrityError and we retry against the new tail instead of
+mis-ordering it.
 """
 import hashlib
 import logging
@@ -28,37 +23,21 @@ logger = logging.getLogger("sentinel.audit")
 GENESIS_HASH = "0" * 64
 _MAX_CHAIN_RETRIES = 5
 
-# Upper bound on the `resource` a single audit row may store.
+# Max length of `resource`. A failed login audits the submitted username, so
+# this takes unauthenticated attacker text: a 5,000-char username made a
+# 5,000-char row and the audit table (whitespace-nowrap) rendered 36,215px
+# wide. The rate limiter bounds how many attempts, not how big each row is.
 #
-# Real, reachable case: `POST /api/auth/login` audits a failed attempt with the
-# SUBMITTED username as the resource, so this column takes attacker-controlled
-# text with no account and no credential behind it. Measured against the
-# running system before this bound existed — a 5,000-character username stored
-# a 5,000-character row, and the audit page (every cell `whitespace-nowrap`)
-# rendered a table 36,215px wide, making the compliance screen unusable. The
-# login rate limiter bounds how MANY attempts are made; nothing bounded how
-# LARGE each one's audit row was.
-#
-# Applied here rather than at the login call site because this function is the
-# single funnel every audit write passes through, so the bound covers callers
-# that do not exist yet — and the login path is only the one that happens to be
-# reachable without credentials, not the only one taking free text.
-#
-# 512 is far above every identifier the system actually records (a uid is ~14
-# characters, the longest real resource is a comma-joined camera list from
-# demo_reset) and far below anything that can distort a table or a datastore.
+# Here and not in the login route because every audit write goes through this
+# function. 512 is way above any real resource (uids are ~14 chars, the
+# longest is demo_reset's camera list).
 MAX_AUDIT_RESOURCE_CHARS = 512
 _TRUNCATION_MARKER = "...[truncated]"
 
 
 def _bounded_resource(resource: str) -> str:
-    """Bound `resource`, and SAY SO when it was shortened.
-
-    A silent cut would make the audit trail quietly disagree with what was
-    actually submitted, which is worse than a shortened value: a reader of the
-    log could not tell a 512-character resource from a 5,000-character one.
-    The marker is inside the bound, so the stored string never exceeds it.
-    """
+    """Cap `resource` and mark it when shortened, so a reader can tell a
+    cut value from a real one. The marker fits inside the cap."""
     if resource is None:
         return ""
     if len(resource) <= MAX_AUDIT_RESOURCE_CHARS:
@@ -67,9 +46,8 @@ def _bounded_resource(resource: str) -> str:
 
 
 def _canonical_fields(entry: models.AuditLog) -> str:
-    """Deterministic string of everything the hash must cover. Field ORDER is
-    part of the contract — changing it changes every future hash, so this is
-    intentionally simple and stable rather than a generic serializer."""
+    """Everything the hash covers, as one string. Field order is part of the
+    contract, changing it changes every future hash."""
     return "|".join([
         str(entry.chain_seq), entry.id, entry.user_id or "", entry.username or "",
         entry.action or "", entry.resource or "", entry.result or "", entry.ip or "",
@@ -85,19 +63,15 @@ def log_action(
     db: Session, user: "models.User | None", action: str, resource: str = "", result: str = "SUCCESS",
     ip: str = "", actor: "str | None" = None,
 ):
-    """Insert one audit row and extend the hash chain.
+    """Insert an audit row and extend the chain.
 
-    Best-effort against races the same way SelfHealEvent is (see models.py):
-    under genuinely concurrent writers this retries on a chain_seq collision
-    rather than silently corrupting the chain, but is not a distributed
-    consensus mechanism — if it cannot land a consistent link within a few
-    attempts it logs the failure and still returns, because a missed audit
-    LINK must never block the real operation it is describing.
+    Retries on a chain_seq collision instead of corrupting the chain. If it
+    still can't land a link after a few tries it logs and returns: a missed
+    audit link must never block the operation being audited.
     """
     from datetime import datetime
 
-    # Bounded before the entry is built, so the value that is hashed is the
-    # value that is stored — the chain covers exactly what the row contains.
+    # cap first so the hashed value is exactly the stored value
     resource = _bounded_resource(resource)
 
     for attempt in range(_MAX_CHAIN_RETRIES):
@@ -106,12 +80,10 @@ def log_action(
         next_seq = (tail.chain_seq + 1) if (tail is not None and tail.chain_seq is not None) else 1
 
         entry = models.AuditLog(
-            id=models.uid("aud"),  # generated explicitly (not left to the Column default) so it is
-            # known BEFORE the hash is computed — a Python-side Column default is only
-            # evaluated by SQLAlchemy at flush time, too late for compute_entry_hash below.
+            id=models.uid("aud"),  # set here, the column default only runs at flush, after the hash
             user_id=user.id if user else None,
-            # `actor` names a non-user origin ("system"); "anonymous" stays for
-            # unauthenticated requests such as a failed login.
+            # actor names a non-user origin ("system"); "anonymous" is for
+            # unauthenticated requests like a failed login
             username=user.username if user else (actor or "anonymous"),
             action=action, resource=resource, result=result, ip=ip,
             timestamp=datetime.utcnow(), chain_seq=next_seq, prev_hash=prev_hash,
@@ -122,17 +94,13 @@ def log_action(
             db.commit()
             return entry
         except IntegrityError:
-            # Another writer took this chain_seq between our read and our
-            # commit — roll back and retry against the now-current tail.
+            # someone else took this chain_seq, roll back and retry on the new tail
             db.rollback()
             continue
         except OperationalError as exc:
-            # A camera worker holding SQLite's write lock past the busy
-            # timeout. This was not caught at all, so the lock escaped as a
-            # 500 on the operation being audited — an upload, an alert
-            # acknowledgement, an evidence download — contradicting this
-            # function's own contract above. Retried like a chain collision;
-            # anything that is not a lock is still a real error and raised.
+            # A camera worker held the write lock past the busy timeout. This
+            # used to escape as a 500 on whatever was being audited (upload,
+            # ack, download). Retried like a collision; other errors raise.
             if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                 raise
             db.rollback()
@@ -143,11 +111,9 @@ def log_action(
 
 
 def verify_chain(db: Session) -> dict:
-    """Walk the full chain in order and confirm every link. Returns
-    {"valid": bool, "checked": N, "broken_at": chain_seq | None, "detail": str}.
-    A missing baseline (rows written before this feature existed, chain_seq
-    NULL) is reported honestly rather than silently skipped or treated as
-    valid — those rows predate the chain and cannot be verified by it."""
+    """Walk the chain and check every link. Returns {"valid", "checked",
+    "broken_at", "detail"}. Rows from before the chain existed (chain_seq
+    NULL) are reported as such, not skipped or counted as valid."""
     rows = db.query(models.AuditLog).order_by(models.AuditLog.chain_seq.asc()).all()
     unchained = [r for r in rows if r.chain_seq is None]
     chained = [r for r in rows if r.chain_seq is not None]

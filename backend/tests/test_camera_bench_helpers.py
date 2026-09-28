@@ -1,9 +1,6 @@
-"""Unit coverage for tools/camera_bench.py's pure helper only. The tool's
-real work (spinning up N real camera workers with real YOLO+OCR inference)
-is deliberately NOT exercised in the regular suite — it is a multi-second,
-CPU-heavy real workload meant to be run deliberately (see the tool's own
-docstring), not on every test run. Import path mirrors tools/anpr_bench.py's
-own pattern of living outside `app/` with its own sys.path insert.
+"""Only camera_bench's pure helper. The real benchmark (N workers with YOLO +
+OCR) is slow and CPU-heavy and meant to be run on purpose, not every test
+run. Imported with its own sys.path insert like anpr_bench.
 """
 import importlib.util
 import sys

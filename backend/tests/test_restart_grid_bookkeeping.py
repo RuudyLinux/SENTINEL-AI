@@ -1,25 +1,13 @@
-"""End-to-end (real HTTP, real RBAC) regression tests for the PR #1 review
-finding: restarting a real Sentinel Grid camera — via either the
-single-camera endpoint or the bulk Camera Control Center endpoint — must
-leave it correctly registered with the 24/7 auto-reconnect supervisor
-(pipeline/supervisor.py), not just "the worker restarted". Both endpoints
-now share one implementation (supervisor.restart) — these tests exercise
-each entry point independently so a future change to either can't silently
-reintroduce the drift PR #1's review caught.
+"""Restarting a grid camera, via the single-camera or the bulk endpoint,
+leaves it registered with the supervisor, not just restarted. Both go through
+supervisor.restart; each entry point is tested separately.
 
-worker.start_worker/stop_worker are monkeypatched here (same technique as
-test_supervisor.py) rather than left real: a real sentinel_grid camera
-worker goes through the real SentinelGridAdapter, which — even with no
-credentials configured (forced empty for the whole suite, see
-conftest.py) — was measured to leave a real asyncio.to_thread call
-occupying a thread-pool slot for a real multi-second timeout, which
-doesn't respond to task.cancel() (cancellation doesn't interrupt a
-synchronous call already running in a worker thread) and was observed to
-slow down and occasionally destabilize unrelated later tests sharing the
-same default executor. These tests are about the AUTO_MANAGED/
-OPERATOR_DISCONNECTED bookkeeping around start/stop, not the adapter
-itself (covered separately by test_sentinel_grid.py/test_adapters.py), so
-mocking the worker boundary is the correct isolation, not a shortcut.
+worker.start_worker/stop_worker are faked (like test_supervisor.py). A real
+grid worker goes through SentinelGridAdapter, which even without credentials
+held a to_thread slot for a multi-second timeout that cancel() can't
+interrupt, and that slowed and destabilized later tests on the same
+executor. This is about AUTO_MANAGED/OPERATOR_DISCONNECTED bookkeeping; the
+adapter has its own tests.
 """
 from app import models
 from app.pipeline import supervisor
@@ -63,9 +51,8 @@ def test_single_camera_restart_endpoint_rejoins_grid_camera_to_auto_managed(clie
         resp = client.post(f"/api/cameras/{cam.id}/restart", headers=_auth(admin_token))
         assert resp.status_code == 200, resp.text
 
-        # The real invariant PR #1's review flagged: restart must clear
-        # OPERATOR_DISCONNECTED and (re)join AUTO_MANAGED — the supervisor's
-        # next sweep must be able to see and manage this camera again.
+        # restart clears OPERATOR_DISCONNECTED and rejoins AUTO_MANAGED, so the
+        # next sweep manages it again
         assert cam.id not in supervisor.OPERATOR_DISCONNECTED
         assert cam.id in supervisor.AUTO_MANAGED
         assert stopped == [cam.id]
@@ -97,9 +84,7 @@ def test_bulk_restart_endpoint_rejoins_grid_camera_to_auto_managed(client, admin
 
 
 def test_restart_rbac_still_enforced_for_both_endpoints(client, db_session, monkeypatch):
-    """Confirms the shared supervisor.restart() refactor didn't loosen
-    RBAC on either entry point — both still require Administrator/Control
-    Room Operator, same as every other camera-control action."""
+    """Both entry points still need Administrator/Control Room Operator."""
     from app.security import hash_password, create_access_token
 
     _mock_worker(monkeypatch)

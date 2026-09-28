@@ -1,13 +1,8 @@
-"""Evidence integrity: the hash must be a baseline, and verify must compare.
+"""Evidence integrity: the hash is a capture-time baseline and verify compares.
 
-The defect this pins down: `POST /api/evidence/{id}/verify` computed a SHA-256
-at VERIFICATION time, stored it, and stamped the record "verified". With no
-digest recorded at capture there was nothing to compare against, so a file
-altered between capture and inspection hashed cleanly and was reported as
-verified — the wrong answer in the one situation the feature exists for.
-
-Evidence is now hashed when it is captured, and verify performs a real
-comparison and reports an honest outcome.
+verify used to hash the file at verification time, store that and say
+"verified". With nothing captured to compare against, a file changed after
+capture was reported as verified.
 """
 import hashlib
 
@@ -51,15 +46,14 @@ class TestHashHelper:
         assert sha256_file(str(evidence_file)) == expected
 
     def test_chunked_reading_gives_the_same_digest_for_a_large_file(self, tmp_path):
-        """Clips are real MP4s read in chunks; the digest must be identical to
-        a whole-file hash or every comparison would be a false mismatch."""
+        """Chunked hashing of an MP4 must match a whole-file hash, or every
+        comparison is a false mismatch."""
         big = tmp_path / "clip.mp4"
         big.write_bytes(b"x" * (3 * 1024 * 1024 + 17))
         assert sha256_file(str(big)) == hashlib.sha256(big.read_bytes()).hexdigest()
 
     def test_returns_empty_rather_than_raising_on_a_missing_file(self):
-        """Hashing is an integrity aid, not the operation — a genuinely
-        captured snapshot must still be recorded even if hashing fails."""
+        """A captured snapshot is still recorded if hashing fails."""
         assert sha256_file("/no/such/file.jpg") == ""
         assert sha256_file(None) == ""
         assert sha256_file("") == ""
@@ -75,8 +69,7 @@ class TestVerification:
         assert body["ok"] is True
 
     def test_a_modified_file_is_reported_as_tampered(self, client, auth, evidence_file):
-        """The case the old implementation got wrong: it re-hashed the altered
-        file and called it verified."""
+        """What the old code got wrong: rehash the altered file, call it verified."""
         eid = _evidence(evidence_file, sha256_file(str(evidence_file)))
         evidence_file.write_bytes(b"substituted frame bytes")
 
@@ -86,8 +79,8 @@ class TestVerification:
         assert body["ok"] is False
 
     def test_the_capture_time_digest_is_never_overwritten_by_a_tamper_check(self, client, auth, evidence_file):
-        """The original digest IS the record of what was captured. Replacing it
-        with the altered file's hash would destroy the evidence of tampering."""
+        """The original digest is the record; overwriting it would erase the
+        proof of tampering."""
         baseline = sha256_file(str(evidence_file))
         eid = _evidence(evidence_file, baseline)
         evidence_file.write_bytes(b"substituted frame bytes")
@@ -103,8 +96,8 @@ class TestVerification:
             db.close()
 
     def test_a_record_with_no_baseline_does_not_claim_to_be_verified(self, client, auth, evidence_file):
-        """Evidence captured before capture-time hashing existed cannot be
-        confirmed unaltered, and must not pretend otherwise."""
+        """Evidence from before capture-time hashing can't be confirmed
+        unaltered and doesn't pretend to be."""
         eid = _evidence(evidence_file, None)
 
         body = client.post(f"/api/evidence/{eid}/verify", headers=auth).json()
@@ -123,8 +116,7 @@ class TestVerification:
         assert body["ok"] is False
 
     def test_a_failed_verification_is_audited_as_a_failure(self, client, auth, evidence_file):
-        """A tamper finding is exactly what an audit trail exists to carry;
-        recording every check as a success would bury it."""
+        """A tamper result goes in the audit trail as what it is."""
         eid = _evidence(evidence_file, sha256_file(str(evidence_file)))
         evidence_file.write_bytes(b"substituted")
         client.post(f"/api/evidence/{eid}/verify", headers=auth)

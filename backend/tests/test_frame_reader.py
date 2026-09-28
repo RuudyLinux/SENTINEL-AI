@@ -1,11 +1,10 @@
-"""Latest-frame reader: the live picture must stay current when AI is slower
-than the camera.
+"""Latest-frame reader: the picture stays current when AI is slower than the
+camera.
 
-Before this existed the camera loop read one frame, processed it, then read the
-next, so a 30fps stream consumed at ~5fps queued up: measured on the real grid,
-the picture ran at ~0.2x real time. These tests pin the replacement contract —
-newest frame wins, old frames are dropped rather than queued, memory is one
-frame, and the capture is released by the thread that owns it.
+The loop used to read, process, read again, so 30fps consumed at ~5fps queued
+up and the grid picture ran at ~0.2x real time. Pinned here: newest frame
+wins, old ones are dropped not queued, one frame of memory, and the owning
+thread releases the capture.
 """
 import asyncio
 import threading
@@ -160,12 +159,11 @@ def test_two_cameras_have_independent_readers():
 
 
 def test_camera_loop_drops_frames_and_stays_current_under_slow_ai(db_session, monkeypatch):
-    """End to end through the real camera loop: a fast live source and
-    deliberately slow processing. The loop must keep up with the newest frame
-    (frames dropped, frame age small) instead of falling behind."""
+    """Through the real loop: fast source, slow processing. It keeps up with
+    the newest frame (drops frames, small frame age) instead of falling behind."""
     cam_row = models.Camera(
         camera_code=f"C-LAG-{uuid.uuid4().hex[:6]}", name="lag", source_type="rtsp",
-        source_uri="rtsp://example.invalid/x", ai_person=False, ai_vehicle=False, ai_anpr=False,
+        source_uri="rtsp://example.invalid/x", ai_person=True, ai_vehicle=True, ai_anpr=False,
     )
     db_session.add(cam_row)
     db_session.commit()
@@ -205,3 +203,78 @@ def test_camera_loop_drops_frames_and_stays_current_under_slow_ai(db_session, mo
     assert st["frames_dropped"] > st["frames_read"]  # most camera frames skipped
     assert st["frame_age_ms"] is not None and st["frame_age_ms"] < 100
     assert source.released.wait(3)  # shutdown freed the capture
+
+
+def test_a_camera_without_ai_or_viewers_idles(db_session, monkeypatch):
+    """No AI and nobody watching: the loop only needs frames for the heartbeat
+    and an occasional preview, so it runs at _IDLE_LOOP_S, not camera speed."""
+    cam_row = models.Camera(
+        camera_code=f"C-IDLE-{uuid.uuid4().hex[:6]}", name="idle", source_type="rtsp",
+        source_uri="rtsp://example.invalid/x", ai_person=False, ai_vehicle=False, ai_anpr=False,
+    )
+    db_session.add(cam_row)
+    db_session.commit()
+    source = FastCamera(interval=0.005)
+
+    class FakeCameraSource:
+        def __init__(self, *_a):
+            pass
+
+        def open(self):
+            return True
+
+        read, pos_msec, release = source.read, source.pos_msec, source.release
+
+        def fps(self):
+            return 200.0
+
+        def resolution(self):
+            return "4x4"
+
+    monkeypatch.setattr(worker, "CameraSource", FakeCameraSource)
+    monkeypatch.setattr(worker, "_IDLE_LOOP_S", 0.3)
+
+    async def run():
+        task = asyncio.create_task(worker._camera_loop(cam_row.id))
+        await asyncio.sleep(1.5)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    st = worker._stats(cam_row.id)
+    assert 2 <= st["frames_read"] <= 7   # ~5 at 0.3s, nowhere near 300
+    assert source.released.wait(3)
+
+
+class _GrabCamera(FastCamera):
+    """Counts how many frames were converted (retrieve) vs just decoded."""
+    can_grab = True
+
+    def __init__(self, interval):
+        super().__init__(interval)
+        self.retrieved = 0
+
+    def grab(self):
+        ok, self._pending = self.read()
+        return ok
+
+    def retrieve(self):
+        self.retrieved += 1
+        return True, self._pending
+
+
+def test_the_reader_converts_only_frames_someone_takes():
+    cam = _GrabCamera(interval=0.005)
+    reader = LatestFrameReader(cam, "grab-cam")
+    reader.start()
+    seq = taken = 0
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        got = reader.next_frame(seq, 0, 1.0)
+        if got.frame is not None:
+            seq, taken = got.seq, taken + 1
+        time.sleep(0.05)
+    reader.stop()
+    reader.join(2)
+    assert reader.frames_read > 3 * taken      # decoded far more than handed out
+    assert cam.retrieved <= taken + 1          # but only converted what was taken

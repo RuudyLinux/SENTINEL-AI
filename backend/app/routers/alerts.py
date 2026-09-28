@@ -10,9 +10,8 @@ from ..audit import log_action
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
-# P6: the only feedback values the platform will compute precision/FP-rate
-# statistics from — a free-text value here would silently corrupt those
-# aggregates, so it is validated, not merely stored.
+# the only feedback values precision/FP stats are computed from, so validated
+# instead of free text
 _VALID_FEEDBACK = {"confirmed", "false_positive", "needs_review"}
 
 
@@ -25,23 +24,15 @@ def list_alerts(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent alerts, narrowed by any combination of the filters.
+    """Most recent alerts, filtered by any mix of the params.
 
-    The 200 was hard-coded and not client-controllable, so the Alert Center
-    could neither ask for a smaller page nor page past the ceiling. It is now
-    the DEFAULT rather than the only value, bounded exactly like the other
-    transactional lists (incidents, evidence, detections, self-heal): `ge=1`
-    because SQLite reads `LIMIT -1` as no limit at all, `le=500` so an
-    authenticated caller cannot turn one request into a full-table scan.
-    Raising the default would have been the wrong change — 200 is what the
-    screen has always shown and what its filter behaviour was tuned against.
+    limit defaults to 200 (what the Alert Center always showed) but is now
+    settable, bounded like the other lists: ge=1 because SQLite reads
+    LIMIT -1 as no limit, le=500 so one request can't scan the table.
 
-    `camera_id` is new. The Alert Center offered a per-camera view ("OPEN
-    ALERTS" from the single-camera page) but filtered CLIENT-side over
-    whatever this endpoint had already truncated to 200 — so a camera whose
-    alerts were not among the 200 most recent system-wide showed an empty
-    list, indistinguishable from a camera with no alerts at all. Filtering
-    before the limit is the only way that view can be correct.
+    camera_id filters server side. The per-camera view used to filter the
+    200 most recent system-wide on the client, so a camera with older alerts
+    showed an empty list, same as one with none.
     """
     q = db.query(models.Alert)
     if severity:
@@ -100,14 +91,12 @@ def submit_feedback(
     alert_id: str, payload: schemas.AlertFeedbackRequest,
     db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
-    """Operator judgement on whether this alert was real (10/10 roadmap P6).
+    """Operator verdict on whether the alert was real.
 
-    This is separate from `status` (new/acknowledged/escalated/dismissed),
-    which tracks WORKFLOW state, not accuracy — an alert can be dismissed for
-    operational reasons while still being a genuine detection, or acknowledged
-    and later found to be a false positive. `feedback` is the accuracy signal
-    `GET /api/analytics/alert-precision` aggregates from; it is never inferred
-    from `status`.
+    Not the same as status (new/acknowledged/escalated/dismissed), which is
+    workflow: an alert can be dismissed for operational reasons and still be
+    a real detection. feedback is what GET /api/analytics/alert-precision
+    uses; it's never inferred from status.
     """
     if payload.feedback not in _VALID_FEEDBACK:
         raise HTTPException(status_code=400, detail=f"feedback must be one of {sorted(_VALID_FEEDBACK)}")

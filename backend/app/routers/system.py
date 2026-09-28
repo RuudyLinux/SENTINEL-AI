@@ -24,8 +24,7 @@ def _require_demo_mode():
 
 @router.get("/status")
 def system_status(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Real subsystem checks, not hardcoded strings — each one actually
-    exercises the thing it claims to report on."""
+    """Live subsystem checks; each one actually exercises what it reports on."""
     running_workers = sum(1 for t in RUNNING.values() if not t.done())
     total_cameras = db.query(models.Camera).filter(models.Camera.retired == False).count()  # noqa: E712
 
@@ -54,26 +53,18 @@ def system_status(db: Session = Depends(get_db), user: models.User = Depends(get
 
 @router.post("/demo/reset")
 async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
-    """Returns the app to a clean, repeatable judge-demo state. DEMO_MODE
-    only. Stops any running camera workers first (their DB rows are about
-    to be reset), wipes transactional data, and re-ensures the two demo
-    cameras + the demo watchlist entry — see seed.reset_demo_data.
+    """Back to a clean demo state. DEMO_MODE only. Stops running workers
+    first (their rows are about to go), wipes transactional data and
+    re-creates the demo cameras and watchlist entry (seed.reset_demo_data).
 
-    Real-evidence-workflow fix: reset_demo_data only ever wrote DB rows —
-    it never started the two demo cameras' workers, so `worker.LATEST_FRAMES`
-    was always empty by the time an operator called
-    POST /demo/trigger-scenario next, and demo_scenario.py's
-    _save_demo_snapshot (correctly) refuses to fabricate a frame, silently
-    producing NO evidence for the flagship demo path. Starting them here —
-    same as _on_startup does for every video_file camera — means a real
-    frame is actually decoding from the real bundled video
-    (app/demo_assets/car-detection.mp4) by the time the demo continues, so the demo
-    scenario's snapshot/clip are genuine, not empty by omission. `async def`
-    (not the previous `def`) because start_worker() calls
-    asyncio.create_task(), which needs a running event loop in this thread —
-    FastAPI runs sync `def` handlers in a worker thread with no such loop
-    (the exact bug class README.md's "Camera creation crash" entry already
-    documents fixing once for POST /api/cameras)."""
+    Then starts the two demo cameras' workers, like startup does for
+    video_file cameras. Without that LATEST_FRAMES was empty when
+    /demo/trigger-scenario came next, and the scenario (rightly) refuses to
+    fake a frame, so the demo produced no evidence at all.
+
+    async def because start_worker calls create_task, which needs the loop;
+    sync handlers run in a thread without one.
+    """
     _require_demo_mode()
     for camera in db.query(models.Camera).all():
         stop_worker(camera.id)
@@ -89,11 +80,10 @@ async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(
 
 @router.post("/demo/trigger-scenario")
 async def demo_trigger_scenario(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """Deterministically fires the primary judge-demo scenario (watchlist
-    plate sighted on C-014, then C-019) through the real correlation/alert
-    code path — see pipeline/demo_scenario.py for exactly what is and isn't
-    real about it. DEMO_MODE only; requires POST /demo/reset (or otherwise
-    having C-014 and C-019 registered) first."""
+    """Fire the demo scenario (watchlist plate on C-014, then C-019) through
+    the real correlation/alert path; pipeline/demo_scenario.py says exactly
+    what's real. DEMO_MODE only, needs /demo/reset (or C-014 and C-019
+    registered) first."""
     _require_demo_mode()
     try:
         result = await trigger_scenario(db, user)

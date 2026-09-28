@@ -23,8 +23,8 @@ export default function InvestigationWorkspacePage() {
 
   const [exportError, setExportError] = useState<string | null>(null);
 
-  // The package endpoint takes a short-lived resource token, not the session
-  // header — a plain <a href> to it always failed with 422 (no token).
+  // the package endpoint wants a short-lived resource token, not the session
+  // header; a plain <a href> always got 422
   async function exportReport() {
     if (!caseId) return;
     setExportError(null);

@@ -1,24 +1,14 @@
-"""BUG-C (final deep-debug pass, 2026-09-11): DELETE /api/cameras/{id}
-returned 200 and silently orphaned every record referencing that camera.
-
-Measured on a single probe camera before the fix — all left pointing at a
-camera_id that no longer existed:
+"""DELETE /api/cameras/{id} used to return 200 and orphan everything that
+referenced the camera. On one probe camera:
 
     orphan detections: 1   orphan alerts:   1   orphan incidents: 1
     orphan evidence:   1   orphan plates:   1   orphan zones:     1
 
-The evidence row carried its capture-time SHA-256 and belonged to an OPEN
-incident: an unrelated endpoint could quietly detach an active
-investigation's evidence from its source camera. `docs/PRIVACY_GOVERNANCE.md`
-states evidence and audit history are never silently destroyed; this was a
-side door around that.
+The evidence row had its capture digest and belonged to an OPEN incident.
+docs/PRIVACY_GOVERNANCE.md says evidence is never silently destroyed.
 
-Second, independent half of the same finding: SQLite does not enforce the
-schema's foreign keys (`PRAGMA foreign_keys` defaults to OFF and is not set
-— see app/db.py), while the Alembic-managed PostgreSQL schema always has.
-The same request therefore SUCCEEDED in dev/demo and would have raised a
-ForeignKeyViolation in production. The guard under test gives both backends
-the same explainable 409.
+And the backends disagreed: SQLite without foreign_keys=ON let it through,
+PostgreSQL would raise. The guard gives both the same 409.
 """
 import uuid
 
@@ -80,8 +70,8 @@ class TestDeletionRefusedWhileHistoryExists:
 
     @pytest.mark.parametrize("dependent", ["detection", "plate", "zone"])
     def test_any_dependent_record_blocks_deletion(self, client, db_session, auth, dependent):
-        """Not just evidence — every referencing table must block, or the
-        orphan simply moves to whichever one was forgotten."""
+        """Every referencing table blocks, or the orphan just moves to the
+        one that was forgotten."""
         cam = _camera(db_session)
         if dependent == "detection":
             db_session.add(models.Detection(camera_id=cam.id, cls="car", confidence=0.5, bbox=[0, 0, 1, 1]))
@@ -98,9 +88,7 @@ class TestDeletionRefusedWhileHistoryExists:
 
 class TestDeletionStillWorksWhenClean:
     def test_a_camera_with_no_history_is_still_deletable(self, client, db_session, auth):
-        """The guard must not turn into "cameras can never be removed" — a
-        freshly-registered camera with no operational history still deletes,
-        exactly as before."""
+        """A new camera with no history still deletes."""
         cam = _camera(db_session)
         cam_id = cam.id
 

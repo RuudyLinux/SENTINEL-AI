@@ -1,6 +1,5 @@
-"""GET /api/cameras/nearby — the GIS query behind "which other cameras could
-have seen this". Runs the haversine path here (SQLite); the PostGIS path is
-exercised against a real PostGIS server by tools/postgres_verify.py --postgis."""
+"""GET /api/cameras/nearby. Haversine path here (SQLite); the PostGIS path is
+checked against a real server by tools/postgis_verify.py."""
 import pytest
 
 from app import geo, models

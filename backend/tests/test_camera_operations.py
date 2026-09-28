@@ -1,16 +1,12 @@
 """Camera lifecycle, diagnostics, system status and person search.
 
-These four routers were the thinnest remaining coverage (cameras 67%, system
-65%, persons 60%). The heavy paths — catalogue sync, Sentinel Grid sync, video
-upload, connection probing — all reach the network or spawn real workers and
-are covered elsewhere; what had no coverage at all were the cheap, constantly
-used ones: per-camera health and diagnostics, start/stop/restart, deletion
-refusal, and the person-similarity guards.
+The network/worker-heavy paths (catalogue and grid sync, upload, probing)
+are tested elsewhere; this covers the cheap everyday ones: health,
+diagnostics, start/stop/restart, delete refusal, person-similarity guards.
 
-`mock_vms` cameras throughout: `create_camera` starts a real worker, and a
-`video_file` camera in an API test means a live FFmpeg decode with no teardown
-— the hazard tests/conftest.py's `client` fixture documents and which
-previously aborted whole test runs with an libavcodec assertion.
+mock_vms cameras everywhere: create_camera starts a worker, and a
+video_file camera here means a live FFmpeg decode with no teardown, which
+used to abort whole runs with a libavcodec assertion (see conftest).
 """
 import uuid
 
@@ -90,13 +86,12 @@ class TestCameraDiagnostics:
         ).status_code == 403
 
     def test_system_diagnostics_are_served_to_an_administrator(self, client, auth):
-        """Also pins the route ordering: `/diagnostics/system` must not be
-        swallowed by `/{camera_id}/diagnostics`."""
+        """Also checks /diagnostics/system isn't swallowed by
+        /{camera_id}/diagnostics."""
         assert client.get("/api/cameras/diagnostics/system", headers=auth).status_code == 200
 
     def test_illegal_state_transitions_are_reported_when_clean(self, client, auth):
-        """The camera lifecycle table (worker._TRANSITIONS) is meant to stay
-        empty; this is the surface that would show it if it did not."""
+        """worker._TRANSITIONS should keep this empty; this is where it'd show."""
         from app.pipeline import worker
         worker.ILLEGAL_TRANSITIONS.clear()
         body = client.get("/api/cameras/diagnostics/system", headers=auth).json()
@@ -142,7 +137,7 @@ class TestCameraLifecycle:
 
 class TestCameraDeletion:
     def test_a_camera_with_history_is_refused_not_orphaned(self, client, auth, db_session, camera):
-        """BUG-C: deleting a camera used to silently orphan its evidence."""
+        """Deleting a camera used to silently orphan its evidence."""
         detection = models.Detection(camera_id=camera.id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4])
         db_session.add(detection)
         db_session.commit()
@@ -152,10 +147,8 @@ class TestCameraDeletion:
         assert db_session.query(models.Camera).filter(models.Camera.id == camera.id).count() == 1
 
     def test_a_camera_with_no_history_deletes_cleanly(self, client, auth, db_session, camera):
-        # The id is captured BEFORE the delete: after expire_all() the ORM
-        # instance refers to a row that no longer exists, and reading any
-        # attribute off it raises ObjectDeletedError instead of running the
-        # assertion.
+        # grab the id before the delete, reading attrs off a deleted instance
+        # after expire_all() raises ObjectDeletedError
         camera_id = camera.id
         assert client.delete(f"/api/cameras/{camera_id}", headers=auth).status_code == 200
         db_session.expire_all()
@@ -175,9 +168,8 @@ class TestSystemStatus:
         assert {"API", "DATABASE", "WEBSOCKET", "STORAGE"} <= names
 
     def test_the_database_check_actually_runs(self, client, auth):
-        """`status` for DATABASE is derived from a real `SELECT 1`, not a
-        hardcoded string — so it must be OPERATIONAL while the test database
-        is plainly reachable."""
+        """DATABASE comes from a real SELECT 1, so it's OPERATIONAL while the
+        test DB is reachable."""
         body = client.get("/api/system/status", headers=auth).json()
         database = next(s for s in body["subsystems"] if s["name"] == "DATABASE")
         assert database["status"] == "OPERATIONAL"
@@ -191,9 +183,8 @@ class TestPersonSimilarity:
         assert client.get("/api/persons/no-such-detection/similar", headers=auth).status_code == 404
 
     def test_a_non_person_detection_is_refused(self, client, auth, db_session, camera):
-        """The endpoint ranks PERSON appearance signatures; handing it a car
-        would return a confident-looking empty answer to a question that was
-        never valid."""
+        """It ranks person signatures; a car would get a confident-looking
+        empty answer to a question that doesn't apply."""
         detection = models.Detection(camera_id=camera.id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4])
         db_session.add(detection)
         db_session.commit()
@@ -205,8 +196,7 @@ class TestPersonSimilarity:
     def test_a_person_with_no_signature_returns_no_candidates_not_an_error(
         self, client, auth, db_session, camera
     ):
-        """Never guessed at: a detection with no stored appearance signature
-        yields an empty candidate list, not a fabricated match."""
+        """No stored signature means no candidates, not a made-up match."""
         detection = models.Detection(camera_id=camera.id, cls="person", confidence=0.9, bbox=[1, 2, 3, 4])
         db_session.add(detection)
         db_session.commit()

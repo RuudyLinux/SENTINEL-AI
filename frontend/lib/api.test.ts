@@ -1,23 +1,17 @@
 /**
- * The frontend had no unit tests at all — its only safety net was 8 Playwright
- * smoke tests against a full running stack, which cannot easily provoke a 503
- * or a network failure.
- *
- * What is tested here is the rule that actually matters for correctness:
- * a GET may be retried, a POST/PATCH/DELETE may NOT. A mutation that reached
- * the server may already have taken effect, so a silent retry can double-fire
- * a non-idempotent action — create two incidents, dismiss twice, purge twice.
- * That rule lives in a comment and in one boolean; nothing verified it.
+ * GET may be retried, POST/PATCH/DELETE may not: a mutation that reached the
+ * server may already have happened, and a silent retry could create two
+ * incidents or purge twice. That rule was a comment and a boolean with no
+ * test, and the Playwright smoke tests can't easily provoke a 503.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api, checkBackendIdentity, BACKEND_SERVICE_NAME } from "./api";
+import { ApiError, api, checkBackendIdentity, BACKEND_SERVICE_NAME, formatDetail } from "./api";
 
 function jsonResponse(status: number, body: unknown = {}): Response {
   return {
     status,
-    // `ok` is what api.ts branches on for the non-401 error path; omitting it
-    // makes even a 200 look like a failure.
+    // api.ts branches on `ok` for non-401 errors; without it even a 200 fails
     ok: status >= 200 && status < 300,
     statusText: String(status),
     headers: { get: () => "application/json" },
@@ -27,8 +21,8 @@ function jsonResponse(status: number, body: unknown = {}): Response {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  // A token would send the 401 path into a location redirect; these tests are
-  // about transport behaviour, so stay logged out.
+  // a token would send 401s into a redirect; these are about transport, stay
+  // logged out
   vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeItem: () => {} });
 });
 
@@ -112,10 +106,9 @@ describe("transient-failure retry", () => {
 });
 
 /**
- * The backend-identity preflight. The bug it exists for: an unrelated local
- * Python app held port 8000 — the documented default — so the dashboard was
- * pointed at a stranger's API and reported only "Login failed". Nothing
- * distinguished a wrong password from a wrong server.
+ * Backend identity preflight. Some unrelated local Python app held port 8000
+ * and the dashboard only said "Login failed"; a wrong password and a wrong
+ * server looked the same.
  */
 describe("backend identity preflight", () => {
   function healthResponse(status: number, body: unknown, jsonThrows = false): Response {
@@ -184,5 +177,19 @@ describe("backend identity preflight", () => {
     await checkBackendIdentity("http://localhost:8000", fetchMock);
     const init = fetchMock.mock.calls[0][1];
     expect(init?.headers).toBeUndefined();
+  });
+});
+
+describe("error detail", () => {
+  it("turns a FastAPI validation list into readable text", () => {
+    const detail = [
+      { type: "missing", loc: ["body", "source_uri"], msg: "Field required", input: null },
+      { type: "value_error", loc: ["body", "latitude"], msg: "Input should be a valid number" },
+    ];
+    expect(formatDetail(detail)).toBe("source uri: Field required; latitude: Input should be a valid number");
+  });
+
+  it("keeps a plain string detail as is", () => {
+    expect(formatDetail("Camera not found")).toBe("Camera not found");
   });
 });

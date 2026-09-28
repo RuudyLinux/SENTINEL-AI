@@ -4,20 +4,18 @@ import Link from "next/link";
 import { Play, Eye } from "lucide-react";
 import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "./ConnectionBadge";
+import { RecIndicator } from "./RecButton";
 
 export default function LiveVideoTile({ camera }: { camera: any }) {
-  // This grid is a management/overview surface, not an auto-playing wall —
-  // with the 24/7 auto-connect supervisor now bringing several real cameras
-  // online without any operator action, fetching every online camera's MJPEG
-  // stream on mount would silently open that many browser video players the
-  // moment this page loads. Preview is opt-in per tile; the single-camera
-  // page (VIEW) is the actual "operator selected this camera" path.
+  // An overview grid, not a video wall. With the supervisor bringing cameras
+  // online by itself, opening every MJPEG on mount would start that many
+  // players the moment the page loads. Preview is opt-in per tile; VIEW is
+  // the single-camera page.
   const [previewing, setPreviewing] = useState(false);
   const connectionState = deriveConnectionState(camera);
   const isLive = connectionState === "CONNECTED" || connectionState === "PROCESSING";
-  // Re-authorized on a schedule for as long as the preview is open: the
-  // backend now ends a stream when its token expires, so a tile left running
-  // past the TTL would otherwise freeze on its last frame.
+  // re-authorized while the preview is open, the backend cuts streams at
+  // token expiry and the tile would freeze
   const streamUrl = useStreamUrl(
     `/api/streams/${camera.id}/stream-token`,
     `/api/streams/${camera.id}/mjpeg`,
@@ -38,7 +36,8 @@ export default function LiveVideoTile({ camera }: { camera: any }) {
         </div>
         <span className="font-mono">{camera.camera_code}</span>
       </div>
-      <div className="aspect-video bg-black flex items-center justify-center">
+      <div className="relative aspect-video bg-black flex items-center justify-center">
+        <RecIndicator recording={!!camera.recording} />
         {previewing && streamUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={streamUrl} alt={camera.name} className="w-full h-full object-cover" />

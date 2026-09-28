@@ -1,26 +1,17 @@
-"""Disaster recovery (10/10 roadmap P14): seed real data, back up the SQLite
-file, destroy the working copy, restore from the backup, and prove every
-piece of evidence-critical state survived — not just "the app starts again".
+"""Disaster recovery: seed real data, back up the SQLite file, destroy the
+working copy, restore, and check every piece of evidence-critical state
+survived, not just that the app starts.
 
-Runs against its OWN standalone SQLite file and engine (via `sqlite3`'s own
-`Connection.backup()` — SQLite's real online-backup API, not a hand-rolled
-file copy that could race a write), completely independent of the shared
-`app.db.engine`/`SessionLocal` the rest of the suite uses. That keeps this
-test from disturbing (or being disturbed by) any other test's DB state,
-while still exercising the schema this repository actually ships (all
-tables created from `app.models`, the exact SQLAlchemy models a real
-deployment uses).
+Own SQLite file and engine, backed up with sqlite3's Connection.backup()
+(the online backup API, not a file copy that could race a write), separate
+from the suite's shared engine. Tables come from app.models, the real schema.
 
-What this test does NOT prove: it verifies SQLite backup/restore — the
-locally-developed and demo-deployed path. Restoring a PostgreSQL-backed
-deployment uses the same alembic-managed schema (see backend/alembic/) but
-was not exercised here — no PostgreSQL instance is available in this
-environment. That gap is stated explicitly, not implied to be covered.
+Only SQLite here. PostgreSQL DR (pg_dump/pg_restore) is covered by
+tools/postgres_verify.py.
 """
 import sqlite3
 import tempfile
 import uuid
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -32,8 +23,7 @@ from app import audit, models
 
 @pytest.fixture
 def dr_env(tmp_path: Path):
-    """A fully independent schema + engine + session, isolated from the rest
-    of the suite's shared SQLite file."""
+    """Own schema, engine and session, apart from the shared test DB."""
     db_path = tmp_path / "dr_original.db"
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     models.Base.metadata.create_all(bind=engine)
@@ -45,9 +35,8 @@ def dr_env(tmp_path: Path):
 
 
 def _seed_real_data(session) -> dict:
-    """Real rows through the real model classes — an incident, its evidence
-    (with a genuine capture-time SHA-256 of a real temp file), and an audited,
-    hash-chained trail — mirroring what a live deployment actually persists."""
+    """An incident, its evidence (real temp file, real capture SHA-256) and a
+    hash-chained audit trail, like a live deployment writes."""
     camera = models.Camera(camera_code=f"DR-{uuid.uuid4().hex[:8]}", name="DR test camera", source_type="video_file", source_uri="x.mp4")
     session.add(camera)
     session.flush()
@@ -59,7 +48,7 @@ def _seed_real_data(session) -> dict:
     session.add(incident)
     session.flush()
 
-    # A real file, really hashed — same function the live capture path uses.
+    # real file, hashed with the same function live capture uses
     evidence_file = Path(tempfile.mkstemp(suffix=".jpg")[1])
     evidence_file.write_bytes(b"not a real jpeg, but real bytes to hash \x00\x01\x02")
     from app.evidence_hash import sha256_file
@@ -85,8 +74,7 @@ def _seed_real_data(session) -> dict:
 
 
 def _backup(source_path: Path, dest_path: Path) -> None:
-    """SQLite's own online backup API — consistent even against a live
-    connection, unlike a plain file copy racing an in-progress write."""
+    """sqlite's online backup API, consistent even with a live connection."""
     src = sqlite3.connect(str(source_path))
     dst = sqlite3.connect(str(dest_path))
     with dst:
@@ -111,7 +99,7 @@ class TestDisasterRecovery:
         engine.dispose()
         _backup(db_path, backup_path)
 
-        # 3. Destroy the working copy — the disaster.
+        # 3. the disaster: delete the working copy
         db_path.unlink()
         assert not db_path.exists()
 
@@ -146,9 +134,8 @@ class TestDisasterRecovery:
             restored_engine.dispose()
 
     def test_a_missing_backup_is_reported_not_silently_treated_as_success(self, tmp_path):
-        """A DR test that can pass with no backup at all would be worse than
-        no DR test — this locks down that restoring from a nonexistent file
-        fails loudly."""
+        """Restoring from a missing file fails loudly; a DR test that passes
+        with no backup would be worse than none."""
         nonexistent = tmp_path / "does_not_exist.db"
         working = tmp_path / "dr_working.db"
         with pytest.raises(FileNotFoundError):

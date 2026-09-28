@@ -1,20 +1,16 @@
-"""Official Gujarat Police camera catalogue client (Phase 3 P0).
+"""Gujarat Police camera catalogue client.
 
-Contract (per sentinel.gujarat.gov.in/resource): `GET {base_url}/api/ingest`
-returns camera records carrying id, location, codec, live status, and stream
-URLs (RTSP/WHEP/HLS). The exact response schema (field names) is not fully
-pinned down in the official material available at build time, so
-`_normalize_record` accepts a few plausible key spellings defensively and
-records what it could not find rather than guessing — anything genuinely
-unknown is left blank, never fabricated.
+GET {base_url}/api/ingest (per sentinel.gujarat.gov.in/resource) returns
+records with id, location, codec, live status and RTSP/WHEP/HLS URLs. The
+exact field names weren't pinned down in the material we had, so
+_normalize_record accepts a few spellings and leaves anything it can't find
+blank instead of guessing.
 
-The host is NEVER hardcoded: `settings.camera_catalog_base_url` is empty by
-default and `sync_catalog()` refuses to run until it's set via
-`.env`/environment.
+No host is hardcoded: camera_catalog_base_url is empty by default and sync
+refuses to run until it's set.
 
-Catalogue sync only REGISTERS cameras (creates/updates Camera rows). It
-never starts AI processing on any of them — that is a separate, explicit
-operator action (POST /api/cameras/{id}/start, or bulk-start from the UI).
+Sync only registers cameras. Starting them is a separate operator action
+(POST /api/cameras/{id}/start or bulk start in the UI).
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,9 +24,8 @@ from ..self_heal.http_retry import request_with_retry
 
 
 class CatalogError(Exception):
-    """Raised for any catalogue fetch/parse failure — caller (the sync
-    endpoint) turns this into a clear HTTP error rather than a stack trace,
-    and never falls back to fabricated camera data."""
+    """Any catalogue fetch/parse failure. The sync endpoint turns it into a
+    clear HTTP error; no fallback camera data."""
 
 
 @dataclass
@@ -40,9 +35,7 @@ class NormalizedCameraRecord:
     codec: str = ""
     live_status: str = ""
     rtsp_url: str = ""
-    # WHEP (browser preview) and HLS (dashboard/mobile fallback) — genuinely
-    # optional, per the official spec's three-URL-per-camera shape. Neither
-    # is required to exist and neither is fabricated when absent.
+    # WHEP (browser preview) and HLS (fallback) are optional in the spec
     whep_url: str = ""
     hls_url: str = ""
     lat: float = 0.0
@@ -67,10 +60,8 @@ def _first(record: dict, *keys, default=""):
 
 
 def normalize_record(record: dict) -> NormalizedCameraRecord | None:
-    """Tolerant normalization of one catalogue record. Returns None (and the
-    caller should count it as a skipped/invalid record, not crash the whole
-    sync) when there's no usable camera identifier at all — a record we
-    truly cannot register rather than one we'd have to invent an id for."""
+    """Normalize one record. None when there's no usable id at all; the
+    caller counts it as skipped instead of us inventing an id."""
     if not isinstance(record, dict):
         return None
     external_id = _first(record, "id", "camera_id", "cameraId")
@@ -81,8 +72,7 @@ def normalize_record(record: dict) -> NormalizedCameraRecord | None:
     rtsp_url = _first(record, "rtsp", "rtsp_url", "rtspUrl", "urls.rtsp")
     if not rtsp_url:
         missing.append("rtsp_url")
-    # WHEP/HLS deliberately not added to `missing` — the spec doesn't
-    # require either to exist (RTSP is what AI ingestion actually needs).
+    # WHEP/HLS aren't required, RTSP is what AI ingestion needs
     whep_url = _first(record, "whep", "whep_url", "whepUrl", "urls.whep")
     hls_url = _first(record, "hls", "hls_url", "hlsUrl", "urls.hls")
     location = _first(record, "location", "name", "location_name")
@@ -122,10 +112,8 @@ async def fetch_catalog() -> list[dict]:
     url = f"{settings.camera_catalog_base_url.rstrip('/')}/api/ingest"
     try:
         async with httpx.AsyncClient(timeout=settings.camera_catalog_timeout_seconds) as client:
-            # Bounded retry (self_heal/http_retry.py) on a transient
-            # network blip or a 5xx/408/429 from the catalogue host — never
-            # on a genuine "host unreachable"/timeout that persists across
-            # every attempt, which still raises below exactly as before.
+            # bounded retry (self_heal/http_retry.py) on a blip or 5xx/408/429.
+            # a host that stays unreachable still raises below
             resp = await request_with_retry(lambda: client.get(url), "camera_catalog fetch")
     except httpx.TimeoutException:
         raise CatalogError(f"Camera catalogue at {settings.camera_catalog_base_url} timed out")
@@ -154,7 +142,7 @@ def upsert_from_catalog(db: Session, raw_records: list[dict]) -> dict:
     """Idempotent sync: existing cameras (matched by external_catalog_id)
     are updated in place, new ones are created, and any previously-synced
     camera absent from this response is marked catalog_stale=True (never
-    deleted — history/evidence linked to it must survive). No worker is
+    deleted, history/evidence linked to it must survive). No worker is
     started for any camera here."""
     seen_ids: set[str] = set()
     created, updated, skipped_invalid = 0, 0, 0
@@ -169,8 +157,8 @@ def upsert_from_catalog(db: Session, raw_records: list[dict]) -> dict:
 
         camera = db.query(models.Camera).filter(models.Camera.external_catalog_id == norm.external_id).first()
         if camera is None:
-            # camera_code must stay unique/stable — prefer the catalogue's
-            # own id (preserves the official camera ID, per requirement).
+            # camera_code must be unique and stable, so use the catalogue's
+            # own id (keeps the official camera ID)
             code = norm.external_id
             if db.query(models.Camera).filter(models.Camera.camera_code == code).first():
                 code = f"CAT-{norm.external_id}"
@@ -180,7 +168,7 @@ def upsert_from_catalog(db: Session, raw_records: list[dict]) -> dict:
                 source_type="rtsp",
                 source_uri=norm.rtsp_url,
                 external_catalog_id=norm.external_id,
-                status="offline",  # registered only — not connected
+                status="offline",  # registered, not connected
             )
             db.add(camera)
             created += 1
@@ -195,10 +183,9 @@ def upsert_from_catalog(db: Session, raw_records: list[dict]) -> dict:
         camera.catalog_synced_at = now
         camera.catalog_stale = False
         if norm.rtsp_url:
-            camera.source_uri = norm.rtsp_url  # never logged/exposed — see EvidenceOut/CameraOut
-        # WHEP/HLS: only overwrite when THIS sync actually supplied a value —
-        # a record that omits one this time doesn't erase a previously-known
-        # one (the catalogue's own omission, not evidence it changed).
+            camera.source_uri = norm.rtsp_url  # never logged or exposed (not in CameraOut)
+        # only overwrite WHEP/HLS when this sync has a value; a record leaving
+        # one out doesn't mean it changed
         if norm.whep_url:
             camera.whep_url = norm.whep_url
         if norm.hls_url:

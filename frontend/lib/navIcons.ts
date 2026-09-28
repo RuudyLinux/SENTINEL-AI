@@ -1,9 +1,5 @@
-// Single source of truth for "which icon means which nav destination" —
-// Sidebar (desktop + mobile drawer, same component) is the only consumer,
-// but kept here rather than inline so the mapping can't drift if anything
-// else ever needs the same icon-per-route semantics (e.g. a future
-// breadcrumb or command palette). Matches the actual nav labels/routes in
-// Sidebar.tsx — none renamed, none invented.
+// nav destination -> icon. Sidebar is the only user, kept here anyway so it
+// can't drift if something else needs it. Labels/routes match Sidebar.tsx.
 import {
   LayoutDashboard, Camera, ScanLine, Search, Bell, ShieldAlert, FileSearch,
   Map, FolderLock, BarChart3, ListChecks, SlidersHorizontal, Users,

@@ -1,30 +1,22 @@
-"""Plate-size statistics: bucketing, percentiles, and sampling-bias control.
+"""Plate-size statistics: buckets, percentiles, sampling-bias control.
 
-The measurement core for M1.5. Deliberately separated from
-`analyze_cctv_size.py`, which does the video I/O and detection: everything here
-is stdlib-only and operates on plain observation records, so the statistics are
-fully testable without footage, without OpenCV and without the inference stack.
+The measurement core for M1.5, kept apart from analyze_cctv_size.py (video
+and detection). Stdlib only, plain records, testable without footage or
+OpenCV.
 
-The question this exists to answer
-----------------------------------
-What plate and character pixel sizes will the system actually encounter on the
-deployment's cameras? The only distribution measured so far is mobile-phone
-photography with a **median glyph height of 75.4px** — far larger than CCTV will
-produce, and therefore the wrong basis for choosing a recogniser input size or
-an architecture.
+The question: what plate and character sizes will the deployment's cameras
+actually give us? The only distribution measured so far is phone photos with
+a median glyph height of 75.4px, far bigger than CCTV, so the wrong basis for
+picking a recogniser input size or architecture.
 
-Two measurement hazards this module is built around
----------------------------------------------------
-**1. Provenance.** A box from the classical detector is not a plate location. On
-the labelled benchmark it reached mean IoU 0.136, and 12 of 16 detections landed
-on something that was not a plate. Any statistic derived from detector boxes is
-therefore labelled `detector-estimated` and never reported as ground truth.
-
-**2. Sampling bias.** A vehicle stationary at a signal for 200 frames would
-contribute 200 observations and dominate the distribution — the measurement
-would describe that one vehicle rather than the traffic. Vehicle-weighted
-sampling caps observations per track, and the report shows both weightings side
-by side so the difference is visible rather than assumed away.
+Two hazards:
+1. Provenance. Classical detector boxes aren't plate locations (mean IoU
+   0.136 on the benchmark, 12 of 16 on something that wasn't a plate), so
+   stats from them are labelled detector-estimated, never ground truth.
+2. Sampling bias. A car sitting 200 frames at a signal would be 200
+   observations and the result would describe that car, not traffic.
+   Vehicle weighting caps observations per track, and the report shows both
+   weightings side by side.
 """
 from __future__ import annotations
 
@@ -39,18 +31,15 @@ SOURCE_GROUND_TRUTH = "ground_truth"
 
 PERCENTILES = (10, 25, 50, 75, 90, 95)
 
-# Used where metadata genuinely does not say. Never guessed.
+# when metadata doesn't say. never guessed
 UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
 class PlateObservation:
-    """One observed plate box in one frame.
-
-    `track_id` is what makes vehicle-weighted sampling possible. When the source
-    has no tracker, pass a per-frame unique value and accept that
-    frame-weighting and vehicle-weighting coincide — the report says so rather
-    than implying a vehicle count it does not have.
+    """One plate box in one frame. track_id enables vehicle weighting;
+    without a tracker pass a per-frame unique value, and frame and vehicle
+    weighting coincide (the report says so).
     """
     camera_id: str
     frame_index: int
@@ -102,8 +91,8 @@ class PlateObservation:
 
     @property
     def vehicle_area_fraction(self) -> float | None:
-        """Plate area as a fraction of its vehicle crop, when the vehicle box is
-        known. None otherwise — never substituted with the frame fraction."""
+        """Plate area as a share of its vehicle crop when known, else None
+        (never the frame fraction instead)."""
         if self.vehicle_bbox is None:
             return None
         vw = self.vehicle_bbox[2] - self.vehicle_bbox[0]
@@ -112,14 +101,12 @@ class PlateObservation:
         return (self.width * self.height) / area if area > 0 else None
 
 
-# ---- percentiles ---------------------------------------------------------
+# percentiles
 
 def percentile(values: list[float], point: float) -> float:
-    """Linear-interpolation percentile (the common "type 7" definition).
-
-    Implemented rather than imported so this module stays stdlib-only and its
-    definition is pinned — percentile conventions differ between libraries, and
-    a silently different definition would make two reports incomparable.
+    """Linear-interpolation percentile ("type 7"). Written out to stay stdlib
+    and pin the definition; libraries differ, and two reports on different
+    definitions aren't comparable.
     """
     if not values:
         return 0.0
@@ -142,21 +129,16 @@ def percentile_summary(values: list[float]) -> dict[str, float]:
     return summary
 
 
-# ---- sampling ------------------------------------------------------------
+# sampling
 
 def vehicle_weighted(
     observations: list[PlateObservation], max_per_track: int = 3,
 ) -> list[PlateObservation]:
-    """Cap observations per track so one long-dwelling vehicle cannot dominate.
+    """Cap observations per track so one lingering vehicle can't dominate.
 
-    Selection within a track is by evenly spaced frame index rather than "first
-    N": the first N frames of a track are its entry into the scene, all at a
-    similar distance, which would bias the size distribution toward whatever
-    size a vehicle happens to be when it first appears. Even spacing samples the
-    vehicle across its whole pass.
-
-    Deterministic — no randomness — so a report is reproducible from the same
-    footage and the same cap.
+    Picks evenly spaced frames, not the first N: those are the car entering,
+    all at about the same distance, which skews sizes. Deterministic, so the
+    same footage and cap give the same report.
     """
     if max_per_track <= 0:
         return list(observations)
@@ -180,12 +162,9 @@ def frame_indices(
     total_frames: int, fps: float, sample_fps: float | None = None,
     max_frames: int | None = None, max_seconds: float | None = None,
 ) -> list[int]:
-    """Which frame indices to decode.
-
-    Interval sampling, not random: it is reproducible, it needs no seek-heavy
-    random access, and it covers the footage evenly. `sample_fps` expresses the
-    interval in a unit an operator can reason about ("two frames a second")
-    rather than a stride that depends on the source frame rate.
+    """Frame indices to decode. Interval sampling: reproducible, no random
+    seeking, even coverage. sample_fps is in units an operator gets ("two
+    frames a second") instead of a stride tied to the source fps.
     """
     if total_frames <= 0:
         return []
@@ -204,7 +183,7 @@ def frame_indices(
     return indices
 
 
-# ---- aggregation ---------------------------------------------------------
+# aggregation
 
 @dataclass
 class SizeDistribution:
@@ -267,7 +246,7 @@ def group_by(observations: list[PlateObservation], attribute: str) -> dict[str, 
     return {key: aggregate(values, label=key) for key, values in sorted(grouped.items())}
 
 
-# ---- model implications --------------------------------------------------
+# model implications
 
 SCENARIO_A = "A"
 SCENARIO_B = "B"
@@ -287,11 +266,9 @@ class ModelImplication:
 
 
 def model_implication(distribution: SizeDistribution) -> ModelImplication:
-    """Translate a measured distribution into the pre-agreed engineering call.
-
-    The thresholds and the three scenarios were fixed in the M1.5 brief BEFORE
-    any measurement existed, which is the point: the decision rule is not chosen
-    after seeing the numbers.
+    """Map a measured distribution to the engineering call agreed in the
+    M1.5 brief. Thresholds and scenarios were fixed before any measurement,
+    so the rule isn't picked after seeing the numbers.
     """
     percentages = distribution.percentages()
     under_20 = percentages.get("<20px", 0.0)
@@ -336,7 +313,7 @@ def model_implication(distribution: SizeDistribution) -> ModelImplication:
     )
 
 
-# ---- reporting -----------------------------------------------------------
+# reporting
 
 def _bucket_table(distribution: SizeDistribution) -> list[str]:
     percentages = distribution.percentages()
@@ -351,8 +328,8 @@ def render_report(
     max_per_track: int = 3,
     sampling_note: str = "",
 ) -> str:
-    """The full M1.5 report: provenance, both weightings, per-camera and
-    per-condition breakdowns, and the resulting engineering recommendation."""
+    """Full M1.5 report: provenance, both weightings, per-camera and
+    per-condition breakdowns, and the recommendation."""
     if not observations:
         return (
             "# CCTV plate-size analysis\n\n"
@@ -470,7 +447,7 @@ def render_report(
     else:
         lines.append("Plate-to-vehicle area fraction: not measured (no vehicle boxes supplied).")
 
-    # --- breakdowns ---
+    # breakdowns
     for attribute, title in (
         ("camera_id", "Per camera"),
         ("time_of_day", "Day / night"),
@@ -495,7 +472,7 @@ def render_report(
                 + f" | {group.glyph_percentiles()['p50']} |"
             )
 
-    # --- implications ---
+    # implications
     implication = model_implication(per_vehicle)
     lines += [
         "",

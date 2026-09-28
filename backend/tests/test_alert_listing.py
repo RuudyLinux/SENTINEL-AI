@@ -1,18 +1,10 @@
-"""The Alert Center's list endpoint.
+"""The Alert Center list endpoint.
 
-Two defects in `app/routers/alerts.py` (52% covered):
-
-1. One alert row with a NULL `reasons` column made the WHOLE list fail
-   response validation — `ResponseValidationError: Input should be a valid
-   list, input None` — so a single bad row blanked the Alert Center for every
-   camera, not just its own line. The same nullable column already crashed the
-   incident timeline; here it took the entire page with it.
-
-2. There was no `camera_id` filter, yet the UI offered a per-camera view
-   ("OPEN ALERTS" from the single-camera page). It filtered in the browser
-   over whatever this endpoint had already truncated to its 200 most recent
-   rows, so a camera whose alerts were not among the newest 200 system-wide
-   showed an empty list — indistinguishable from a camera with no alerts.
+- One alert with NULL `reasons` failed response validation for the whole
+  list ("Input should be a valid list, input None"), blanking the page.
+- No camera_id filter. The per-camera view filtered in the browser over the
+  200 most recent alerts system-wide, so a camera whose alerts were older
+  showed an empty list, same as a camera with none.
 """
 import uuid
 from datetime import datetime, timedelta
@@ -75,8 +67,8 @@ class TestCameraFilter:
         assert rows and all(r["camera_id"] == mine.id for r in rows)
 
     def test_an_older_alert_survives_the_200_row_limit(self, client, auth, db_session):
-        """The exact failure: the camera's alert is not among the 200 most
-        recent system-wide, so client-side filtering could never find it."""
+        """The camera's alert isn't in the 200 newest system-wide, so client
+        side filtering could never find it."""
         mine = _camera(db_session)
         noisy = _camera(db_session, prefix="NOISY")
         old = datetime.utcnow() - timedelta(days=30)

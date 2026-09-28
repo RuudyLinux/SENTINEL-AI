@@ -1,6 +1,4 @@
-"""All numbers here are real aggregates computed from the DB at request time —
-per the doc's AI-honesty rule, nothing here is a hard-coded demo number.
-"""
+"""Real aggregates from the DB at request time, no hard-coded demo numbers."""
 from datetime import datetime, timedelta
 from sqlalchemy import extract, func
 from fastapi import APIRouter, Depends
@@ -40,19 +38,14 @@ def overview(db: Session = Depends(get_db), user: models.User = Depends(get_curr
 def events_by_hour(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     """Detections per hour over the last 24 hours.
 
-    Grouped with `extract`, not `strftime`. SQLAlchemy passes an unknown
-    function name straight through to the database, and `strftime` is SQLite's
-    — PostgreSQL, this platform's documented production datastore, has no such
-    function. Verified against a real PostgreSQL server before the fix:
+    extract(), not strftime(): SQLAlchemy passes unknown functions straight
+    through and strftime is SQLite only. On a real PostgreSQL server:
 
         (psycopg.errors.UndefinedFunction) function strftime(unknown,
         timestamp without time zone) does not exist
 
-    so the dashboard's 24-hour chart returned 500 in production while passing
-    every test on SQLite — the same dev/prod divergence class as the
-    unenforced SQLite foreign keys. `extract` is translated per dialect by
-    SQLAlchemy, so one query works on both; the label is then formatted in
-    Python rather than in SQL.
+    so the 24h chart 500'd in production and passed every SQLite test.
+    extract() is translated per dialect; the label is formatted in Python.
     """
     since = datetime.utcnow() - timedelta(hours=24)
     parts = (
@@ -88,9 +81,8 @@ def camera_uptime(db: Session = Depends(get_db), user: models.User = Depends(get
 
 @router.get("/ai-performance")
 def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Reports measured detection volumes and ANPR read rate. No accuracy
-    percentages are fabricated — precision/recall need a labeled ground-truth
-    set, which is not available in this environment (doc §65 honesty rule).
+    """Measured detection volume and ANPR read rate. No accuracy numbers;
+    precision/recall need labelled ground truth we don't have here (doc §65).
     """
     total_detections = db.query(models.Detection).count()
     person_detections = db.query(models.Detection).filter(models.Detection.cls == "person").count()
@@ -109,22 +101,18 @@ def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(ge
     }
 
 
-# Below this many operator-reviewed alerts, a computed rate is noise wearing
-# the costume of a statistic — a single dismissed alert would print "100%
-# false-positive rate". Configurable rather than hardcoded so an operator can
-# raise it for a higher-confidence figure once real usage accumulates.
+# Below this many reviewed alerts a rate is noise; one dismissed alert would
+# print "100% false-positive rate". Raise it once real usage builds up.
 MIN_FEEDBACK_SAMPLE_SIZE = 20
 
 
 @router.get("/alert-precision")
 def alert_precision(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Real alert-quality metrics from operator feedback (10/10 roadmap P6).
+    """Alert quality from operator feedback.
 
-    Computed ONLY from `Alert.feedback` — the explicit operator judgement
-    (see routers/alerts.py::submit_feedback) — never inferred from `status`,
-    which tracks workflow, not accuracy. Below MIN_FEEDBACK_SAMPLE_SIZE this
-    reports `insufficient_sample` rather than a rate that would misrepresent
-    a handful of reviews as a validated precision figure.
+    Only from Alert.feedback (routers/alerts.py submit_feedback), never from
+    status, which is workflow, not accuracy. Under MIN_FEEDBACK_SAMPLE_SIZE
+    it reports insufficient_sample instead of a rate.
     """
     total_alerts = db.query(models.Alert).count()
     confirmed = db.query(models.Alert).filter(models.Alert.feedback == "confirmed").count()

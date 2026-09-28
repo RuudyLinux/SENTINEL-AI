@@ -1,16 +1,11 @@
-"""Camera lifecycle transitions are now a real table, not just a set of valid
-names.
+"""Camera lifecycle transitions are a real table now.
 
-The guard this replaces only checked that a NEW state was a known name —
-"PROCESSING" is a valid name and a nonsense destination from DISCONNECTED,
-and nothing said so. It was also a bare `assert`, which `python -O` strips
-entirely.
+The old guard only checked the new state was a known name, so DISCONNECTED ->
+PROCESSING passed, and it was an assert, gone under -O.
 
-An illegal transition is still APPLIED here, not refused: refusing would
-leave CAMERA_STATS asserting something the camera is no longer doing, and
-raising would kill a live camera worker over a gap in the table. The
-transition is counted in ILLEGAL_TRANSITIONS instead, which is what turns a
-log line nobody reads into something a test can fail the build on.
+Illegal transitions are still applied (refusing would leave CAMERA_STATS
+wrong, raising would kill a worker) and counted in ILLEGAL_TRANSITIONS, so a
+test can fail on them.
 """
 import pytest
 
@@ -28,10 +23,9 @@ def _isolate():
 
 class TestFirstTransition:
     def test_a_camera_s_first_ever_transition_is_never_illegal(self):
-        """CAMERA_STATS is created by setdefault the first time anything asks
-        about a camera, which is not the same moment a worker starts one. The
-        dict's grid_state starts at None precisely so this case can never be
-        mistaken for a real prior state."""
+        """CAMERA_STATS is created by setdefault on first lookup, not when a
+        worker starts, so grid_state starts at None and can't be mistaken for
+        a real prior state."""
         worker._set_grid_state("cam1", "DISCOVERING")
         assert worker.ILLEGAL_TRANSITIONS == {}
         worker.CAMERA_STATS.clear()
@@ -53,10 +47,8 @@ class TestARealBootLifecycle:
         assert worker.ILLEGAL_TRANSITIONS == {}
 
     def test_stopping_from_any_running_state_is_legal(self):
-        # Reached via CONNECTED first for DEGRADED/RECONNECTING: those two are
-        # read-failure states, which the real loop only enters once a stream
-        # was already live — CONNECTING -> DEGRADED directly is not a real
-        # sequence and is correctly excluded from the table.
+        # DEGRADED/RECONNECTING via CONNECTED: they're read-failure states,
+        # only reached once a stream was live
         for start in ("CONNECTED", "PROCESSING", "DEGRADED", "RECONNECTING"):
             worker.CAMERA_STATS.clear()
             worker._set_grid_state("cam1", "CONNECTING")
@@ -83,13 +75,10 @@ class TestARealBootLifecycle:
         assert worker.ILLEGAL_TRANSITIONS == {}
 
     def test_a_fast_failing_initial_connect_falls_straight_into_a_retry(self):
-        """Caught live, not hypothesised: `start_worker`'s own fallback is
-        `opened = await _open_with_timeout(...); if not opened: opened =
-        await _reopen_with_backoff(...)` in one call. `_open_with_timeout`
-        marks DISCONNECTED on a synchronous failure; `_reopen_with_backoff`'s
-        own first line then marks RECONNECTING, immediately, same call stack.
-        Running this backend locally at 8000 produced exactly this sequence
-        for two real cameras before the table accounted for it."""
+        """Seen live: start_worker does _open_with_timeout and then
+        _reopen_with_backoff in the same call. The first marks DISCONNECTED
+        on a synchronous failure, the second immediately marks RECONNECTING.
+        Two real cameras did exactly this before the table allowed it."""
         worker._set_grid_state("cam1", "CONNECTING")
         worker._set_grid_state("cam1", "DISCONNECTED")
         worker._set_grid_state("cam1", "RECONNECTING")
@@ -104,9 +93,8 @@ class TestIllegalTransitionsAreCaughtNotSilent:
         assert worker.ILLEGAL_TRANSITIONS == {("DISCONNECTED", "PROCESSING"): 1}
 
     def test_the_illegal_transition_is_applied_anyway(self):
-        """Refusing it would leave the runtime state claiming the camera is
-        still doing whatever it was doing before — worse than recording a
-        gap in the table."""
+        """Refusing would leave state claiming the camera is doing what it
+        did before, worse than logging a gap."""
         worker._set_grid_state("cam1", "CONNECTING")
         worker._set_grid_state("cam1", "DISCONNECTED")
         worker._set_grid_state("cam1", "PROCESSING")
@@ -121,9 +109,8 @@ class TestIllegalTransitionsAreCaughtNotSilent:
         assert worker.ILLEGAL_TRANSITIONS[("DISCONNECTED", "PROCESSING")] == 3
 
     def test_an_unknown_state_name_is_still_rejected_outright(self):
-        """This is a different failure from an illegal transition: the value
-        itself is not a state this lifecycle has, so applying it would corrupt
-        CAMERA_STATS rather than merely skip a step in it."""
+        """Different from an illegal move: not a state at all, applying it
+        would corrupt CAMERA_STATS."""
         with pytest.raises(ValueError):
             worker._set_grid_state("cam1", "TOTALLY_MADE_UP")
 

@@ -1,10 +1,10 @@
-/** WHEP (WebRTC-HTTP Egress Protocol, RFC 9725) playback with the browser's own
- * RTCPeerConnection — no library. The official camera catalogue gives each
- * camera a WHEP URL next to its RTSP one; the browser plays it directly from
- * the camera's media server, sub-second, and the backend spends nothing on it.
+/** WHEP (RFC 9725) playback with the browser's RTCPeerConnection, no
+ * library. The catalogue gives each camera a WHEP URL next to RTSP; the
+ * browser plays it straight from the media server, sub-second, and the
+ * backend does nothing.
  *
- * Returns a stop function that closes the peer connection and, when the server
- * gave a session URL, ends the session with DELETE as the protocol asks. */
+ * Returns a stop function that closes the connection and, if the server gave
+ * a session URL, DELETEs it as the protocol asks. */
 export async function playWhep(url: string, video: HTMLVideoElement, signal?: AbortSignal): Promise<() => void> {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
@@ -42,8 +42,8 @@ export async function playWhep(url: string, video: HTMLVideoElement, signal?: Ab
   }
 }
 
-/** The offer is sent once, not trickled, so it must carry the candidates. A
- * browser that has not finished gathering in `ms` sends what it has. */
+/** No trickle ICE, so the offer has to carry the candidates; after `ms` we
+ * send whatever has been gathered. */
 function iceGatheringDone(pc: RTCPeerConnection, ms: number): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {

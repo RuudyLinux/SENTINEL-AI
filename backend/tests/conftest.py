@@ -1,9 +1,8 @@
-"""Shared pytest fixtures for the Phase 3 regression suite.
+"""Shared fixtures.
 
-IMPORTANT: the DB_PATH/UPLOADS_DIR/EVIDENCE_DIR env vars are set BEFORE
-anything under `app` is imported, so every test in this suite runs against
-a throwaway temp SQLite DB and throwaway storage dirs — never the real
-`backend/sentinel.db` / `uploads/` / `evidence_store/` a developer is using.
+DB_PATH/UPLOADS_DIR/EVIDENCE_DIR are set before anything under `app` is
+imported, so the suite runs on a throwaway SQLite DB and temp dirs, never the
+real backend/sentinel.db, uploads/ or evidence_store/.
 """
 import os
 import tempfile
@@ -15,15 +14,10 @@ os.environ.setdefault("UPLOADS_DIR", str(_tmp_root / "uploads"))
 os.environ.setdefault("EVIDENCE_DIR", str(_tmp_root / "evidence_store"))
 os.environ.setdefault("CAMERA_CATALOG_BASE_URL", "")  # must stay empty unless a test opts in
 os.environ.setdefault("DEMO_MODE", "true")
-# Real credentials for the Sentinel Camera Grid may exist in a developer's
-# real backend/.env (pydantic-settings reads it too, not just os.environ) —
-# without this override, every test that boots the real FastAPI app (the
-# `client` fixture) would trigger a REAL network call to the real external
-# grid via supervisor.discover_and_register() at startup: real login latency
-# per test, and real repeated hits against the live grid. Force both empty
-# so credentials are "not configured" for the whole suite regardless of what
-# a developer's .env holds; AUTOCONNECT is also forced off as a second,
-# independent guard against any accidental real connection during a test.
+# A dev's backend/.env may have real grid credentials (pydantic-settings reads
+# it too). Then every test booting the app would log into the real grid via
+# supervisor.discover_and_register() at startup. Force them empty, and
+# autoconnect off as a second guard.
 os.environ.setdefault("SENTINEL_GRID_EMAIL", "")
 os.environ.setdefault("SENTINEL_GRID_PASSWORD", "")
 os.environ.setdefault("SENTINEL_GRID_AUTOCONNECT", "false")
@@ -76,19 +70,14 @@ def admin_token(admin_user):
     return create_access_token(admin_user)
 
 
-# Every table that references `cameras`, plus everything that references
-# THOSE, ordered children-first. Deleting cameras alone (what this fixture
-# used to do) is only valid while SQLite has foreign keys switched off; the
-# moment `PRAGMA foreign_keys=ON` matches the PostgreSQL schema's real
-# behavior, an unordered camera wipe fails outright — measured: 143 errors
-# + 5 failures across the suite, all from this one fixture.
+# Everything that references cameras, and what references those, children
+# first. Deleting cameras alone only worked while SQLite ignored foreign keys;
+# with them on it was 143 errors + 5 failures from this fixture alone.
 #
-# Derived from the actual ForeignKey declarations in app/models.py, not
-# guessed: Evidence -> Incident/Alert/Detection, IncidentAlert ->
-# Incident/Alert, Incident -> Alert, Alert -> AlertRule/Detection,
-# AlertRule -> Zone, Plate/Track/Detection/Zone/SelfHealEvent -> Camera.
-# Vehicles are deliberately NOT wiped: nothing links them to a camera, so
-# removing them would discard more shared state than this fixture needs to.
+# From the ForeignKeys in app/models.py: Evidence -> Incident/Alert/Detection,
+# IncidentAlert -> Incident/Alert, Incident -> Alert, Alert ->
+# AlertRule/Detection, AlertRule -> Zone, Plate/Track/Detection/Zone/
+# SelfHealEvent -> Camera. Vehicles stay, nothing ties them to a camera.
 _CAMERA_DEPENDENTS_CHILDREN_FIRST = (
     "Evidence",
     "IncidentNote",
@@ -112,13 +101,9 @@ def _wipe_cameras_and_dependents(session) -> None:
 
 
 def delete_cameras_by_code(session, camera_codes: "list[str]") -> None:
-    """Remove specific cameras AND everything referencing them, children-first.
-
-    With `PRAGMA foreign_keys=ON` (app/db.py), deleting a camera that still
-    has detections/alerts/incidents simply fails — so a test that needs a
-    camera code to be absent cannot just delete the camera row. Shares the
-    same ordering as the full wipe above, scoped to the named codes.
-    """
+    """Delete the named cameras and everything referencing them, children
+    first. With foreign keys on you can't just delete a camera that has
+    detections/alerts/incidents."""
     camera_ids = [
         c.id for c in session.query(models.Camera).filter(models.Camera.camera_code.in_(camera_codes)).all()
     ]
@@ -154,22 +139,15 @@ def delete_cameras_by_code(session, camera_codes: "list[str]") -> None:
 
 @pytest.fixture
 def client():
-    """Phase 6 finding: TestClient(app) runs the real FastAPI startup event,
-    which resumes real camera workers (real cv2.VideoCapture decode + real
-    torch inference, as background asyncio tasks) for any Camera row left
-    in the shared test DB by an earlier test (e.g. test_demo_scenario.py's
-    C-014/C-019). Those tasks have no test-level owner to await or cancel,
-    so they keep running past the test and get torn down mid-operation at
-    interpreter exit — which reproducibly crashed the whole test process
-    with a native FFmpeg/torch threading assertion. API-route tests have no
-    business starting real camera AI workers at all, so this fixture
-    guarantees there's nothing for the startup resume-loop to find.
+    """TestClient(app) runs the real startup, which resumes camera workers
+    (real VideoCapture decode + torch inference) for any camera an earlier
+    test left in the shared DB (test_demo_scenario's C-014/C-019). Nothing
+    owns those tasks, they get killed mid-work at interpreter exit, and that
+    crashed the test process with an FFmpeg/torch threading assertion. API
+    tests have no business starting workers, so wipe cameras first.
 
-    Wipes the camera's dependent rows too (see
-    `_CAMERA_DEPENDENTS_CHILDREN_FIRST`): deleting only cameras left every
-    detection/alert/incident/evidence row behind pointing at a camera_id
-    that no longer existed — harmless only because SQLite was ignoring
-    foreign keys, and the thing blocking this project from enforcing them.
+    Dependent rows go too (_CAMERA_DEPENDENTS_CHILDREN_FIRST); deleting only
+    cameras left orphans behind, which only worked while SQLite ignored FKs.
     """
     session = SessionLocal()
     try:
@@ -182,9 +160,8 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _no_plate_model_unless_a_test_configures_one(monkeypatch):
-    """Production names a trained plate model (config.plate_model_name), and a
-    developer machine may have those weights while CI does not. Tests must not
-    change behaviour with that: every test runs on the classical localizer
+    """Production names a trained plate model and a dev box may have the
+    weights while CI doesn't. Every test runs on the classical localizer
     unless it sets plate_model_name itself."""
     from app.config import settings
     from app.pipeline import plate_detector
@@ -196,10 +173,9 @@ def _no_plate_model_unless_a_test_configures_one(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _free_ai_slots():
-    """AI slots (pipeline/ai_capacity) are process-global, and tests call
-    `_process_frame` directly without the stop_worker that would release them,
-    so a slot taken by one test would otherwise block AI in the next."""
+    """AI slots are process-global and tests call _process_frame without the
+    stop_worker that frees them, so one test's slot would block the next."""
     from app.pipeline import ai_capacity
-    ai_capacity._HOLDERS.clear()
+    ai_capacity.reset()
     yield
-    ai_capacity._HOLDERS.clear()
+    ai_capacity.reset()

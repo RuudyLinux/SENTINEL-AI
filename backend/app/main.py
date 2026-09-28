@@ -11,13 +11,11 @@ logger = logging.getLogger("sentinel.main")
 
 from . import log_redaction  # noqa: E402
 
-# Before any request is served: uvicorn logs full URLs, and several carry a
-# token (see app/log_redaction.py).
+# before any request: uvicorn logs full URLs and some carry a token
 log_redaction.install()
 
-#: Installed at startup, shut down at exit. Held here rather than on `app`
-#: because `asyncio.to_thread` reaches the loop's default executor, not the
-#: application object.
+# installed at startup, shut down at exit. module level because to_thread
+# uses the loop's default executor, not anything on `app`
 _executor: "ThreadPoolExecutor | None" = None
 
 from .db import Base, engine, SessionLocal, ensure_columns, ensure_indexes
@@ -25,7 +23,7 @@ from . import models, background
 from .seed import run_seed
 from .ws import manager
 from .pipeline.worker import start_worker, stop_worker, RUNNING
-from .pipeline import supervisor
+from .pipeline import supervisor, recorder
 from .security import get_user_from_token, resource_token_expiry
 from .config import settings
 
@@ -39,10 +37,6 @@ from .self_heal import engine as self_heal_engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup and shutdown in one place (FastAPI's on_event startup/shutdown
-    # hooks are deprecated in favor of this) — same two phases as before,
-    # just expressed as the code before/after the single `yield` rather than
-    # two separate decorated functions.
     await _on_startup()
     yield
     await _on_shutdown()
@@ -52,8 +46,6 @@ app = FastAPI(title="SENTINEL VISION API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    # Configurable (CORS_ALLOWED_ORIGINS, comma-separated) rather than
-    # hardcoded — default preserves the exact local-demo origin unchanged.
     allow_origins=[o.strip() for o in settings.cors_allowed_origins.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
@@ -66,31 +58,37 @@ for r in (auth, cameras, streams, detections, vehicles, persons, search,
     app.include_router(r.router)
 
 
-def _size_thread_pool(camera_count: int) -> int:
-    """How many threads the shared executor needs for this many cameras.
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
-    Every camera worker parks one thread on a blocking `source.read()` for as
-    long as the stream takes to deliver a frame, and that is the same pool
-    that serves DB commits, inference offloads and connection probes. Python's
-    default (`min(32, cpu_count + 4)`) does not know how many cameras exist,
-    so past that number of cameras the workers simply queue against each
-    other -- which presents as cameras flickering between `online` and
-    `degraded` with no error, since a read waiting for a thread is
-    indistinguishable from a read waiting for a camera.
+
+def _size_thread_pool(camera_count: int) -> int:
+    """Threads the shared executor needs for this many cameras.
+
+    Each camera parks a thread on a blocking source.read(), in the same pool
+    as DB commits, inference and probes. Python's default min(32, cpu+4)
+    doesn't know about cameras, so past that they queue on each other and
+    flicker online/degraded with no error: a read waiting for a thread looks
+    just like one waiting for the camera.
     """
     if settings.worker_thread_pool_size > 0:
         return settings.worker_thread_pool_size
-    return max(32, min(settings.worker_thread_pool_max, camera_count + settings.worker_thread_pool_headroom))
+    # Two per camera: each loop can hold one waiting for a frame or the GPU
+    # while its DB commit needs another. At one per camera, a camera that had
+    # already written couldn't get a thread to commit while every other
+    # writer sat in SQLite's 30s busy wait on its lock ("database is locked"
+    # everywhere with 30 cameras).
+    return max(32, min(settings.worker_thread_pool_max, 2 * camera_count + settings.worker_thread_pool_headroom))
 
 
 def _ignore_client_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-    """Drop the one asyncio error that is not an error.
-
-    On Windows the Proactor loop logs a full traceback when a client closes a
-    socket first (ConnectionResetError from `_call_connection_lost`) — every
-    time a browser navigates away from a live MJPEG stream. Nothing failed and
-    nothing can be done about it; everything else still goes to the default
-    handler."""
+    """Windows' Proactor loop logs a full traceback (ConnectionResetError in
+    _call_connection_lost) every time a browser leaves an MJPEG stream.
+    Nothing failed. Swallow that one, pass everything else on."""
     exc = context.get("exception")
     if isinstance(exc, ConnectionResetError) and "_call_connection_lost" in str(context.get("handle", "")):
         return
@@ -114,11 +112,9 @@ async def _install_thread_pool() -> None:
 
 
 def _mark_all_cameras_offline(db) -> int:
-    """No camera worker survives a process restart, so at boot every camera is
-    offline until a worker proves otherwise. Without this, a camera that was
-    online when the process died (or was killed) stayed "online" in the
-    database — and in the dashboard's online count — with no worker behind it;
-    measured after a hard restart: "4/34 online" with 2 workers running."""
+    """No worker survives a restart, so every camera starts offline until its
+    worker reports in. Otherwise a camera online when the process was killed
+    stayed "online" with nothing behind it ("4/34 online" with 2 workers)."""
     reset = (
         db.query(models.Camera)
         .filter(models.Camera.status != "offline")
@@ -129,11 +125,9 @@ def _mark_all_cameras_offline(db) -> int:
 
 
 def _resume_local_workers(db) -> list[str]:
-    """Resume detection workers for cameras registered in a previous run.
-    rtsp/onvif are deliberately excluded — those require an explicit operator
-    start (see routers/cameras.py POST /{id}/start), same as grid cameras.
-    mock_vms behaves like webcam/video_file: purely local, safe to auto-resume.
-    Retired cameras are never resumed (models.Camera.retired)."""
+    """Restart workers for local cameras (webcam, video_file, mock_vms).
+    rtsp/onvif and grid cameras need an operator start (POST /{id}/start).
+    Retired cameras never resume."""
     started = []
     for camera in db.query(models.Camera).filter(models.Camera.retired == False).all():  # noqa: E712
         if camera.source_type in ("webcam", "video_file", "mock_vms"):
@@ -144,8 +138,8 @@ def _resume_local_workers(db) -> list[str]:
 
 async def _on_startup():
     Base.metadata.create_all(bind=engine)
-    # Additive-only migration for columns added after a DB already existed
-    # (create_all never alters existing tables) — see db.ensure_columns.
+    # create_all never alters existing tables, so columns added later get
+    # added here (db.ensure_columns, additive only)
     ensure_columns(
         "cameras",
         {
@@ -154,8 +148,7 @@ async def _on_startup():
             "catalog_stale": "BOOLEAN", "whep_url": "VARCHAR", "hls_url": "VARCHAR",
         },
         backfill_defaults={"catalog_codec": "''", "catalog_live_status": "''", "catalog_stale": "0"},
-        # whep_url/hls_url deliberately NOT backfilled — genuinely optional,
-        # existing cameras correctly migrate to NULL (never fabricated).
+        # whep_url/hls_url stay NULL, they're optional
     )
     ensure_columns("detections", {"source_timestamp": "DATETIME"})
     ensure_columns("plates", {"source_timestamp": "DATETIME"})
@@ -165,18 +158,14 @@ async def _on_startup():
         {"alert_id": "VARCHAR", "detection_id": "VARCHAR", "event_type": "VARCHAR", "source_timestamp": "DATETIME"},
         backfill_defaults={"event_type": "''"},
     )
-    # Camera groups (Model 2/4), person appearance-similarity signatures (Phase 5),
-    # loitering rule support (Phase 6) — see README.md → "Capability breakdown".
+    # camera groups, person appearance signatures, loitering
     ensure_columns("cameras", {"camera_group": "VARCHAR"}, backfill_defaults={"camera_group": "''"})
     ensure_columns("detections", {"appearance_signature": "JSON"})
     ensure_columns("zones", {"loitering_seconds": "FLOAT"})
-    # V2 plate pipeline: per-track sighting fields on `plates`, and the
-    # bookkeeping columns on `tracks` (a table declared since the first schema
-    # but never written until V2 — see models.Track). Backfills are chosen so an
-    # existing row migrates to a TRUE statement about itself: a pre-V2 Plate row
-    # was one single-frame read, so reads_count=1 is correct, while track_id /
-    # plate_bbox / last_seen stay NULL because that information genuinely was
-    # never captured and must not be invented.
+    # V2 plate pipeline fields on plates and tracks. Backfills have to be true
+    # of the old row: a pre-V2 plate was one single-frame read so
+    # reads_count=1, but track_id/plate_bbox/last_seen were never captured and
+    # stay NULL.
     ensure_columns(
         "plates",
         {
@@ -191,17 +180,12 @@ async def _on_startup():
         {"detection_count": "INTEGER", "plate_reads": "INTEGER"},
         backfill_defaults={"detection_count": "0", "plate_reads": "0"},
     )
-    # Explainable risk score on alerts. Existing alerts keep risk_score=0 and an
-    # empty factor list — correct, because no assessment was ever made for them;
-    # a retroactively computed score would be a claim about a decision that was
-    # not taken at the time.
+    # risk score. old alerts get 0 and no factors, nothing was assessed then
     ensure_columns(
         "alerts", {"risk_score": "INTEGER", "risk_factors": "JSON"},
         backfill_defaults={"risk_score": "0"},
     )
-    # Human-in-the-loop ANPR review (10/10 roadmap P7). Existing rows keep
-    # review_status=auto_accepted — correct for a read written before review
-    # existed, since it was already treated as usable without one.
+    # ANPR review. old reads were already treated as usable, so auto_accepted
     ensure_columns(
         "plates",
         {
@@ -210,28 +194,19 @@ async def _on_startup():
         },
         backfill_defaults={"review_status": "'auto_accepted'"},
     )
-    # Alert feedback / false-positive measurement (10/10 roadmap P6). Left
-    # NULL for existing alerts — no review ever happened for them, and
-    # defaulting to "confirmed" would fabricate one.
+    # alert feedback. NULL for old alerts, nobody reviewed them
     ensure_columns(
         "alerts",
         {"feedback": "VARCHAR", "feedback_reason": "VARCHAR", "feedback_by": "VARCHAR", "feedback_at": "DATETIME"},
     )
-    # Evidence provenance completion (10/10 roadmap P8) — model/rule version
-    # active AT CAPTURE. NULL for pre-existing rows: genuinely not recorded.
+    # model/rule version at capture. NULL on old rows, never recorded
     ensure_columns("evidence", {"model_version": "VARCHAR", "rule_version": "VARCHAR"})
-    # Tamper-evident audit chain (10/10 roadmap P9). Existing rows keep
-    # chain_seq/prev_hash/entry_hash NULL — they predate the chain and
-    # verify_chain() reports them honestly as unchained rather than pretending
-    # a retroactive hash covers writes it never actually witnessed.
+    # Audit chain. Old rows stay NULL and verify_chain() reports them as
+    # unchained; a retroactive hash would vouch for writes it never saw.
     ensure_columns("audit_logs", {"chain_seq": "INTEGER", "prev_hash": "VARCHAR", "entry_hash": "VARCHAR"})
-    # ANPR explainability: which preprocessing variant produced the read, how
-    # many variants agreed, whether the temporal layer corroborated it, and the
-    # plate crop OCR actually looked at. All left NULL for existing rows —
-    # genuinely unrecorded. `corroborated` in particular is NOT backfilled to
-    # true: a pre-existing row was written under a pipeline that persisted on a
-    # single read, so claiming it was corroborated would assert evidence that
-    # was never gathered. NULL reads as "unknown", which is the truth.
+    # ANPR explainability, NULL on old rows. corroborated especially isn't
+    # backfilled to true: those rows came from a pipeline that persisted on a
+    # single read. NULL = unknown, which is accurate.
     ensure_columns(
         "plates",
         {
@@ -239,25 +214,20 @@ async def _on_startup():
             "corroborated": "BOOLEAN", "plate_crop_path": "VARCHAR",
         },
     )
-    # Corroboration on the vehicle (A1 precision hardening). NOT backfilled to
-    # true: existing rows were written by a pipeline that escalated watchlist
-    # alerts on confidence alone, so claiming they were corroborated would
-    # assert evidence that was never gathered. NULL reads as "not corroborated",
-    # which caps their watchlist alerts at HIGH until a fresh corroborated
-    # sighting arrives — the safe direction for a missing safety signal.
+    # Not backfilled to true either, old rows escalated on confidence alone.
+    # NULL = not corroborated, capping watchlist alerts at HIGH until a fresh
+    # corroborated sighting comes in.
     ensure_columns("vehicles", {"plate_corroborated": "BOOLEAN"})
-    # Camera retirement (see models.Camera.retired): every existing camera
-    # migrates as active, which is true of all of them.
+    # every existing camera is active
     ensure_columns("cameras", {"retired": "BOOLEAN NOT NULL DEFAULT 0"})
     ensure_indexes("plates", ["review_status"])
     ensure_indexes("alerts", ["feedback"])
     ensure_indexes("audit_logs", ["chain_seq"])
-    # Hot-path query indexes — additive, safe to run every startup.
+    # hot-path indexes, additive, fine to run every startup
     ensure_indexes("detections", ["timestamp", "camera_id", "track_id"])
     ensure_indexes("alerts", ["severity", "status", "camera_id"])
     ensure_indexes("incidents", ["status"])
-    # Historical plate search and route reconstruction both scan `plates` —
-    # these are what keep an investigation query fast as the table grows.
+    # plate search and route reconstruction both scan plates
     ensure_indexes("plates", ["plate_text_normalized", "vehicle_id", "camera_id", "timestamp", "track_id"])
     ensure_indexes("tracks", ["camera_id", "yolo_track_id", "vehicle_id"])
     ensure_indexes("vehicles", ["plate_text", "last_seen"])
@@ -280,52 +250,40 @@ async def _on_startup():
     finally:
         db.close()
 
-    # Size the shared thread pool BEFORE any camera worker is started: every
-    # one of them parks a thread on a blocking read, and the default pool does
-    # not scale with the number of cameras. See _size_thread_pool.
+    # size the pool before the grid supervisor starts its workers
+    # (see _size_thread_pool)
     await _install_thread_pool()
 
-    # Real Sentinel Camera Grid 24/7 auto-connect: discover the real catalogue
-    # (register-only, safe if the grid is unreachable/unconfigured — logged,
-    # never fatal to startup) and start the connection supervisor, which
-    # connects eligible real cameras up to a resource-safety cap and
-    # reconnects any that drop. Never enables AI (see supervisor.py header).
+    # load the shared YOLO model once before cameras need it (CUDA init is
+    # slow, and every camera's first frame would wait on it)
+    if _cuda_available():
+        try:
+            from .pipeline import detector
+            await asyncio.to_thread(detector.warmup)
+        except Exception:
+            logger.exception("startup: model warmup failed, cameras will load it on first use")
+
+    # Grid auto-connect: discover and register the catalogue (logged and
+    # skipped if the grid is down or unconfigured), then the supervisor keeps
+    # eligible cameras connected and reconnects drops. It never enables AI.
     await supervisor.discover_and_register()
     supervisor.start_supervisor()
 
-    # Self-Heal: reload the open-problem index from real recorded events so
-    # GET /api/self-heal/problems reflects true state across a restart, not
-    # just this process's in-memory history since boot.
+    # rebuild open problems from recorded events so they survive a restart
     self_heal_engine.rebuild_open_problems()
 
 
 async def _on_shutdown():
-    # Stops the supervisor's sweep loop and every camera worker IT manages
-    # (supervisor.AUTO_MANAGED — sentinel_grid cameras only).
+    # stops the sweep loop and the grid cameras it manages
     await supervisor.stop_supervisor()
-    # Bug fix: _on_startup also starts workers directly for every webcam/
-    # video_file/mock_vms camera (start_worker() above), completely
-    # bypassing the supervisor — those tasks are never added to
-    # AUTO_MANAGED, so stop_supervisor() alone never touches them. Without
-    # this, they were abandoned at process exit instead of going through
-    # _camera_loop's `finally: source.release()`, leaking the asyncio task
-    # and cv2.VideoCapture handle. Stopping every remaining key in RUNNING
-    # (a dict, so this snapshot avoids mutating it while iterating — stop_worker
-    # pops from RUNNING) covers ALL camera workers, supervisor-managed or not.
+    # Local cameras were started directly at startup and aren't in
+    # AUTO_MANAGED, so stop everything left in RUNNING too (snapshot, since
+    # stop_worker pops). Otherwise their tasks and VideoCaptures leaked at exit.
     #
-    # Each stop is independently guarded: RUNNING is process-global, so one
-    # camera's cleanup raising (e.g. a task tied to an event loop that's
-    # already been closed by something else) must never abort cleanup of
-    # the rest, nor propagate out of shutdown and fail whatever caller is
-    # waiting on it — same defensive stance worker.py already takes
-    # everywhere else around per-camera cleanup.
-    # Audit finding: stop_worker() only requests cancellation via
-    # task.cancel() — the task's own `finally: source.release()` only runs
-    # once it's next scheduled, which isn't guaranteed before uvicorn tears
-    # down the event loop unless this actually awaits it. Collected here
-    # (rather than trusting return_exceptions elsewhere) so a shutdown
-    # deterministically waits for every camera's real cleanup, not just the
-    # cancellation request.
+    # Each stop is guarded on its own so one bad cleanup doesn't stop the rest
+    # or blow up shutdown. And the tasks are awaited: cancel() only requests
+    # it, and the release in their finally only runs once they're scheduled
+    # again, which isn't guaranteed before uvicorn tears the loop down.
     pending_tasks = []
     for camera_id in list(RUNNING.keys()):
         try:
@@ -336,21 +294,17 @@ async def _on_shutdown():
             logger.exception("shutdown: stop_worker failed for camera %s, continuing", camera_id)
     if pending_tasks:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
-    # Camera workers are stopped, so nothing new is being spawned — now let the
-    # fire-and-forget work they started finish. An event-clip task waits up to
-    # clip_post_event_seconds before writing its Evidence row, and an untracked
-    # one was simply destroyed when the loop closed, silently losing evidence
-    # for a real alert (see app/background.py).
+    # Workers are gone, now let their background work finish. A clip task
+    # waits up to clip_post_event_seconds before writing Evidence, and one
+    # killed with the loop loses evidence for a real alert (app/background.py).
     await background.drain(settings.shutdown_drain_seconds)
-    # Same deterministic-cleanup contract as the camera workers above: the
-    # live-event batcher holds a timer task and a buffer of events not yet
-    # sent, so it is stopped (and given a final flush) here rather than being
-    # abandoned when the loop is torn down.
+    # stop_worker already asked recordings to finish; wait so the files and
+    # their evidence rows get written
+    await asyncio.to_thread(recorder.stop_all, settings.shutdown_drain_seconds)
+    # the ws batcher has a timer task and unsent events, stop it with a final flush
     await manager.shutdown()
-    # Last, because everything above may still hand work to it. Threads parked
-    # on a blocking socket read do not notice a shutdown request, so this does
-    # not wait for them -- the loop is going away regardless, and the camera
-    # workers' own `finally: source.release()` has already run above.
+    # Last, the above may still use it. Threads stuck on a socket read won't
+    # notice, so don't wait; the workers' own release already ran.
     global _executor
     if _executor is not None:
         _executor.shutdown(wait=False, cancel_futures=True)
@@ -364,14 +318,9 @@ def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str | None = None):
-    # Real gap found in a hardening pass: this endpoint broadcasts live
-    # detection/alert events (worker.py, rules_engine.py) and previously had
-    # NO authentication at all — anyone who could reach the backend got the
-    # live surveillance feed without logging in. Browsers can't attach an
-    # Authorization header to a WebSocket handshake, so the token travels as
-    # a query parameter instead (same reasoning as the existing resource-
-    # token endpoints for evidence/streams) and is validated with the same
-    # JWT before the connection is ever accepted.
+    # Live detection/alert feed, so it needs auth. Browsers can't set an
+    # Authorization header on a WebSocket handshake, so the token comes as a
+    # query param (like the evidence/stream tokens) and is checked before accept.
     db = SessionLocal()
     try:
         user = get_user_from_token(token, db)
@@ -380,11 +329,9 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = None):
     if user is None:
         await ws.close(code=4401)
         return
-    # The token is checked once, at the handshake, and a socket then stays
-    # open for as long as the tab does — so a session token that expired (8h)
-    # kept receiving live surveillance events indefinitely. Same bound the
-    # MJPEG stream already applies: the connection ends when its token does,
-    # and the client reconnects with whatever token it now holds.
+    # Checked once at the handshake, and a socket lives as long as the tab, so
+    # an expired 8h token kept getting events forever. Close when the token
+    # expires (same as MJPEG); the client reconnects with its current token.
     deadline = resource_token_expiry(token)
     await manager.connect(ws)
     try:
@@ -394,15 +341,13 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = None):
                 await ws.close(code=4401)
                 break
             try:
-                # The dashboard sends nothing; this only keeps the socket alive
-                # and notices a disconnect.
+                # dashboard never sends anything, this just notices a disconnect
                 await asyncio.wait_for(ws.receive_text(), timeout=remaining)
             except asyncio.TimeoutError:
                 continue
     except WebSocketDisconnect:
         pass
     finally:
-        # Any other exit (a transport error, a cancelled task at shutdown) used
-        # to leave the socket in `manager.active`, where every later broadcast
-        # tried to send to it.
+        # any exit, or a dead socket stays in manager.active and every
+        # broadcast keeps trying it
         manager.disconnect(ws)

@@ -1,10 +1,8 @@
-"""Indian registration validation: state/UT codes and the Bharat series.
+"""Indian registrations: state/UT codes and the Bharat series.
 
-Why this matters more than a format tweak: the format regex alone accepts any
-two letters, so OCR noise landing in the right SHAPE — "QQ00QQ0000",
-"XX12AB1234" — was a "valid plate", cleared the quality gate and became a real
-Vehicle row. On the labelled corpus, plate-shaped-but-wrong reads outnumbered
-correct ones, so this is the cheapest false-positive defence available.
+The regex alone takes any two letters, so noise shaped like QQ00QQ0000 or
+XX12AB1234 passed the gate and became a Vehicle. On the labelled corpus
+plate-shaped wrong reads outnumber correct ones; this is the cheapest defence.
 """
 import pytest
 
@@ -32,9 +30,8 @@ class TestRealRegistrationsAreAccepted:
     @pytest.mark.parametrize("plate", ["OD02AB1234", "OR02AB1234", "TG07XY9999", "TS07XY9999",
                                        "UK07AB1234", "UA07AB1234"])
     def test_both_current_and_legacy_codes_are_accepted(self, plate):
-        """Odisha, Telangana and Uttarakhand each changed prefix. Vehicles
-        carrying the old code are still on the road, and rejecting them would
-        blind the system to real traffic."""
+        """Odisha, Telangana and Uttarakhand changed prefix; old plates are
+        still on the road."""
         assert looks_like_plate(plate)
 
     @pytest.mark.parametrize("plate", ["CH01AB1234", "PY01AB1234", "AN01A1234",
@@ -46,13 +43,12 @@ class TestRealRegistrationsAreAccepted:
 class TestBharatSeries:
     @pytest.mark.parametrize("plate", ["23BH1234AA", "21BH5678A", "24BH0001XY"])
     def test_bh_series_is_accepted(self, plate):
-        """The 2021 all-India series for transferable vehicles. It does NOT
-        follow the state-code grammar — it starts with the registration year."""
+        """2021 all-India series, starts with the registration year, not a state."""
         assert looks_like_plate(plate)
 
     def test_bh_series_does_not_match_the_state_format(self, plate="23BH1234AA"):
-        """Pinned so a future 'simplification' does not merge the two grammars
-        and thereby start accepting digit-leading garbage as a state plate."""
+        """Kept separate so merging the grammars can't start accepting
+        digit-leading junk as a state plate."""
         assert not PLATE_RE.match(plate)
 
     @pytest.mark.parametrize("junk", ["23XX1234AA", "2BH1234AA", "23BH12AA", "23BH1234ABC"])
@@ -69,8 +65,7 @@ class TestUnknownStateCodesAreRejected:
         "IN07BX7197",   # "IND" country marker fragment, a real OCR artefact
     ])
     def test_plate_shaped_but_impossible_reads_are_refused(self, junk):
-        """These all satisfy the format regex. Only the state-code check stops
-        them becoming vehicle records."""
+        """All pass the regex; only the state check stops them."""
         assert PLATE_RE.match(junk), "precondition: this IS plate-shaped"
         assert looks_like_plate(junk) is False
 
@@ -80,16 +75,15 @@ class TestUnknownStateCodesAreRejected:
         assert "QQ" not in INDIAN_STATE_CODES
 
     def test_the_code_set_is_not_accidentally_empty_or_tiny(self):
-        """A truncated set would silently reject most of the country's traffic —
-        a failure that looks like 'ANPR got worse' rather than a config bug."""
+        """A short list would reject real traffic, and it'd look like ANPR got
+        worse rather than a config bug."""
         assert len(INDIAN_STATE_CODES) >= 35
 
 
 class TestInteractionWithRepairAndNormalization:
     def test_a_repair_that_would_produce_an_unknown_state_is_not_applied(self):
-        """The disambiguator only returns a candidate that `looks_like_plate`
-        accepts, so it can no longer repair noise into an impossible state
-        code."""
+        """The repair only returns something looks_like_plate accepts, so it
+        can't produce an impossible state code."""
         assert disambiguate_plate("QQQQQQQQQQ") == "QQQQQQQQQQ"
 
     def test_a_repair_producing_a_real_state_code_still_works(self):

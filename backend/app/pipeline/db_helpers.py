@@ -1,11 +1,6 @@
-"""Self-heal-aware DB commit/flush wrappers, extracted from worker.py.
-
-Every camera worker commit and flush goes through these rather than calling
-db_retry.safe_commit/safe_flush directly, so a transient SQLite lock during
-retry is recorded as a Self-Heal event automatically -- callers throughout
-the camera loop, the connection/reconnect logic, and frame processing get
-that for free by using `_safe_commit`/`_safe_flush` instead of the bare
-db_retry functions.
+"""Commit/flush wrappers that log lock recoveries as Self-Heal events (split
+out of worker.py). Camera loop code uses _safe_commit/_safe_flush instead of
+db_retry directly and gets the logging for free.
 """
 from sqlalchemy.orm import Session
 
@@ -15,10 +10,8 @@ from .camera_state import CAMERA_STATS
 
 
 def _self_heal_camera_id(camera_code: str) -> str | None:
-    # CAMERA_STATS is keyed by camera.id (not camera_code) — cheap reverse
-    # lookup only used for the self-heal event's camera_id field, purely
-    # informational (never on any hot path: only called when a lock was
-    # actually hit, i.e. already the rare/slow path).
+    # CAMERA_STATS is keyed by camera.id; this reverse lookup only runs after
+    # a lock was hit, never on the hot path
     for cid, stats in CAMERA_STATS.items():
         if stats.get("camera_code") == camera_code:
             return cid
@@ -26,20 +19,11 @@ def _self_heal_camera_id(camera_code: str) -> str | None:
 
 
 def _db_self_heal_on_result(camera_code: str, op_name: str):
-    """Builds the `on_result` hook passed to safe_commit/safe_flush —
-    records a Self-Heal event ONLY when a lock actually happened (the
-    overwhelming common case is a clean first-try write, which would be
-    pure noise to log every time). See self_heal/engine.py's module
-    docstring for why this observes rather than re-implements db_retry.py's
-    real retry logic.
+    """The on_result hook for safe_commit/safe_flush. Only logs when a lock
+    actually happened; a clean first try every time would just be noise.
 
-    Final-review audit finding: this used to be declared `async def` purely
-    to build and return a plain closure (it performs no `await` itself),
-    forcing an unnecessary coroutine creation + await on EVERY commit/flush
-    across every running camera — a real hot path this same PR's own
-    concurrency work targets. Now a plain sync function; the returned
-    closure itself is still `async def` (it genuinely awaits
-    self_heal.record_event) and is `await`ed normally by db_retry.py."""
+    Plain def returning an async closure; it used to be async itself for no
+    reason, costing a coroutine per commit on every camera."""
     async def _on_result(attempt: int, max_attempts: int, success: bool, was_lock: bool, duration_s: float):
         if not was_lock:
             return
@@ -54,13 +38,11 @@ def _db_self_heal_on_result(camera_code: str, op_name: str):
 
 
 async def _safe_commit(db: Session, camera_code: str, reapply=None) -> bool:
-    """Thin camera-labeled wrapper around db_retry.safe_commit — see that
-    module for the full rationale (retry-with-reapply on a transient SQLite
-    lock, verified empirically; no retry without `reapply`, to avoid a
-    retry-with-nothing-pending silently reporting success on a lost write)."""
+    """db_retry.safe_commit labelled with the camera (see db_retry for the
+    retry-with-reapply rules)."""
     return await safe_commit(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "commit"))
 
 
 async def _safe_flush(db: Session, camera_code: str, reapply=None) -> bool:
-    """Same as _safe_commit above, for db.flush() — see db_retry.safe_flush."""
+    """Same for db.flush()."""
     return await safe_flush(db, f"camera {camera_code}", reapply=reapply, on_result=_db_self_heal_on_result(camera_code, "flush"))

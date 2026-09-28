@@ -1,20 +1,15 @@
-"""BUG-D + the FK-enforcement half of BUG-C (final deep-debug pass).
+"""Foreign keys enforced on SQLite, and demo reset working with them on.
 
-Two findings, one root cause: SQLite ignores every FOREIGN KEY in this
-schema unless `PRAGMA foreign_keys=ON` is set per connection (it defaults to
-OFF), while the Alembic-managed PostgreSQL schema has always enforced them.
-Anything referentially invalid therefore succeeded silently in dev/demo and
-failed in production, where no SQLite-run test could ever see it.
+SQLite ignores foreign keys unless PRAGMA foreign_keys=ON per connection,
+while PostgreSQL always enforced them, so invalid references passed in dev
+and failed in production where no SQLite test could see it.
 
-Enabling the PRAGMA immediately surfaced a REAL production bug (BUG-D):
-`seed.reset_demo_data` — reached by `POST /api/system/demo/reset`, the
-flagship judge-demo reset path — deleted incidents and alerts WITHOUT first
-deleting `IncidentAlert`, which holds foreign keys to both. On PostgreSQL
-that is a ForeignKeyViolation, i.e. the demo reset endpoint was broken on
-the production datastore.
+Turning it on found a real bug straight away: seed.reset_demo_data (POST
+/api/system/demo/reset) deleted incidents and alerts before IncidentAlert,
+which points at both. On PostgreSQL that's a ForeignKeyViolation, so demo
+reset was broken in production.
 
-These tests pin: (1) the PRAGMA stays on, (2) the constraints genuinely
-bite, (3) the demo reset works with them on.
+Pinned: the PRAGMA stays on, the constraints actually bite, demo reset works.
 """
 import uuid
 
@@ -24,13 +19,13 @@ from sqlalchemy.exc import IntegrityError
 
 from app import models
 from app.config import settings
-from app.db import SessionLocal, engine
+from app.db import SessionLocal
 
 
 class TestForeignKeysAreEnforced:
     def test_the_pragma_is_on_for_every_connection(self):
-        """Per-connection, not per-database: a new pooled connection that
-        missed the PRAGMA would silently stop enforcing constraints."""
+        """Per connection: a pooled connection without the PRAGMA would quietly
+        stop enforcing."""
         for _ in range(3):
             session = SessionLocal()
             try:
@@ -39,8 +34,7 @@ class TestForeignKeysAreEnforced:
                 session.close()
 
     def test_inserting_a_row_referencing_a_nonexistent_camera_is_rejected(self):
-        """The constraint must actually bite — proving the PRAGMA is doing
-        something, not just reporting 1."""
+        """It actually bites, not just reports 1."""
         session = SessionLocal()
         try:
             session.add(models.Detection(
@@ -53,8 +47,7 @@ class TestForeignKeysAreEnforced:
             session.close()
 
     def test_deleting_a_referenced_row_is_rejected(self):
-        """The other direction: a parent with children cannot vanish and
-        leave them dangling (BUG-C's orphaned evidence, at the DB layer)."""
+        """A parent with children can't vanish and leave them dangling."""
         session = SessionLocal()
         try:
             camera = models.Camera(
@@ -76,12 +69,9 @@ class TestForeignKeysAreEnforced:
 
 class TestDemoResetIsReferentiallyValid:
     def test_reset_demo_data_succeeds_with_a_fully_linked_incident(self, db_session):
-        """BUG-D regression: build exactly the shape the real pipeline
-        produces — an incident with an IncidentAlert link, evidence and a
-        note — then reset. Before the fix this raised
-        `FOREIGN KEY constraint failed` on `DELETE FROM incidents`, and
-        would have been a 500 from POST /api/system/demo/reset on
-        PostgreSQL."""
+        """Incident with an IncidentAlert link, evidence and a note, then
+        reset. Used to fail "FOREIGN KEY constraint failed" on DELETE FROM
+        incidents, a 500 on PostgreSQL."""
         from app.seed import reset_demo_data
 
         assert settings.demo_mode, "this test requires DEMO_MODE (conftest sets it)"

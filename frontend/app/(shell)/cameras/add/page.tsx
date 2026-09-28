@@ -7,10 +7,9 @@ export default function AddCameraPage() {
   const router = useRouter();
   const [form, setForm] = useState({
     camera_code: "", name: "", department: "Police", location: "", camera_group: "",
-    // Blank, not a city centre: a pre-filled position was saved for every
-    // camera whose operator did not change it, and the map then showed that
-    // camera somewhere it is not. Blank is stored as 0,0, which the map treats
-    // as "location unavailable".
+    // blank, not a city centre: a prefilled position got saved for every camera
+    // nobody changed, and the map put them in the wrong place. blank = 0,0 =
+    // "location unavailable"
     lat: "", lng: "",
     source_type: "video_file", source_uri: "",
     ai_person: true, ai_vehicle: true, ai_anpr: true,
@@ -25,6 +24,13 @@ export default function AddCameraPage() {
   }
 
   async function uploadIfNeeded(): Promise<string> {
+    if (form.source_type === "video_file" && !file && !form.source_uri) {
+      throw new Error("Choose a video file first");
+    }
+    // mock_vms has no address field, it generates its own feed
+    if (["webcam", "rtsp", "onvif"].includes(form.source_type) && !form.source_uri.trim()) {
+      throw new Error("Enter the camera's source address first");
+    }
     if (form.source_type !== "video_file" || !file) return form.source_uri;
     const fd = new FormData();
     fd.append("file", file);
@@ -40,9 +46,8 @@ export default function AddCameraPage() {
       const fd = new FormData();
       fd.append("source_type", form.source_type);
       fd.append("source_uri", uri);
-      // api.post, not a raw fetch: the helper attaches the bearer token. This
-      // endpoint used to be the one camera route with no authorization at all,
-      // precisely because the caller here never sent one.
+      // api.post so the bearer token goes along; this was the one camera route
+      // without auth, because this caller never sent one
       const data = await api.post<any>("/api/cameras/test-connection", fd);
       setTestResult(data.detail);
       if (uri !== form.source_uri) set("source_uri", uri);

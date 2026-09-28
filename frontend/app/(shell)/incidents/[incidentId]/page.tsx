@@ -20,8 +20,8 @@ export default function IncidentDetailPage() {
   const timeline = timelineData?.events || [];
   const evidence = evidenceData || [];
   const cameras = camerasData || [];
-  // Other cameras within 1 km of the incident's camera: where an investigator
-  // looks next. A PostGIS query on the PostgreSQL deployment (app/geo.py).
+  // other cameras within 1 km of the incident's camera, where an investigator
+  // looks next (PostGIS on PostgreSQL, app/geo.py)
   const incidentCamera = incident?.camera_id ? cameras.find((c) => c.id === incident.camera_id) : null;
   const nearbyPath = incidentCamera && hasLocation(incidentCamera)
     ? `/api/cameras/nearby?lat=${incidentCamera.lat}&lng=${incidentCamera.lng}&radius_m=1000&limit=10&exclude_id=${incidentCamera.id}`

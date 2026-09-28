@@ -1,18 +1,10 @@
-"""Sentinel Self-Heal — centralized recovery event log + open-problem index
-for the platform's REAL recovery mechanisms.
+"""Self-Heal: recovery event log and open-problem index.
 
-This module deliberately does NOT implement a second, parallel recovery
-system. The project already has real, tested recovery code:
-  - pipeline/db_retry.py (safe_commit/safe_flush) — SQLite lock rollback+retry
-  - pipeline/worker.py (_reopen_with_backoff, read-failure counter) — camera
-    reconnect/backoff and stream-drop handling
-  - pipeline/supervisor.py — 24/7 reconnect sweep
-  - self_heal/http_retry.py — bounded retry for this app's own outbound HTTP
-
-Part 17 of the Self-Heal spec is explicit that Self-Heal must be
-OPERATIONAL RECOVERY ONLY — this module OBSERVES and LOGS the recovery
-paths above (so operators have one place to see them: GET /api/self-heal/*
-and the SELF-HEAL UI), it never re-implements or overrides them.
+Doesn't do any recovering itself. The real recovery code is db_retry.py
+(lock rollback + retry), worker.py / camera_connection.py (reconnect and
+backoff), supervisor.py (24/7 reconnect sweep) and self_heal/http_retry.py.
+This records what those do so operators see it in one place
+(GET /api/self-heal/*, the SELF-HEAL UI).
 """
 import asyncio
 import logging
@@ -30,40 +22,27 @@ logger = logging.getLogger("sentinel.self_heal")
 # Components with no camera_id use this key in _LATEST below.
 _GLOBAL = "_global"
 
-# In-memory "is this thing currently broken" index — one entry per
-# (component, camera_id) key, holding the most recent event for that key.
-# Powers GET /api/self-heal/problems without re-scanning the whole events
-# table on every poll. Rebuilt from the DB at startup (rebuild_open_problems)
-# so a backend restart doesn't lose real open problems. Diagnostic/UI state
-# only — never the source of truth (the DB row is), safe to lose on crash.
+# Latest event per (component, camera_id), so /problems doesn't rescan the
+# events table on every poll. Rebuilt from the DB at startup
+# (rebuild_open_problems); the DB is the source of truth.
 _LATEST: dict[tuple[str, str], "models.SelfHealEvent"] = {}
 
-# Terminal statuses — a component/camera whose latest event has one of these
-# is NOT an open problem. Anything else (RECOVERING, FAILED, CONFIG_REQUIRED,
-# DEGRADED) is.
+# latest status in here = not an open problem. anything else (RECOVERING,
+# FAILED, CONFIG_REQUIRED, DEGRADED) is
 _RESOLVED_STATUSES = {"RECOVERED"}
 
-# Noisy-duplicate suppression (audit review finding): a camera under
-# sustained-but-transient lock contention can hit-and-recover a lock on
-# nearly every heartbeat commit — each one individually correct to log, but
-# a real operator's Error Logs/Recovery Activity page would drown in
-# identical "recovered" rows for the SAME ongoing condition. Suppresses a
-# REPEAT of the exact same (component, camera_id, error_type) RECOVERED
-# event within this window — never applied to a FAILED/CONFIG_REQUIRED
-# event or a critical-severity one, so a genuine, still-unresolved failure
-# is never hidden by this. The DB row for the first occurrence in a burst
-# always persists; only the immediate repeats are skipped.
+# A camera under steady lock contention can hit and recover a lock on almost
+# every heartbeat commit, and Error Logs drowned in identical "recovered" rows.
+# Repeats of the same (component, camera_id, error_type) RECOVERED event
+# inside this window are skipped. Never FAILED, CONFIG_REQUIRED or critical
+# events, and the first one of a burst is always written.
 _DEDUP_WINDOW_S = 10.0
-# Shared-state seam (app/runtime_state.py): this was a `time.monotonic()` dict,
-# which a second process cannot read and a restart resets. The effect of either
-# is the same — the burst of repeats this exists to swallow gets written anyway.
+# Shared via app/runtime_state.py; a monotonic dict can't be read by another
+# process and resets on restart, so the burst got written anyway.
 #
-# This call site stays sync and is never awaited: `record_event_sync` (below)
-# is either run directly (a synchronous caller already off the event loop) or
-# reached through `record_event`'s `await asyncio.to_thread(record_event_sync,
-# ...)`, so a blocking Redis call inside it is already off the loop either way
-# — no async wrapper needed here the way rules_engine's cooldown check needed
-# one.
+# Sync is fine here: record_event_sync runs either in a caller that's already
+# off the loop or via record_event's to_thread, so a blocking Redis call never
+# hits the event loop.
 _recovered_claims = runtime_state.build_claims_store("self_heal_dedup", settings)
 
 
@@ -74,7 +53,10 @@ def _key(component: str, camera_id: str | None) -> tuple[str, str]:
 def _is_noisy_duplicate(component: str, camera_id: str | None, error_type: str, status: str, severity: str) -> bool:
     if status != "RECOVERED" or severity == "critical":
         return False
-    dedup_key = (component, camera_id or _GLOBAL, error_type)
+    # A database lock is one condition however many cameras hit it; with 30
+    # cameras a storm wrote 30 rows, each a write fighting the same lock.
+    scope = _GLOBAL if component == "database" else (camera_id or _GLOBAL)
+    dedup_key = (component, scope, error_type)
     return not _recovered_claims.claim(dedup_key, _DEDUP_WINDOW_S)
 
 
@@ -85,17 +67,12 @@ def record_event_sync(
     status: str = "RECOVERED", duration_seconds: float = 0.0,
     endpoint: str = "", metadata: dict[str, Any] | None = None,
 ) -> "models.SelfHealEvent | None":
-    """Best-effort, synchronous write — never raises. Uses its OWN
-    short-lived session so recording a self-heal event can never interfere
-    with (or get rolled back by) the transaction of the real operation it's
-    describing. Losing an occasional self-heal row under extreme contention
-    is acceptable; the operation it describes already succeeded/failed on
-    its own, independently of this log entry.
+    """Best-effort synchronous write, never raises. Own short-lived session so
+    logging can't interfere with or get rolled back by the operation it
+    describes. Losing the odd row under heavy contention is fine.
 
-    Returns None (no row written) for a suppressed noisy-duplicate RECOVERED
-    event — see _is_noisy_duplicate above. Callers already treat None as
-    "no event to broadcast" (record_event), so this needs no special
-    handling at any call site."""
+    None (nothing written) for a suppressed duplicate; record_event already
+    treats None as nothing to broadcast."""
     if _is_noisy_duplicate(component, camera_id, error_type, status, severity):
         return None
     db = SessionLocal()
@@ -126,15 +103,13 @@ def record_event_sync(
 
 
 async def record_event(**kwargs) -> "models.SelfHealEvent | None":
-    """Async wrapper — offloads the blocking DB write to a thread (same
-    reasoning as db_retry.py) and broadcasts over the existing WebSocket so
-    the Recovery Activity / Problems pages update live, no polling."""
+    """Write on a thread (like db_retry.py) and push it over the websocket so
+    Recovery Activity / Problems update live."""
     row = await asyncio.to_thread(record_event_sync, **kwargs)
     if row is not None:
         try:
-            # publish, not broadcast: emits the canonical `self_heal.recovery`
-            # name and the legacy `self_heal_event` alias alongside it, so the
-            # existing Recovery Activity / Problems pages keep working unchanged.
+            # publish sends self_heal.recovery plus the legacy self_heal_event
+            # name the existing pages listen for
             metrics.SELF_HEAL_EVENTS.labels(
                 component=str(row.component or "unknown"), status=str(row.status or "unknown"),
             ).inc()
@@ -156,11 +131,9 @@ def serialize(row: "models.SelfHealEvent") -> dict[str, Any]:
 
 
 def classify_exception(exc: BaseException) -> tuple[str, str]:
-    """Best-effort (error_type, severity) for a generic caught exception —
-    for call sites that don't already know a more specific type (e.g.
-    worker.py's outer per-iteration except). Narrow and honest: anything not
-    recognized is UNKNOWN/warning, never guessed into a specific category
-    it might not actually be."""
+    """(error_type, severity) for a generic exception, for callers that don't
+    know better (worker's per-iteration except). Anything unrecognized is
+    UNKNOWN/warning rather than a guess."""
     name = type(exc).__name__
     msg = str(exc).lower()
     if "operational" in name.lower() and ("locked" in msg or "busy" in msg):
@@ -174,8 +147,7 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
 
 def rebuild_open_problems() -> None:
     """Startup: reload the latest event per (component, camera_id) from the
-    last 24h so GET /api/self-heal/problems reflects real state across a
-    restart, not just this process's in-memory history since boot."""
+    last 24h so open problems survive a restart."""
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -195,18 +167,15 @@ def rebuild_open_problems() -> None:
 
 
 def forget_camera(camera_id: str) -> None:
-    """Drop a deleted camera from the open-problem index.
-
-    Deleting a camera deletes its SelfHealEvent rows (routers/cameras.py), but
-    this in-memory index kept the latest one, so a deleted camera's failure
-    stayed on the Problems page — pointing at a camera that no longer exists —
-    until the next restart rebuilt the index from the database.
+    """Forget a deleted camera. Its SelfHealEvent rows go with it
+    (routers/cameras.py), but this index kept the last one and the Problems
+    page showed a camera that no longer existed until the next restart.
     """
     for key in [k for k in _LATEST if k[1] == camera_id]:
         _LATEST.pop(key, None)
 
 
 def open_problems() -> list["models.SelfHealEvent"]:
-    """Every tracked (component, camera_id)'s latest event, where that
-    latest status is not a resolved one — i.e. genuinely still open."""
+    """Latest event per tracked (component, camera_id) whose status isn't
+    resolved."""
     return [row for row in _LATEST.values() if row.status not in _RESOLVED_STATUSES]

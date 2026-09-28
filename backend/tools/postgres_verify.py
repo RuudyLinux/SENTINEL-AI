@@ -1,43 +1,32 @@
-"""Live PostgreSQL verification — the production datastore, actually exercised.
+"""Live PostgreSQL verification.
 
-Everything this repo claims about PostgreSQL was previously verified only by
-generating SQL offline (`alembic upgrade head --sql`). That proves the DDL
-parses; it does not prove the migration APPLIES, that the constraints behave,
-or that code paths which differ between the two backends work. This runs a
-REAL PostgreSQL server (via the `pgserver` package — self-contained binaries,
-no admin install, no system service) and exercises them for real.
+Offline SQL generation (alembic upgrade head --sql) only proves the DDL
+parses, not that migrations apply, constraints behave, or backend-specific
+code paths work. This runs a real PostgreSQL via `pgserver` (bundled
+binaries, no install, no service) and checks those.
 
-Everything happens in ONE process on purpose: `pgserver` stops the server when
-the owning process exits, so a separate `alembic` invocation would find nothing
-listening.
+One process on purpose: pgserver stops the server when its owner exits, so a
+separate alembic run would find nothing listening.
 
-Checks, in order:
+Checks:
+1. alembic upgrade head applies.
+2. vehicles.plate_text and audit_logs.chain_seq are UNIQUE,
+3. and duplicates are actually rejected.
+4. Foreign keys are enforced (SQLite only does with PRAGMA foreign_keys=ON).
+5. seed.reset_demo_data runs. A missing IncidentAlert delete once made
+   DELETE FROM incidents a ForeignKeyViolation on PostgreSQL only; this
+   checks the fix on the backend that was broken.
+6. alembic downgrade base reverses the chain.
 
-1. `alembic upgrade head` APPLIES against a real PostgreSQL database.
-2. The schema really carries the constraints this project depends on —
-   `vehicles.plate_text` UNIQUE (BUG-1) and `audit_logs.chain_seq` UNIQUE.
-3. Those constraints actually bite (duplicate insert rejected).
-4. Foreign keys are enforced — the property SQLite only gained once
-   `PRAGMA foreign_keys=ON` was set, and the source of the dev/prod divergence.
-5. **BUG-D**: `seed.reset_demo_data` runs cleanly. This is the important one —
-   BUG-D was a PostgreSQL-ONLY failure (a missing `IncidentAlert` delete made
-   `DELETE FROM incidents` a ForeignKeyViolation), so it was fixed against a
-   backend that could not previously be tested. This proves the fix on the
-   backend that was actually broken.
-6. `alembic downgrade base` reverses the whole chain cleanly.
-
-Usage:
     cd backend
     uv pip install --python .venv/Scripts/python.exe pgserver   # one-off
     .venv/Scripts/python.exe tools/postgres_verify.py
 
-`pgserver` is deliberately NOT in requirements.txt: it bundles a full
-PostgreSQL distribution and is only needed to RUN this verification, never to
-run SENTINEL itself. A deployment that already has a PostgreSQL instance can
-skip it and point DATABASE_URL at the real server instead.
+pgserver isn't in requirements.txt; it's a whole PostgreSQL distribution
+only needed for this check. With a real server, point DATABASE_URL at it.
 
-Measured result on this machine (2026-09-11): 12/12 checks passed, including
-pg_dump -> DROP DATABASE -> pg_restore with the evidence SHA-256 intact.
+Last run here (2026-09-11): 12/12 passed, including pg_dump -> DROP
+DATABASE -> pg_restore with the evidence SHA-256 intact.
 """
 from __future__ import annotations
 
@@ -73,14 +62,14 @@ def main() -> int:
     sa_uri = raw_uri.replace("postgresql://", "postgresql+psycopg://")
     print(f"database: {db_name}")
 
-    # Must be set BEFORE app.config is imported — settings are read at import.
+    # before app.config is imported, settings are read at import
     os.environ["DATABASE_URL"] = sa_uri
 
     from alembic import command
     from alembic.config import Config
     from sqlalchemy import create_engine, inspect, text
 
-    # --- 1. migrations actually apply -------------------------------------
+    # 1. migrations apply
     cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
     try:
         command.upgrade(cfg, "head")
@@ -95,7 +84,7 @@ def main() -> int:
     check("core tables created", {"cameras", "vehicles", "alerts", "incidents", "evidence", "audit_logs"} <= tables,
           f"{len(tables)} tables")
 
-    # --- 2/3. the constraints this project depends on ---------------------
+    # 2/3. the unique constraints
     def _has_unique(table: str, column: str) -> bool:
         uniques = inspector.get_unique_constraints(table)
         indexes = [i for i in inspector.get_indexes(table) if i.get("unique")]
@@ -117,7 +106,7 @@ def main() -> int:
         duplicate_rejected = True
     check("duplicate plate_text is rejected by PostgreSQL (BUG-1 fix is real here)", duplicate_rejected)
 
-    # --- 4. foreign keys enforced -----------------------------------------
+    # 4. foreign keys enforced
     fk_rejected = False
     try:
         with engine.begin() as conn:
@@ -130,14 +119,9 @@ def main() -> int:
         fk_rejected = True
     check("foreign keys are enforced (detection -> nonexistent camera rejected)", fk_rejected)
 
-    # --- 4b. analytics queries run on PostgreSQL, not only on SQLite ------
-    # `/api/analytics/events-by-hour` grouped with SQLite's `strftime`, which
-    # SQLAlchemy passes through verbatim, so on PostgreSQL it failed with
-    # "function strftime(unknown, timestamp without time zone) does not
-    # exist" — a 500 on the dashboard's 24-hour chart in production, invisible
-    # to a test suite that runs on SQLite. The real endpoint function is
-    # called here (not a re-written copy of its query) so this check cannot
-    # drift away from what the API actually executes.
+    # 4b. analytics on PostgreSQL. events-by-hour used SQLite's strftime,
+    # passed through verbatim, and 500'd the dashboard chart in production.
+    # Calls the real endpoint function, not a copy of its query.
     from sqlalchemy.orm import sessionmaker as _sessionmaker
 
     from app.routers.analytics import events_by_hour
@@ -152,7 +136,7 @@ def main() -> int:
     finally:
         _session.close()
 
-    # --- 5. BUG-D: the PostgreSQL-only demo-reset failure ------------------
+    # 5. demo reset (the PostgreSQL-only failure)
     from sqlalchemy.orm import sessionmaker
 
     from app import models
@@ -176,7 +160,7 @@ def main() -> int:
         incident = models.Incident(title="pg probe incident", camera_id=camera.id, alert_id=alert.id)
         session.add(incident)
         session.flush()
-        # The row whose missing DELETE was BUG-D.
+        # the table whose missing DELETE broke it
         session.add(models.IncidentAlert(incident_id=incident.id, alert_id=alert.id, correlation_reason="pg probe"))
         session.add(models.Evidence(
             incident_id=incident.id, camera_id=camera.id, alert_id=alert.id,
@@ -198,11 +182,8 @@ def main() -> int:
     finally:
         session.close()
 
-    # --- 5b. disaster recovery on PostgreSQL ------------------------------
-    # tests/test_disaster_recovery.py proves backup/restore for SQLite only
-    # (it uses SQLite's own online-backup API). This is the PostgreSQL
-    # equivalent, using the real pg_dump/pg_restore that ship with the server
-    # — the documented production DR path, previously never exercised.
+    # 5b. disaster recovery. test_disaster_recovery.py only covers SQLite's
+    # backup API; this is pg_dump/pg_restore, the real production DR path
     import subprocess
 
     pg_bin = Path(pgserver.__file__).parent / "pginstall" / "bin"
@@ -265,7 +246,7 @@ def main() -> int:
         dump_path.unlink(missing_ok=True)
         engine = create_engine(sa_uri)
 
-    # --- 6. the migration chain reverses ----------------------------------
+    # 6. the migration chain reverses
     try:
         command.downgrade(cfg, "base")
         remaining_tables = set(inspect(create_engine(sa_uri)).get_table_names()) - {"alembic_version"}

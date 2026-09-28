@@ -18,14 +18,12 @@ def list_incidents(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent incidents, newest first, narrowed by status.
+    """Most recent incidents, newest first, optionally by status.
 
-    This ended in a bare `.all()`. One incident is opened per CRITICAL alert,
-    so the table grows with operational activity and "return every row" is a
-    query whose cost rises forever — on one of the screens an operator opens
-    most. Every other transactional list endpoint here is already bounded
-    (alerts 200, detections 100/500, audit 500); these were the deviation, not
-    the new rule. `ge=1` because SQLite reads `LIMIT -1` as no limit at all.
+    Bounded like the other list endpoints (alerts 200, detections 100/500,
+    audit 500); one incident per CRITICAL alert, so a bare .all() only gets
+    slower on a screen operators open constantly. ge=1 because SQLite reads
+    LIMIT -1 as no limit.
     """
     q = db.query(models.Incident)
     if status:
@@ -34,14 +32,9 @@ def list_incidents(
 
 
 def _require_exists(db: Session, model, value: "str | None", label: str) -> None:
-    """404 for a referenced row that is not there.
-
-    Every one of these columns is a foreign key. Unchecked, an unknown id
-    reached the database and raised an unhandled IntegrityError — a 500
-    carrying a raw "FOREIGN KEY constraint failed" where the caller had simply
-    named something that does not exist. (Before SQLite foreign keys were
-    enforced the same request silently wrote a dangling reference, which is
-    worse: an incident pointing at no camera still renders as an incident.)
+    """404 for a referenced row that doesn't exist. These are all foreign
+    keys; unchecked, an unknown id became a 500 "FOREIGN KEY constraint
+    failed" (and before SQLite enforced FKs, a silently dangling reference).
     """
     if value and not db.query(model).filter(model.id == value).first():
         raise HTTPException(status_code=404, detail=f"{label} not found")
@@ -70,13 +63,11 @@ def get_incident(incident_id: str, db: Session = Depends(get_db), user: models.U
 
 @router.get("/{incident_id}/summary")
 def incident_summary(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Investigator Summary (10/10 roadmap P10): everything backing "what
-    happened, why was it flagged, where was it seen, what evidence supports
-    it, how confident are we" gathered into one call, so the incident page
-    does not require an operator to manually chase five different endpoints.
-    Every value here is read from rows already computed elsewhere (risk.py,
-    plate_tracker via the Plate table, correlate.get_route, evidence.verify) —
-    nothing is recomputed or invented for this view.
+    """Investigator summary: what happened, why it was flagged, where the
+    vehicle was seen, what evidence backs it and how confident we are, in
+    one call instead of five. Everything is read from what's already been
+    computed (risk.py, the Plate table, correlate.get_route, evidence
+    verification); nothing is recomputed here.
     """
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
@@ -89,10 +80,8 @@ def incident_summary(incident_id: str, db: Session = Depends(get_db), user: mode
     primary_alert = next((a for a in alerts if a.id == inc.alert_id), alerts[0] if alerts else None)
 
     vehicle = db.query(models.Vehicle).filter(models.Vehicle.id == inc.vehicle_id).first() if inc.vehicle_id else None
-    # Read from the entry, not from the vehicle's cached flag: the summary
-    # tells an investigator this vehicle is on the watchlist, so it must be
-    # true at read time. A stale-True flag would assert a match that had been
-    # deactivated; a stale-False one would hide a live match.
+    # from the entry, not the cached flag: this tells an investigator the
+    # vehicle is on the watchlist, so it has to be true right now
     watchlist_entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle else None
 
     route = []
@@ -153,10 +142,8 @@ def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: mod
     if inc.alert_id:
         alert = db.query(models.Alert).filter(models.Alert.id == inc.alert_id).first()
         if alert:
-            # `or []`: Alert.reasons is nullable, and joining None raised
-            # "TypeError: can only join an iterable" — a 500 on the timeline of
-            # an otherwise valid incident. The summary endpoint above already
-            # guards the same column this way; this call site did not.
+            # Alert.reasons is nullable and join(None) raised TypeError, a 500
+            # on a valid incident's timeline
             events.append({"timestamp": alert.timestamp, "label": f"Alert fired: {', '.join(alert.reasons or [])}"})
     if inc.vehicle_id:
         from ..pipeline.correlate import get_route
@@ -191,8 +178,8 @@ def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depen
     if not assignee:
         raise HTTPException(status_code=404, detail="Assignee not found")
     if not assignee.active:
-        # Assigning to a closed account moves the incident to in_progress with
-        # nobody able to log in and work it — a silently stalled case.
+        # assigning to a disabled account leaves the case in_progress with
+        # nobody who can log in to work it
         raise HTTPException(status_code=400, detail="That account is disabled and cannot be assigned work")
     inc.assigned_to = assignee_user_id
     inc.status = "in_progress"

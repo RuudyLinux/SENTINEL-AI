@@ -1,21 +1,14 @@
-"""Whether a watchlist entry is IN FORCE right now — asked in one place.
+"""Is a watchlist entry in force right now. Asked here and nowhere else.
 
-Four call sites (rules_engine, correlate twice, the incident summary) each
-asked this question independently as `active == True`, and every one of them
-ignored `valid_until`. The column is on the model, accepted by the create
-schema, and stored by the API, but nothing in the codebase ever compared it to
-the clock — so an entry given an explicit expiry date kept matching plates
-forever. An operator who sets an end date reasonably believes the entry stops
-at that date; it did not.
+The four places that asked (rules_engine, correlate twice, incident summary)
+each checked `active == True` and ignored valid_until, so an entry with an
+end date kept matching forever.
 
-`Vehicle.watchlist_flag` is a CACHE of the answer, not the answer. It is
-written when a vehicle is first seen (correlate.upsert_vehicle_for_plate) and
-refreshed whenever the entries covering its plate change, so the UI and the
-worker's snapshot capture can test a boolean instead of running this query per
-frame. Anything that decides whether to ACCUSE — fire a watchlist alert, or
-tell an investigator "this vehicle matches an active watchlist entry" — must
-consult the entry itself through this module, because a cache can be stale and
-an accusation should not be.
+Vehicle.watchlist_flag is a cache of the answer: set when the vehicle is
+first seen and refreshed when its plate's entries change, so the UI and
+snapshot capture can check a bool instead of querying per frame. Anything
+that accuses (fires a watchlist alert, tells an investigator there's a
+match) must ask the entry through this module; a cache can be stale.
 """
 from datetime import datetime
 
@@ -26,11 +19,7 @@ from . import models
 
 
 def entries_in_force(db: Session, now: datetime | None = None) -> Query:
-    """Entries that are active AND not past their expiry.
-
-    An entry with no `valid_until` never expires, which is the existing
-    behaviour for the entries that have none.
-    """
+    """Active and not expired. No valid_until = never expires."""
     at = now or datetime.utcnow()
     return db.query(models.WatchlistEntry).filter(
         models.WatchlistEntry.active == True,  # noqa: E712
@@ -39,11 +28,9 @@ def entries_in_force(db: Session, now: datetime | None = None) -> Query:
 
 
 def plate_entry_in_force(db: Session, plate_text: str | None, now: datetime | None = None):
-    """The in-force plate entry covering `plate_text`, or None.
-
-    Plate identifiers are stored normalized by the create endpoint, and every
-    caller here passes an already-normalized plate (the pipeline normalizes at
-    OCR time), so this compares like with like.
+    """In-force plate entry for plate_text, or None. Identifiers are stored
+    normalized and callers pass normalized plates, so this compares like
+    with like.
     """
     if not plate_text:
         return None
@@ -54,14 +41,10 @@ def plate_entry_in_force(db: Session, plate_text: str | None, now: datetime | No
 
 
 def refresh_vehicle_flag(db: Session, vehicle, now: datetime | None = None) -> bool:
-    """Recompute a vehicle's cached flag from the entries actually in force.
-
-    Called wherever the entry set for a plate changes. Deactivating an entry
-    used to leave `watchlist_flag` set forever: the vehicle kept showing
-    "⚠ WATCHLIST" across the UI, kept being CRITICAL-prioritised on the
-    tracking page, and kept having snapshot evidence captured of it — for a
-    plate an operator had explicitly removed from the watchlist. Does not
-    commit; the caller owns the transaction.
+    """Recompute a vehicle's cached flag from the entries in force. Call it
+    whenever a plate's entries change; deactivation used to leave the flag
+    on forever (still "⚠ WATCHLIST", still prioritised, still snapshotted).
+    Doesn't commit.
     """
     if vehicle is None:
         return False

@@ -1,14 +1,10 @@
-"""Run the REAL detection + ANPR pipeline over a video source and report what
-it actually detected.
+"""Run the real detection + ANPR pipeline over a video source and print what
+it found.
 
-Not a test double: this calls the same `detector.detect_and_track` (YOLOv8 +
-ByteTrack), the same `plate_detect.locate_plate`, and the same
-`anpr.read_plate`/`passes_anpr_gate` the live camera worker uses. The only
-thing it skips is persistence and rule evaluation, so it can be pointed at any
-source without touching the database.
-
-Purpose: produce MEASURED detection output from real footage, rather than
-asserting the pipeline "works". Every number printed is counted from this run.
+Same detector.detect_and_track, plate_detect.locate_plate and
+anpr.read_plate/passes_anpr_gate as the live worker, minus persistence and
+rules, so it can point at any source without touching the database. Every
+number printed is counted from this run.
 
 Usage:
     python tools/live_detect_probe.py                     # bundled demo footage

@@ -1,17 +1,10 @@
-"""Regression tests for the SQLite "database is locked" concurrency fix
-(pipeline/db_retry.py). These use a real, dedicated on-disk SQLite file and
-a genuine second connection holding a real write lock — not a mock — so
-they prove the fix against SQLite's actual locking behavior, the same way
-this was verified before the fix was written (scratchpad experiment
-scripts, not reproduced here).
+"""SQLite "database is locked" handling (pipeline/db_retry.py), against a
+real on-disk file with a real second connection holding the write lock, not
+a mock.
 
-A dedicated throwaway DB file (not the shared tests/conftest.py test.db) is
-used so this test can safely shrink busy_timeout far below the app's real
-30s (db.py) — forcing a genuine, fast OperationalError instead of waiting
-out the full 30s budget SQLite itself already absorbs before ever surfacing
-"database is locked" to Python (confirmed during this fix's investigation:
-with the app's real 30s busy_timeout, a lock error reaching Python at all
-already means multi-second contention, not a sub-second blip).
+Own throwaway DB file, not conftest's test.db, so busy_timeout can be far
+below the app's 30s and a real OperationalError shows up fast. With 30s a
+lock error reaching Python already means seconds of contention.
 """
 import asyncio
 import os
@@ -30,10 +23,8 @@ from app.pipeline.correlate import upsert_vehicle_for_plate
 
 
 def _make_short_timeout_engine(db_path: str):
-    """Same PRAGMAs as db.py's real engine, but with a much shorter
-    busy_timeout — purely so this test can force a real lock error in
-    milliseconds instead of seconds; the retry/backoff mechanism under test
-    is identical for any timeout value."""
+    """db.py's PRAGMAs with a much shorter busy_timeout so a real lock error
+    shows up in ms. The retry logic is the same for any timeout."""
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 0.2})
 
     @event.listens_for(engine, "connect")
@@ -47,12 +38,10 @@ def _make_short_timeout_engine(db_path: str):
 
 
 def test_safe_commit_retries_through_a_real_sqlite_lock_and_succeeds():
-    """A genuine second connection holds a real write lock on the actual
-    on-disk file for longer than a single commit attempt's busy_timeout
-    budget. safe_commit must rollback, reapply, back off, and retry until
-    the lock releases — and the reapplied value must actually be the one
-    that ends up durably committed (verified by reloading through a
-    completely separate connection, not just trusting the return value)."""
+    """A second connection holds the write lock longer than one commit
+    attempt waits. safe_commit has to roll back, reapply, back off and retry
+    until it's free, and the reapplied value is what ends up committed
+    (checked from a separate connection, not the return value)."""
     tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
     db_path = os.path.join(tmp_dir, "lock_test.db").replace("\\", "/")
 
@@ -69,10 +58,10 @@ def test_safe_commit_retries_through_a_real_sqlite_lock_and_succeeds():
     db.commit()
     camera_id = camera.id
 
-    lock_hold_seconds = 0.6  # comfortably longer than several retry attempts' total backoff
+    lock_hold_seconds = 0.6  # longer than several retries' total backoff
 
     def _hold_lock():
-        conn = sqlite3.connect(db_path, timeout=30)  # this side isn't under test — it just needs to hold and release
+        conn = sqlite3.connect(db_path, timeout=30)  # just holds and releases, not under test
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE cameras SET name = name WHERE id = ?", (camera_id,))
         time.sleep(lock_hold_seconds)
@@ -88,10 +77,8 @@ def test_safe_commit_retries_through_a_real_sqlite_lock_and_succeeds():
         camera.status = target_status  # type: ignore[assignment]
 
         def reapply():
-            # Reassigns from the captured local, never by re-reading
-            # camera.status — a rollback would have expired it back to
-            # "offline" (the last-committed value), per this fix's
-            # verified rollback semantics.
+            # from the captured local, rollback expired camera.status back
+            # to "offline"
             camera.status = target_status  # type: ignore[assignment]
 
         ok = asyncio.run(safe_commit(db, "test-camera", reapply=reapply, max_attempts=20))
@@ -111,10 +98,7 @@ def test_safe_commit_retries_through_a_real_sqlite_lock_and_succeeds():
 
 
 def test_safe_commit_without_reapply_fails_fast_under_a_real_lock_rather_than_retrying():
-    """No `reapply` given -> a single attempt, matching the pre-fix
-    behavior — proves this never silently turns into an unbounded/blind
-    retry loop against a real lock when the caller hasn't opted in with a
-    way to redo the pending write."""
+    """No reapply: one attempt, never a blind retry loop."""
     tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
     db_path = os.path.join(tmp_dir, "lock_test2.db").replace("\\", "/")
 
@@ -154,18 +138,14 @@ def test_safe_commit_without_reapply_fails_fast_under_a_real_lock_rather_than_re
         engine.dispose()
 
     assert ok is False
-    assert elapsed < 1.0  # single attempt, not stuck waiting through the holder's full 1s hold
+    assert elapsed < 1.0  # one attempt, not waiting out the holder's 1s
 
 
 def test_safe_flush_retries_through_a_real_sqlite_lock_and_succeeds():
-    """Root-cause regression test: worker.py's `db.add(det_row); db.flush()`
-    (assigns the detection's identity before the rest of the frame's
-    processing) was completely unguarded — a real lock there escaped to
-    _camera_loop's outer except and silently dropped the detection instead
-    of retrying, exactly as seen in a real production log (`INSERT INTO
-    detections ... sqlite3.OperationalError: database is locked`). Same real-
-    lock harness as the safe_commit test above, proving safe_flush recovers
-    and the flushed row is durably visible."""
+    """safe_flush on the worker's detection flush, which used to be unguarded:
+    a real lock there dropped the detection (seen in a production log:
+    INSERT INTO detections ... database is locked). Same harness as above;
+    the flushed row has to be durably visible."""
     tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
     db_path = os.path.join(tmp_dir, "flush_lock_test.db").replace("\\", "/")
 
@@ -203,16 +183,14 @@ def test_safe_flush_retries_through_a_real_sqlite_lock_and_succeeds():
         db.add(det)
 
         def reapply():
-            # Same reasoning as db_retry.safe_flush's docstring: rollback
-            # only detaches the still-transient `det` — its client-generated
-            # id and other already-set attributes survive untouched, so
-            # re-add() alone correctly restores it for the retried flush.
+            # rollback only detaches the new `det`, its id and attributes
+            # survive, so re-add() is enough
             db.add(det)
 
         ok = asyncio.run(safe_flush(db, "test-camera", reapply=reapply, max_attempts=20))
         assert ok is True
         det_id = det.id
-        db.commit()  # persist what the flush staged, so a fresh connection can see it
+        db.commit()  # so a fresh connection can see it
     finally:
         holder.join()
         db.close()
@@ -228,9 +206,7 @@ def test_safe_flush_retries_through_a_real_sqlite_lock_and_succeeds():
 
 
 def test_safe_flush_without_reapply_fails_fast_rather_than_retrying():
-    """No `reapply` given -> a single attempt, same bounded-retry contract as
-    safe_commit — proves this never turns into an unbounded/blind retry
-    loop against a real lock."""
+    """No reapply: one attempt, like safe_commit."""
     tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
     db_path = os.path.join(tmp_dir, "flush_lock_test2.db").replace("\\", "/")
 
@@ -275,14 +251,9 @@ def test_safe_flush_without_reapply_fails_fast_rather_than_retrying():
 
 
 def test_upsert_vehicle_for_plate_retries_through_a_real_sqlite_lock():
-    """Final-demo-readiness-phase regression test: found live — triggering
-    the demo scenario while the two demo cameras' real workers were writing
-    concurrently produced a genuine unhandled 500 from this function's own
-    unguarded `db.flush()`. Shared by BOTH the real live pipeline
-    (worker.py) and demo_scenario.py — fixing it here covers both callers.
-    Same real-second-connection-holds-a-real-lock harness as the tests
-    above, for the NEW-vehicle path (inserts a fresh, never-before-committed
-    Vehicle row)."""
+    """upsert_vehicle_for_plate's flush used to be unguarded and 500'd when
+    the demo scenario ran while workers were writing. Both the live pipeline
+    and demo_scenario use it. Same real-lock harness, new-vehicle path."""
     tmp_dir = tempfile.mkdtemp(prefix="sentinel_lock_test_")
     db_path = os.path.join(tmp_dir, "vehicle_lock_test.db").replace("\\", "/")
 

@@ -47,10 +47,8 @@ export default function ProblemDetailsPage({ params }: { params: Promise<{ id: s
             {data.endpoint && <Field label="Endpoint" value={data.endpoint} />}
           </div>
 
-          {/* Timeline derived honestly from this one real recorded row —
-              we log the retry loop's final outcome (attempt count + total
-              duration), not a per-retry timestamp series, so this shows
-              exactly what was actually measured, nothing fabricated. */}
+          {/* built from this one recorded row: we log the retry loop's final
+              result (attempts + total duration), not a timestamp per retry */}
           <div>
             <h2 className="text-sm font-medium text-slate-300 mb-2">Timeline</h2>
             <div className="border border-border rounded-lg divide-y divide-border">

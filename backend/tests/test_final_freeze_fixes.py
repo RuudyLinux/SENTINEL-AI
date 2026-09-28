@@ -23,7 +23,7 @@ def _cuda() -> bool:
 def test_ai_rate_and_limit_follow_the_hardware_when_unset():
     s = Settings(detect_every_n_frames=None, max_ai_cameras=None)
     if _cuda():
-        assert (s.detect_every_n_frames, s.max_ai_cameras) == (1, 2)
+        assert (s.detect_every_n_frames, s.max_ai_cameras) == (1, 64)
     else:
         assert (s.detect_every_n_frames, s.max_ai_cameras) == (3, 1)
 

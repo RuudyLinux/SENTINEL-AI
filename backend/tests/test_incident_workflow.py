@@ -1,25 +1,14 @@
-"""Incident creation, assignment and timeline.
+"""Incident creation, assignment and timeline. Four bugs, each reproduced
+before the fix:
 
-`app/routers/incidents.py` was the least-covered module left (43%). Four
-defects, each reproduced before it was fixed:
-
-1. `POST /api/incidents` with an unknown `camera_id`, `alert_id` or
-   `vehicle_id` raised an unhandled IntegrityError — a 500 carrying a raw
-   "FOREIGN KEY constraint failed". Before SQLite foreign keys were enforced
-   the same request silently stored a dangling reference, which is worse: an
-   incident pointing at no camera still renders as an incident.
-
-2. `POST /{id}/assign` did not check the assignee exists — same 500. Assigning
-   to a DISABLED account was accepted too, moving the incident to in_progress
-   with nobody able to log in and work it.
-
-3. `GET /{id}/timeline` did `', '.join(alert.reasons)` on a nullable column:
-   `TypeError: can only join an iterable`, a 500 on an otherwise valid
-   incident. The summary endpoint in the same file already guards that column
-   with `or []`; this call site did not.
-
-4. An incident note had no length bound — a 2,000,000-character note was
-   accepted (200, measured) and then rendered into the timeline.
+1. POST /api/incidents with an unknown camera_id/alert_id/vehicle_id was a
+   500 "FOREIGN KEY constraint failed" (before FKs, a silently dangling ref).
+2. /{id}/assign didn't check the assignee exists (same 500), and accepted a
+   disabled account, leaving the case in_progress with nobody to work it.
+3. /{id}/timeline joined a nullable alert.reasons: TypeError, a 500 on a
+   valid incident. The summary endpoint already had `or []`.
+4. Notes had no length limit; a 2,000,000-char note was accepted and then
+   rendered in the timeline.
 """
 import uuid
 
@@ -63,8 +52,7 @@ class TestCreationValidatesReferences:
         assert _incident(client, auth, camera_id=camera.id)["camera_id"] == camera.id
 
     def test_an_incident_with_no_references_is_still_allowed(self, client, auth):
-        """All three columns are nullable — a manually raised incident need
-        name none of them."""
+        """All three are nullable; a manual incident can name none of them."""
         assert _incident(client, auth)["id"]
 
 

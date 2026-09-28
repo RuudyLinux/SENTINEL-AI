@@ -1,8 +1,6 @@
-"""Opt-in plate redaction for evidence packages (workstream C5).
+"""Opt-in plate redaction for evidence packages.
 
-`docs/PRIVACY_GOVERNANCE.md` previously listed export redaction as NOT
-provided. The reason it needed care rather than a one-line mask: the
-registration reaches an evidence package through FIVE independent paths —
+The plate gets into a package five ways:
 
     vehicle.plate_text
     alert.reasons            ("Watchlist signal: plate GJ05AB1234 matches ...")
@@ -10,10 +8,9 @@ registration reaches an evidence package through FIVE independent paths —
     incident.description     (built by joining those reasons)
     audit_trail[].resource   (a watchlist entry's resource IS the plate)
 
-so masking the obvious field yields a document that LOOKS redacted while
-still disclosing the plate three other ways — worse than no redaction,
-because the reader trusts it. These tests assert the plate is absent from
-the ENTIRE serialized document, and that integrity data survives.
+Masking one field leaves a document that looks redacted and still leaks it,
+worse than nothing. So these check the whole serialized document, and that
+integrity data survives.
 """
 import json
 import uuid
@@ -38,9 +35,8 @@ def incident_with_plate_everywhere(db_session):
     )
     db_session.add(camera)
     db_session.flush()
-    # `watchlist_flag` is a cache of an actual WatchlistEntry (app/watchlist.py);
-    # the flag alone is a state the pipeline never produces. Added so this
-    # fixture describes a reachable situation.
+    # the flag is a cache of a real WatchlistEntry (app/watchlist.py); the flag
+    # alone never happens in the pipeline
     db_session.add(models.WatchlistEntry(
         entity_type="plate", identifier=plate, priority="CRITICAL", active=True,
         reason="redaction test",
@@ -85,8 +81,7 @@ def _package(client, auth, incident_id: str, redact: bool) -> dict:
 
 class TestRedaction:
     def test_the_plate_appears_nowhere_in_a_redacted_package(self, client, auth, incident_with_plate_everywhere):
-        """The whole point: search the ENTIRE serialized document, not
-        selected fields."""
+        """Search the whole serialized document, not picked fields."""
         data = incident_with_plate_everywhere
         package = _package(client, auth, data["incident_id"], redact=True)
 
@@ -97,8 +92,7 @@ class TestRedaction:
         )
 
     def test_an_unredacted_package_still_contains_the_plate(self, client, auth, incident_with_plate_everywhere):
-        """Redaction is OPT-IN. The default export is the evidentiary
-        artefact and must not be silently degraded."""
+        """Opt-in; the default export is the evidentiary one."""
         data = incident_with_plate_everywhere
         blob = json.dumps(_package(client, auth, data["incident_id"], redact=False))
         assert data["plate"] in blob
@@ -112,8 +106,8 @@ class TestRedaction:
         assert "*" in masked
 
     def test_integrity_data_is_never_redacted(self, client, auth, incident_with_plate_everywhere):
-        """A redacted package must remain verifiable against the source
-        evidence, so ids, digests and verification status pass through."""
+        """Ids, digests and verification status pass through so a redacted
+        package still verifies."""
         data = incident_with_plate_everywhere
         package = _package(client, auth, data["incident_id"], redact=True)
         item = next(e for e in package["evidence"] if e["id"] == data["evidence_id"])
@@ -128,8 +122,8 @@ class TestRedaction:
         assert "scheme" in package["redaction"]
 
     def test_which_export_was_produced_is_audited(self, client, auth, db_session, incident_with_plate_everywhere):
-        """A redacted export and a full one are different disclosures of the
-        same incident — the audit trail has to distinguish them."""
+        """Redacted and full exports are different disclosures, the audit
+        trail has to say which."""
         data = incident_with_plate_everywhere
         _package(client, auth, data["incident_id"], redact=True)
 

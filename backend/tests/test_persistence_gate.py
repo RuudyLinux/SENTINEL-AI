@@ -1,14 +1,11 @@
 """Temporal consensus and the persistence gate.
 
-The behavior this locks down: a plate becomes TRUSTED intelligence only after
-enough independent frames agreed on it. Before this gate existed, the first
-gate-passing OCR read created a Vehicle and a Plate row outright — one lucky
-frame, one plate-shaped-but-wrong read clearing the confidence floor, became a
-durable vehicle identity.
+A plate is only trusted once enough frames agree. The first passing read
+used to create a Vehicle and Plate straight away, so one lucky wrong read
+became a vehicle identity.
 
-What it must NOT do is discard real observations. A vehicle crossing the frame
-in a single inference cycle gets exactly one read and will never get another;
-that sighting is kept, flagged for review rather than presented as settled.
+Real observations still aren't thrown away: a car crossing in one cycle
+gets one read, kept and flagged for review.
 """
 import pytest
 
@@ -22,8 +19,7 @@ OTHER = "GJ05AB1284"
 
 @pytest.fixture(autouse=True)
 def _isolate_tracks():
-    """Module state is process-global by design — same convention as the other
-    per-track state in this codebase."""
+    """Module state is process-global, reset around each test."""
     plate_tracker.reset()
     yield
     plate_tracker.reset()
@@ -56,15 +52,14 @@ class TestConsensus:
         assert plate_tracker.has_consensus("cam1", "284") is True
 
     def test_one_observation_restores_the_previous_behavior(self, monkeypatch):
-        """The escape hatch must be real: setting the threshold to 1 persists on
-        the first passing read, exactly as before."""
+        """Threshold 1 persists on the first passing read, like before."""
         monkeypatch.setattr(settings, "plate_min_observations", 1)
         plate_tracker.record_read("cam1", "284", PLATE, 0.50)
         assert plate_tracker.has_consensus("cam1", "284") is True
 
     def test_disagreeing_reads_do_not_accumulate_toward_consensus(self, monkeypatch):
-        """Two frames reading two DIFFERENT plates is not two observations of
-        one plate — it is a track the system is confused about."""
+        """Two frames reading two different plates isn't two observations of
+        one; the track is confused."""
         monkeypatch.setattr(settings, "plate_min_observations", 2)
         plate_tracker.record_read("cam1", "284", PLATE, 0.80)
         plate_tracker.record_read("cam1", "284", OTHER, 0.80)
@@ -88,8 +83,7 @@ class TestConsensusSignals:
         assert result.competing_observations == 1
 
     def test_peak_confidence_is_not_inflated_by_observation_count(self):
-        """Four agreeing reads at 0.60 stay 0.60. Corroboration is reported as a
-        count, never mixed into the confidence."""
+        """Four agreeing reads at 0.60 stay 0.60; agreement is a count."""
         for _ in range(4):
             plate_tracker.record_read("cam1", "284", PLATE, 0.60)
         result = plate_tracker.consensus("cam1", "284")
@@ -108,8 +102,7 @@ class TestConsensusSignals:
 
 class TestReviewGating:
     def test_an_uncorroborated_read_is_always_flagged_for_review(self, monkeypatch):
-        """Even at a confidence that would otherwise auto-accept. A
-        high-confidence read observed once is not corroborated evidence."""
+        """Even at auto-accept confidence; seen once isn't corroborated."""
         monkeypatch.setattr(settings, "plate_review_confidence_floor", 0.60)
         assert review_status_for(0.95, None, corroborated=False) == "pending_review"
 
@@ -118,15 +111,13 @@ class TestReviewGating:
         assert review_status_for(0.95, None, corroborated=True) == "auto_accepted"
 
     def test_a_corroborated_but_low_confidence_read_still_needs_review(self, monkeypatch):
-        """Corroboration does not substitute for confidence — the two gates are
-        independent and both must pass."""
+        """Agreement doesn't replace confidence, both gates apply."""
         monkeypatch.setattr(settings, "plate_review_confidence_floor", 0.60)
         assert review_status_for(0.40, None, corroborated=True) == "pending_review"
 
     @pytest.mark.parametrize("terminal", ["corrected", "rejected"])
     def test_a_human_decision_is_never_overwritten(self, terminal):
-        """Terminal states survive any subsequent OCR frame, corroborated or
-        not — a machine read must not silently undo an operator."""
+        """Human review states survive later OCR frames, corroborated or not."""
         assert review_status_for(0.99, terminal, corroborated=True) == terminal
         assert review_status_for(0.10, terminal, corroborated=False) == terminal
 
@@ -144,8 +135,7 @@ class TestTrackCleanup:
         assert plate_tracker.consensus("cam2", "284") is not None
 
     def test_a_stale_track_is_pruned_and_loses_its_consensus(self):
-        """ByteTrack never announces that a track id retired, so the TTL is the
-        only thing bounding this state on a long-running camera."""
+        """ByteTrack never says a track ended, the TTL bounds this."""
         plate_tracker.record_read("cam1", "284", PLATE, 0.9)
         state = plate_tracker.get("cam1", "284")
         state.last_seen_mono -= settings.plate_track_ttl_seconds + 1.0
@@ -153,8 +143,8 @@ class TestTrackCleanup:
         assert plate_tracker.consensus("cam1", "284") is None
 
     def test_the_held_plate_crop_is_released_with_the_track(self):
-        """The crop is held only until the sighting's evidence is written; it
-        must not outlive the track and accumulate."""
+        """The crop is only kept until evidence is written, it doesn't
+        outlive the track."""
         plate_tracker.record_read("cam1", "284", PLATE, 0.9, plate_crop=object())
         assert plate_tracker.get("cam1", "284").last_plate_crop is not None
         plate_tracker.release_camera("cam1")
@@ -163,16 +153,15 @@ class TestTrackCleanup:
 
 class TestProvenanceRecording:
     def test_variant_provenance_is_stored_without_affecting_the_vote(self):
-        """Cross-variant agreement is recorded for the audit trail but must not
-        also weight the temporal vote — that would count one corroboration
-        twice."""
+        """Variant agreement is provenance only; weighting the vote with it
+        would count one corroboration twice."""
         plate_tracker.record_read("cam1", "284", PLATE, 0.60, variant="sharpen", variants_agreeing=5)
         plate_tracker.record_read("cam1", "284", OTHER, 0.60, variant="clahe", variants_agreeing=1)
         state = plate_tracker.get("cam1", "284")
         assert state.votes[PLATE].variant == "sharpen"
         assert state.votes[PLATE].variants_agreeing == 5
-        # Equal confidence, one read each — the 5-variant agreement must not
-        # have tipped the temporal vote on its own.
+        # equal confidence, one read each; 5-variant agreement alone mustn't
+        # tip the vote
         assert state.votes[PLATE].summed_confidence == pytest.approx(
             state.votes[OTHER].summed_confidence
         )

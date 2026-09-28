@@ -7,6 +7,7 @@ import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge } from "@/components/ConnectionBadge";
 import ErrorState from "@/components/ErrorState";
 import WhepVideo from "@/components/WhepVideo";
+import RecButton, { RecIndicator } from "@/components/RecButton";
 
 export default function SingleCameraPage() {
   const { cameraId } = useParams<{ cameraId: string }>();
@@ -14,9 +15,8 @@ export default function SingleCameraPage() {
   const { data: camera, loading: cameraLoading, error: cameraError, reload: reloadCamera } = useApiData<any>(
     `/api/cameras/${cameraId}`, { pollMs: 4000 }
   );
-  // Re-authorized on a schedule: the backend ends a stream when the token
-  // that opened it expires, and this view is the one most likely to be left
-  // open for a full shift.
+  // re-authorized on a timer: the backend cuts a stream when its token
+  // expires, and this page gets left open for a whole shift
   const streamUrl = useStreamUrl(
     `/api/streams/${cameraId}/stream-token`,
     `/api/streams/${cameraId}/mjpeg`,
@@ -26,9 +26,9 @@ export default function SingleCameraPage() {
     `/api/detections?camera_id=${cameraId}&limit=50`, { pollMs: 4000 }
   );
   const [actionError, setActionError] = useState<string | null>(null);
-  // MJPEG from the backend carries the AI boxes and is the default. A camera
-  // whose catalogue entry has a WHEP URL can also be watched as raw WebRTC
-  // video, straight from its media server, at lower latency.
+  // MJPEG from the backend has the AI boxes and is the default. With a WHEP
+  // URL in the catalogue you can also watch raw WebRTC from the media server,
+  // lower latency.
   const [videoMode, setVideoMode] = useState<"mjpeg" | "webrtc">("mjpeg");
   const [webrtcError, setWebrtcError] = useState<string | null>(null);
 
@@ -90,7 +90,8 @@ export default function SingleCameraPage() {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
-        <div className="bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
+        <div className="relative bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
+          <RecIndicator recording={!!camera.recording} />
           {videoMode === "webrtc" && camera.whep_url ? (
             <WhepVideo
               url={camera.whep_url}
@@ -124,6 +125,7 @@ export default function SingleCameraPage() {
           </div>
           {actionError && <div className="text-xs text-critical">{actionError}</div>}
           <div className="flex flex-col gap-2">
+            <RecButton cameraId={cameraId} online={camera.status === "online"} recording={!!camera.recording} onChange={reloadCamera} />
             <button onClick={createIncident} className="text-xs bg-accent text-ink font-medium rounded py-2">CREATE INCIDENT</button>
             <button onClick={() => router.push(`/vehicles/tracking`)} className="text-xs border border-border rounded py-2 hover:border-accent">TRACK OBJECT</button>
             <button onClick={() => router.push(`/alerts?camera_id=${cameraId}`)} className="text-xs border border-border rounded py-2 hover:border-accent">OPEN ALERTS</button>

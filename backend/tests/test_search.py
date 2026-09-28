@@ -1,18 +1,10 @@
-"""First tests for `GET /api/search` — previously the least-covered module in
-the codebase (24%) with no test referencing it at all.
+"""GET /api/search. It had no tests, and two bugs turned up right away:
 
-Two real defects were found the moment it was exercised:
-
-1. **"after 12am" parsed to hour 12.** Midnight is 0. The `pm` branch guarded
-   `12pm` correctly; the `am` branch did not exist, so an operator asking for
-   overnight activity silently got an afternoon filter.
-
-2. **The parsed filters were never applied.** `after_hour`, `before_hour` and
-   `entity` were extracted, returned in `parsed_filters`, and RENDERED to the
-   operator by the search page (`app/(shell)/search/page.tsx` prints
-   "Parsed filters: ..."), while every query ignored them. A time-scoped
-   search that is not scoped is worse than one that is absent, because the
-   screen asserts the filter was understood.
+1. "after 12am" parsed to hour 12. Midnight is 0; the pm branch handled
+   12pm, there was no am branch, so overnight searches got an afternoon filter.
+2. Parsed filters were never applied. after_hour, before_hour and entity
+   were extracted and shown on the search page ("Parsed filters: ...") while
+   every query ignored them.
 """
 import random
 import uuid
@@ -25,10 +17,9 @@ from app.routers.search import parse_natural_language
 
 
 def _fresh_plate() -> str:
-    """A VALID Indian registration. An earlier version of this file built the
-    numeric block from uuid hex, producing e.g. `GJ05SVFDB4` — letters where
-    digits belong, so it matched neither PLATE_TOKEN_RE nor the stored plate,
-    and the test failed for its own bad data rather than for the code."""
+    """A valid Indian registration. Building the digits from uuid hex gave
+    things like GJ05SVFDB4, which matched nothing, so the test failed on its
+    own bad data."""
     return f"GJ05SV{random.randint(1000, 9999)}"
 
 
@@ -40,7 +31,7 @@ def auth(admin_token):
 class TestMeridiemParsing:
     @pytest.mark.parametrize("query,expected", [
         ("after 6pm", 18),
-        ("after 12am", 0),    # midnight — the bug
+        ("after 12am", 0),    # midnight, the bug
         ("after 12pm", 12),   # noon, already correct
         ("after 1am", 1),
         ("after 11pm", 23),
@@ -63,8 +54,7 @@ class TestMeridiemParsing:
 
 
 class TestFiltersAreActuallyApplied:
-    """The headline fix: a filter the response advertises must change the
-    results, or the screen is lying to the investigator."""
+    """A filter the response advertises has to change the results."""
 
     def _incident_at(self, db, hour: int, title: str) -> models.Incident:
         when = datetime.utcnow().replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -132,9 +122,8 @@ class TestSearchSections:
         assert code in [c["camera_code"] for c in by_code["cameras"]]
 
     def test_an_alert_is_found_via_its_vehicle(self, client, db_session, auth):
-        """Regression guard for a bug this project already fixed once: alerts
-        were filtered on `camera_id.ilike(free text)`, so the alerts section of
-        a global search was permanently empty."""
+        """Alerts used to be matched on camera_id.ilike(text), so the alerts
+        section was always empty."""
         plate = _fresh_plate()
         camera = models.Camera(
             camera_code=f"SRCH-{uuid.uuid4().hex[:8]}", name="alert search cam",
@@ -161,9 +150,8 @@ class TestSearchSections:
 
 
 def test_a_plate_is_only_recognised_as_a_whole_word():
-    """A plate-shaped run inside a longer word is not a plate. This made a
-    random-order test fail intermittently: its random marker sometimes
-    contained a plate-shaped substring that was carved out of the query."""
+    """A plate-shaped run inside a longer word isn't a plate. A random-order
+    test's marker sometimes contained one and got carved up."""
     from app.routers.search import parse_natural_language
 
     assert "plate" not in parse_natural_language("ZTIME1BC234 before 9am")

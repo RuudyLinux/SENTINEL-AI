@@ -1,14 +1,11 @@
-"""Keep credentials out of server logs.
+"""Keep tokens out of server logs.
 
-Three kinds of request carry a token in the URL because a browser cannot attach
-an Authorization header to them: the /ws handshake, MJPEG/snapshot <img> tags,
-and evidence/package download links. uvicorn logs the full path with query
-string for every request and every WebSocket handshake, so a session JWT (8h)
-or a resource token sat in plain text in every server log.
+The /ws handshake, MJPEG/snapshot <img> tags and evidence downloads carry a
+token in the URL (browsers can't add a header there), and uvicorn logs the
+full path with query string, so JWTs sat in plain text in every log.
 
-The filter is attached to uvicorn's own loggers at import time of the app, so
-it holds however uvicorn is launched — start.bat, Docker, or a bare command —
-instead of depending on an operator remembering --no-access-log.
+Attached to uvicorn's loggers at app import, so it works however uvicorn is
+started instead of relying on --no-access-log.
 """
 import logging
 import re
@@ -32,8 +29,8 @@ class TokenRedactingFilter(logging.Filter):
         return True
 
 
-# uvicorn.access: HTTP request lines. uvicorn.error: WebSocket handshake lines
-# ("WebSocket /ws?token=..." [accepted]) are logged here, not on the access logger.
+# uvicorn.access has HTTP lines; the WebSocket handshake lines
+# ("WebSocket /ws?token=..." [accepted]) go to uvicorn.error
 REDACTED_LOGGERS = ("uvicorn.access", "uvicorn.error")
 
 

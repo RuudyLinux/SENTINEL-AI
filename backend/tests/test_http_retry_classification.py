@@ -1,17 +1,7 @@
-"""Final deep-debug pass — retry-classification audit for
-`self_heal/http_retry.py`.
+"""Which outbound HTTP failures self_heal/http_retry.py retries.
 
-This module decides which outbound-HTTP failures are retried and which are
-not, and it had NO test coverage at all before this pass (verified: nothing
-under tests/ referenced `request_with_retry` or `http_retry`). That is
-exactly the logic the debugging brief asks to prove — "make sure
-non-retryable failures do not enter infinite retry loops" — so each case
-below counts the REAL number of attempts made rather than trusting the
-docstring.
-
-Result: no bug found. Every case behaves as documented — recorded here so a
-future change to the classifier cannot silently start hammering a remote
-endpoint on a 401, or silently stop retrying a real 503.
+It had no tests. Each case counts the actual attempts. No bug found; this
+keeps a future change from retrying a 401 or giving up on a real 503.
 """
 import asyncio
 
@@ -22,8 +12,8 @@ from app.self_heal.http_retry import RETRYABLE_STATUS, request_with_retry
 
 
 def _responder(statuses):
-    """Returns (callback, calls) where the callback yields the next status
-    each time it is invoked, so a test can assert the ATTEMPT COUNT."""
+    """(callback, calls): each call returns the next status, so tests can
+    count attempts."""
     calls = []
 
     async def do_request() -> httpx.Response:
@@ -47,9 +37,8 @@ def _raiser(exc: Exception):
 class TestNonRetryableStatuses:
     @pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 418])
     def test_a_non_retryable_status_is_returned_after_exactly_one_attempt(self, status):
-        """A bad request or bad credentials retried blindly is just hammering
-        the remote endpoint for no new information — and on an auth failure
-        it is how you get an account locked out or an IP blocked."""
+        """Retrying bad requests or credentials just hammers the other end,
+        and on auth failures gets accounts locked or IPs blocked."""
         do_request, calls = _responder([status])
         resp = asyncio.run(request_with_retry(do_request, label="probe", max_attempts=3))
         assert resp.status_code == status
@@ -84,9 +73,8 @@ class TestNetworkExceptions:
         assert len(calls) == 3, f"expected the 3-attempt ceiling, got {len(calls)}"
 
     def test_an_unexpected_exception_is_not_retried_at_all(self):
-        """Only the named transient network errors are retryable. A
-        programming error (or any other exception) must surface immediately,
-        not be retried as if it were a network blip."""
+        """Only the known transient network errors retry; anything else, a
+        bug included, surfaces immediately."""
         do_request, calls = _raiser(ValueError("a bug, not a network problem"))
         with pytest.raises(ValueError):
             asyncio.run(request_with_retry(do_request, label="probe", max_attempts=3, backoff_base=0.001))
@@ -95,8 +83,8 @@ class TestNetworkExceptions:
 
 class TestBoundedness:
     def test_retrying_is_always_bounded_and_backs_off(self):
-        """The core anti-infinite-loop property: a permanently-failing
-        endpoint must terminate, and must not busy-loop while doing so."""
+        """A permanently failing endpoint stops, and doesn't busy-loop on
+        the way."""
         import time
 
         do_request, calls = _responder([500])
@@ -105,7 +93,6 @@ class TestBoundedness:
         elapsed = time.monotonic() - started
 
         assert len(calls) == 4
-        # 0.01 + 0.02 + 0.04 = 0.07s of backoff minimum — proves it slept
-        # between attempts rather than spinning.
+        # at least 0.01 + 0.02 + 0.04 = 0.07s of backoff, so it slept
         assert elapsed >= 0.05, "no backoff observed between retries — a failing endpoint would be hammered"
         assert elapsed < 5.0, "backoff grew unreasonably for a small attempt ceiling"

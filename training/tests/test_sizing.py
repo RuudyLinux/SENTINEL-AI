@@ -1,8 +1,6 @@
-"""CCTV plate-size measurement (M1.5).
-
-All synthetic. No footage, no OpenCV, no detector, no network — the statistics
-core is deliberately separated from the video I/O so it can be verified in full
-before any authorized footage exists.
+"""CCTV plate-size measurement (M1.5). All synthetic, no footage/OpenCV/
+detector/network; the stats core is separate from video I/O so it can be
+checked before any authorized footage exists.
 """
 import pytest
 
@@ -17,8 +15,7 @@ from sizing import (
 
 
 def observation(height=60.0, width=None, **overrides):
-    """One synthetic observation. Height drives the glyph estimate, so it is the
-    knob these tests turn."""
+    """One synthetic observation; height drives the glyph estimate."""
     width = width if width is not None else height * 4
     fields = dict(
         camera_id="C-001", frame_index=0, frame_width=1920, frame_height=1080,
@@ -46,8 +43,7 @@ class TestGeometry:
         assert obs.vehicle_area_fraction == pytest.approx(10000 / 160000)
 
     def test_vehicle_fraction_is_none_rather_than_substituted(self):
-        """Never silently replaced with the frame fraction — they are different
-        measurements and conflating them would misreport both."""
+        """Not swapped for the frame fraction, different measurement."""
         assert observation().vehicle_area_fraction is None
 
 
@@ -57,11 +53,9 @@ class TestGlyphEstimation:
         assert GLYPH_HEIGHT_FRACTION_SINGLE_ROW == 0.55
 
     def test_two_row_uses_27_point_5_percent(self):
-        """A two-row plate stacks two character bands into the same box, so each
-        band is about half a single-row plate's. Motorcycles are almost always
-        two-row and are the smallest plates on the road — treating them as
-        single-row would place the worst-case class one or two buckets too high
-        and make CCTV legibility look better than it is."""
+        """Two-row plates stack two bands, each about half a single-row one.
+        Motorcycles are nearly always two-row and smallest; treating them as
+        single-row puts the worst case a bucket or two too high."""
         assert estimate_glyph_px(100.0, "double") == pytest.approx(27.5)
         assert GLYPH_HEIGHT_FRACTION_DOUBLE_ROW == 0.275
 
@@ -93,8 +87,7 @@ class TestSizeBuckets:
         assert observation(height=height).bucket == expected
 
     def test_sub_20px_plates_are_counted_not_discarded(self):
-        """They are the operational case for an explicit INSUFFICIENT_RESOLUTION
-        state, so they must survive into the report."""
+        """The reason for an INSUFFICIENT_RESOLUTION state, so they stay in."""
         distribution = aggregate([observation(height=20.0) for _ in range(5)])
         assert distribution.counts["<20px"] == 5
         assert distribution.total == 5
@@ -130,9 +123,7 @@ class TestPercentiles:
 
 class TestVehicleWeightedSampling:
     def test_a_long_dwelling_vehicle_is_capped(self):
-        """The headline bias control: one vehicle stationary for 200 frames must
-        not contribute 200 observations and describe itself rather than the
-        traffic."""
+        """A car stopped 200 frames mustn't be 200 observations."""
         observations = [observation(frame_index=i, track_id="v1") for i in range(200)]
         assert len(vehicle_weighted(observations, max_per_track=3)) == 3
 
@@ -150,9 +141,8 @@ class TestVehicleWeightedSampling:
         assert len(kept) == 20
 
     def test_samples_are_spread_across_the_track_not_taken_from_the_start(self):
-        """The first N frames of a track are its entry into the scene, all at a
-        similar distance; taking those would bias the size distribution toward
-        whatever size a vehicle is when it first appears."""
+        """First N frames are the car entering, all at one distance; that
+        skews the sizes."""
         observations = [observation(frame_index=i, track_id="v1") for i in range(100)]
         indices = sorted(o.frame_index for o in vehicle_weighted(observations, max_per_track=3))
         assert indices[0] == 0 and indices[-1] == 99
@@ -169,16 +159,14 @@ class TestVehicleWeightedSampling:
         assert first == second
 
     def test_observations_without_a_track_id_are_not_merged(self):
-        """No tracker means every detection is its own observation; they must
-        not all collapse into one pseudo-track."""
+        """No tracker: each detection is its own observation, not one pseudo-track."""
         observations = [observation(frame_index=i, track_id="") for i in range(10)]
         assert len(vehicle_weighted(observations, max_per_track=1)) == 10
 
 
 class TestWeightingChangesTheAnswer:
     def test_frame_weighting_is_dominated_by_a_stationary_vehicle(self):
-        """The exact bias this tooling exists to expose: one large, stationary
-        plate versus many small moving ones."""
+        """One big stopped plate vs many small moving ones."""
         stationary = [observation(height=400.0, frame_index=i, track_id="parked")
                       for i in range(100)]
         passing = [observation(height=40.0, frame_index=i, track_id=f"pass{i}")
@@ -200,9 +188,8 @@ class TestFrameSampling:
         assert indices[:3] == [0, 5, 10]
 
     def test_max_frames_thins_evenly_rather_than_truncating(self):
-        """Truncating would silently restrict the measurement to the beginning
-        of the footage — which is a time of day, a light level, and possibly one
-        traffic phase."""
+        """Truncating would only measure the start of the footage: one time of
+        day, one light level, maybe one traffic phase."""
         indices = frame_indices(total_frames=10000, fps=25.0, sample_fps=25.0, max_frames=10)
         assert len(indices) == 10
         assert indices[-1] > 8000, "the cap must still reach the end of the footage"
@@ -274,8 +261,8 @@ class TestReport:
         assert "No statistics are reported" in report
 
     def test_detector_provenance_is_stated_prominently(self):
-        """Detector boxes are not ground truth — mean IoU 0.136 on the labelled
-        benchmark — and a report that did not say so would be misleading."""
+        """Detector boxes aren't ground truth (mean IoU 0.136), and the report
+        has to say so."""
         report = render_report([observation(source=SOURCE_DETECTOR)])
         assert "DETECTOR-ESTIMATED" in report
         assert "0.136" in report
@@ -319,6 +306,5 @@ class TestReport:
         assert "INSUFFICIENT_RESOLUTION" in report
 
     def test_report_contains_no_plate_text_field(self):
-        """This tool measures geometry. It never reads, stores or prints plate
-        text — which keeps it usable at a lower privacy tier than annotation."""
+        """Geometry only; plate text is never read, stored or printed."""
         assert not hasattr(observation(), "plate_text")

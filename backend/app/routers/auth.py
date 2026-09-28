@@ -11,78 +11,54 @@ from ..audit import log_action
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# In-memory login rate limiter (Phase 11 security baseline) — a first layer
-# against credential brute-forcing, keyed by (username, source IP): see
-# `_limiter_key` for why username alone made targeted account LOCKOUT a
-# credential-free availability attack, and what the pair costs. Single-process,
-# not distributed — documented limitation, not claimed as a full solution.
-# Sliding window: MAX_ATTEMPTS failures within WINDOW_SECONDS locks out further
-# attempts for that username until the window rolls forward; a success clears it.
+# Login rate limiter, a first layer against brute force, keyed by (username,
+# source IP) (see _limiter_key). MAX_ATTEMPTS failures inside WINDOW_SECONDS
+# lock that key out until the window moves on; a success clears it.
 _LOGIN_MAX_ATTEMPTS = 5
 _LOGIN_WINDOW_SECONDS = 60.0
 
-# BUG-A fix (final deep-debug pass): this table is keyed by an ATTACKER-
-# CONTROLLED string and had neither a key-count bound nor a key-size bound, so
-# every failed login permanently added an entry. Measured before the fix: 500
-# novel usernames -> 500 permanent keys; one 1,000,000-character username ->
-# one permanent 1,000,049-byte key. No account and no credential were needed —
-# just repeated POST /api/auth/login. That is remote, unauthenticated,
-# unbounded memory growth.
+# The keys are attacker-controlled, and every failed login used to add one for
+# good: 500 new usernames = 500 keys, one 1,000,000-char username = a 1MB key.
+# Unauthenticated, unbounded memory growth.
 #
-# Both bounds are enforced below:
-#   - key SIZE: the key is the username truncated to _LOGIN_KEY_MAX_CHARS.
-#     Two usernames only share a key if they share a 128-character prefix,
-#     which no real account here does; when it happens it makes limiting
-#     STRICTER for those absurd names, never weaker for a real one.
-#   - key COUNT: capped at _LOGIN_MAX_TRACKED_USERNAMES, evicting only
-#     entries whose attempts have ALL aged out of the window. Eviction never
-#     touches a username currently at the limit, so spraying novel
-#     usernames cannot flush an actively-attacked account's counter (that
-#     is, an entry already at the limit is never evicted; that
-#     would turn the memory fix into a rate-limit bypass — see
-#     tests/test_login_ratelimit_hardening.py).
+# Both are bounded now:
+#   - key size: username truncated to _LOGIN_KEY_MAX_CHARS. only names sharing
+#     a 128-char prefix collide, and that only makes limiting stricter
+#   - key count: capped at _LOGIN_MAX_TRACKED_USERNAMES, evicting only keys
+#     whose attempts have all aged out. an entry at the limit is never evicted,
+#     otherwise spraying new usernames would reset a real target's counter
+#     (tests/test_login_ratelimit_hardening.py)
 _LOGIN_KEY_MAX_CHARS = 128
 _LOGIN_MAX_TRACKED_USERNAMES = 1024
-# Both bounds above now live in the shared store (app/runtime_state.py), which
-# carries this module's eviction policy verbatim — including the rule that an
-# entry already at the limit is never evicted. The move off `time.monotonic()`
-# matters beyond tidiness: a monotonic reading is per-process, so with a second
-# API process the same five failures are counted twice and neither side ever
-# reaches the limit, and a restart cleared every lockout outright.
+# The store is app/runtime_state.py now, same eviction rules. Not monotonic
+# time anymore: per-process readings meant a second API process counted the
+# same failures separately and neither hit the limit, and a restart cleared
+# every lockout.
 _failed_attempts = runtime_state.build_sliding_window(
     "login_attempts", settings, max_keys=_LOGIN_MAX_TRACKED_USERNAMES,
 )
 
 
 def _limiter_key(username: str, ip: str = "") -> str:
-    """Scope the counter to (username, source IP), not username alone.
+    """Key the counter on (username, source IP), not username alone.
 
-    Username-only keying made account LOCKOUT trivially reachable: five wrong
-    passwords against a known account — "admin" is documented in this repo's
-    own README — denied that operator login for the whole window, from
-    anywhere. For a control room that is an availability attack requiring no
-    credential at all, and it is worse than the brute-force it defends
-    against, because a control-room operator locked out mid-incident is a
-    real operational failure.
+    Username only made lockout trivial: five wrong passwords against "admin"
+    (it's in the README) locked the real admin out from everywhere. In a
+    control room that's an availability attack needing no credential, and an
+    operator locked out mid-incident is worse than the brute force it stops.
 
-    Scoping by pair means an attacker hammering `admin` from their own
-    address cannot lock out the real admin logging in from theirs.
-
-    The trade-off, stated rather than hidden: an attacker controlling many
-    source addresses now gets `_LOGIN_MAX_ATTEMPTS` tries per address instead
-    of five in total. That is the accepted cost of not being remotely
-    lockout-able, and this limiter was never the only defence — passwords are
-    bcrypt-hashed, every failure is audited, and a real deployment fronts this
-    with a reverse proxy that can rate-limit by address at the edge.
+    Trade-off: an attacker with many addresses gets _LOGIN_MAX_ATTEMPTS per
+    address instead of five total. That's the price of not being remotely
+    lockable, and this isn't the only defence: bcrypt, every failure
+    audited, and a real deploy rate-limits by address at the proxy.
     """
     return f"{(username or '')[:_LOGIN_KEY_MAX_CHARS]}|{(ip or '')[:64]}"
 
 
 def _rate_limited(username: str, ip: str = "") -> bool:
-    """Read-only: counting must not itself count as an attempt, or a client
-    polling the login endpoint would lock out the account it is asking about.
-    `count()` still drops an entry whose attempts have all aged out, which is
-    what kept an empty list from pinning an attacker-supplied key forever."""
+    """Read-only, or a client polling login would lock out the account it's
+    asking about. count() still drops a fully aged-out entry so an empty list
+    can't pin an attacker's key forever."""
     attempts = _failed_attempts.count(_limiter_key(username, ip), _LOGIN_WINDOW_SECONDS)
     return attempts >= _LOGIN_MAX_ATTEMPTS
 
@@ -107,11 +83,9 @@ def login(payload: schemas.LoginRequest, request: Request, db: Session = Depends
         raise HTTPException(status_code=401, detail="Incorrect Police ID or password")
     _failed_attempts.forget(_limiter_key(payload.username, client_ip))
     if not user.active:
-        # Audited: correct credentials against a DISABLED account is exactly
-        # the event worth seeing — a revoked operator still holding a working
-        # password, or a credential in use after an account was closed. This
-        # branch previously returned 403 and recorded nothing, so the attempt
-        # left no trace anywhere.
+        # audit it: right password on a disabled account means a revoked
+        # operator or a credential still in use after the account closed.
+        # this used to 403 with no trace
         log_action(db, None, "login_disabled_account", resource=payload.username, result="FAILURE", ip=client_ip)
         raise HTTPException(status_code=403, detail="Account disabled")
     token = create_access_token(user)

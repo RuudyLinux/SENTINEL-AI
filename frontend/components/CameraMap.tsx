@@ -6,15 +6,11 @@ import { hasLocation } from "@/lib/geo";
 
 // default marker icons reference bundled assets Next.js won't resolve; use divIcon instead
 //
-// The DOT stays 14px and the TARGET is 28px. A measured pass at 375px width
-// found 33 camera markers failing WCAG 2.5.8 (Target Size, Minimum, 24x24):
-// the icon was 14x14 and markers in the same district overlap, so the spacing
-// exception did not rescue them either — on a phone, picking one camera out
-// of a cluster was a matter of luck. Growing the painted dot instead would
-// have made a dense district unreadable, which is the wrong trade: the
-// requirement is about the region that responds to a tap, not the glyph. So
-// the dot is centred inside a transparent 28x28 box, and the map looks
-// exactly as it did before.
+// Dot stays 14px, tap target is 28px. At 375px wide 33 markers failed WCAG
+// 2.5.8 (24x24): 14x14 icons that overlap in a district, so picking one on a
+// phone was luck. A bigger dot would make dense areas unreadable, and the
+// rule is about the tappable area anyway, so the dot sits centred in a
+// transparent 28x28 box and looks the same.
 const ICON_BOX = 28; // >= the 24px WCAG minimum, with a little margin
 const DOT = 14;
 
@@ -22,8 +18,8 @@ const cameraIcon = (color: string) =>
   L.divIcon({
     className: "",
     html: `<div style="width:${ICON_BOX}px;height:${ICON_BOX}px;display:flex;align-items:center;justify-content:center"><div style="width:${DOT}px;height:${DOT}px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6)"></div></div>`,
-    // Leaflet centres a divIcon on its iconSize when no iconAnchor is given,
-    // so the dot still sits exactly on the camera's coordinate.
+    // Leaflet centres a divIcon on its iconSize without an iconAnchor, so the
+    // dot still sits on the coordinate
     iconSize: [ICON_BOX, ICON_BOX],
   });
 
@@ -33,14 +29,13 @@ export default function CameraMap({
   cameras: any[];
   route?: { lat: number; lng: number; label: string }[];
   center?: [number, number];
-  /** Index of the route hop currently being replayed. When set, hops after it
-   * are dimmed and the current one is enlarged, so the journey reads as a
-   * progression rather than a finished line. Undefined shows the whole route
-   * at equal weight — the existing behavior, unchanged for existing callers. */
+  /** Route hop being replayed. Later hops are dimmed and this one enlarged so
+   * the journey reads as a progression. Undefined shows the whole route
+   * evenly, as before. */
   activeIndex?: number;
 }) {
-  // A camera with no known position is left off the map rather than drawn at
-  // 0,0; the count below says how many, so none silently disappears.
+  // cameras with no position are left off (not drawn at 0,0); the count
+  // below says how many
   const located = cameras.filter(hasLocation);
   const unlocated = cameras.length - located.length;
   // Each hop keeps its index in the full route, which is what activeIndex counts.
@@ -49,11 +44,10 @@ export default function CameraMap({
   const first = located[0] || routeOnMap[0];
   const mapCenter: [number, number] = center || (first ? [first.lat, first.lng] : [23.03, 72.58]);
 
-  // Plain Leaflet (BSD-2-Clause) rather than react-leaflet, whose Hippocratic
-  // licence is not an OSI open-source licence. The map is created once, like
-  // react-leaflet's MapContainer (its centre is fixed at mount), and the
-  // overlays are redrawn only when what they show changes — every camera list
-  // poll would otherwise close an open popup.
+  // Plain Leaflet (BSD-2-Clause), not react-leaflet, whose Hippocratic licence
+  // isn't OSI open source. Map created once (like MapContainer, fixed centre);
+  // overlays only redraw when what they show changes, or every camera poll
+  // would close an open popup.
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const overlays = useRef<L.LayerGroup | null>(null);
@@ -99,8 +93,7 @@ export default function CameraMap({
         .addTo(layer);
     }
     if (routeOnMap.length > 0) {
-      // The full journey, drawn faintly — the route as a whole stays visible
-      // during replay so the operator keeps the context.
+      // whole journey drawn faintly so the context stays during replay
       L.polyline(routeOnMap.map((r) => [r.lat, r.lng] as [number, number]), {
         color: "#2dd4bf", weight: 3, opacity: activeIndex === undefined ? 1 : 0.25,
       }).addTo(layer);
@@ -140,8 +133,8 @@ export default function CameraMap({
   );
 }
 
-/** Popup body built from text nodes: camera names and plate labels come from
- * the database, and must never be parsed as HTML. */
+/** Popup body from text nodes: names and plates come from the DB and must
+ * never be parsed as HTML. */
 function popupContent(lines: { text: string; bold?: boolean }[]): HTMLElement {
   const root = document.createElement("div");
   root.className = "text-xs";

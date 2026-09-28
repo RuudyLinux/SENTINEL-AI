@@ -1,9 +1,6 @@
-"""QC checks and reports.
-
-The governing rule under test: **unusual plate strings are WARNING, never
-ERROR.** Auto-rejecting labels that fail the Indian registration format would
-delete exactly the non-standard plates Phase 2 measured as 5 of 10 recognition
-failures, and would restrict the corpus to plates the system already reads.
+"""QC checks and reports. Unusual plate strings are WARNING, never ERROR;
+rejecting them would drop the non-standard plates that were 5 of 10
+recognition failures in Phase 2.
 """
 import pytest
 
@@ -12,7 +9,7 @@ from fixtures import (
     size_bucket_dataset,
 )
 from qc.checks import (
-    ERROR, INFO, WARNING, check_dataset, check_record, errors, has_blocking_errors, run_all,
+    INFO, WARNING, check_dataset, check_record, errors, has_blocking_errors, run_all,
 )
 from qc.report import (
     character_coverage, render_character_coverage, render_qc_report,
@@ -73,8 +70,7 @@ class TestSeverityOfUnusualPlates:
 
 class TestUnreadablePlates:
     def test_a_deliberately_unreadable_plate_is_info_not_an_error(self):
-        """Kept on purpose: it trains the detector and is needed to measure
-        honest rejection."""
+        """Kept: it trains the detector and is needed to measure rejection."""
         findings = check_record(make_record("v", plate_text="", quality="unreadable"))
         assert not has_blocking_errors(findings)
         assert "unreadable_plate" in codes(findings)

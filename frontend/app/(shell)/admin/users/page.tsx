@@ -14,10 +14,8 @@ export default function UsersRolesPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Same double-submit guard as the other create forms. This one matters most:
-  // a duplicate POST here either creates a second account or fails halfway
-  // through, and an operator cannot tell which from a button that never
-  // acknowledged the first click.
+  // double-submit guard. matters most here: a duplicate POST makes a second
+  // account or half-fails, and the operator can't tell which
   async function create(e: React.FormEvent) {
     e.preventDefault();
     if (busy) return;
@@ -51,8 +49,7 @@ export default function UsersRolesPage() {
     { key: "department", label: "Department" },
     { key: "role", label: "Role" },
     { key: "active", label: "Status", render: (u) => (u.active ? "Active" : "Disabled") },
-    // A disabled account can now be restored: the API previously had no
-    // enable route at all, so every disable here was permanent.
+    // disabled accounts can be restored now; before there was no enable route
     {
       key: "actions",
       label: "Actions",
@@ -69,17 +66,12 @@ export default function UsersRolesPage() {
     <div className="space-y-4">
       <h1 className="text-lg font-semibold">Users & Roles</h1>
 
-      {/* htmlFor/id on every field, and an explicit autoComplete on each.
-          Chrome logged "Input elements should have autocomplete attributes
-          (suggested: current-password)" here on every visit — but
-          `current-password` is the WRONG value and taking the suggestion
-          would have introduced a real bug: this form creates SOMEONE ELSE'S
-          account, so a password manager filling the signed-in administrator's
-          own password into it is exactly what must not happen.
-          `new-password` says that, and also stops the browser offering to
-          save the new operator's password as the admin's. The unassociated
-          labels were the same defect the login page already fixed: a screen
-          reader announced five unlabelled boxes. */}
+      {/* htmlFor/id on every field and an explicit autoComplete. Chrome kept
+          suggesting current-password here, but this form creates SOMEONE
+          ELSE'S account, and a password manager filling in the admin's own
+          password is exactly wrong. new-password also stops the browser
+          offering to save it as the admin's. The labels weren't associated
+          either, so a screen reader heard five unlabelled boxes. */}
       <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex flex-wrap gap-2 items-end">
         <div><label htmlFor="new-user-username" className="text-xs text-slate-400">Username</label><input id="new-user-username" name="new-username" autoComplete="off" required value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" /></div>
         <div><label htmlFor="new-user-password" className="text-xs text-slate-400">Password</label><input id="new-user-password" name="new-password" autoComplete="new-password" required type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" /></div>

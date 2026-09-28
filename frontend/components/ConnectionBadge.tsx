@@ -1,10 +1,7 @@
-// 24/7 auto-connect supervisor UI. `grid_state` (in-memory, set by
-// worker.py._set_grid_state, exposed via GET /api/cameras) is the real
-// connection-lifecycle truth for a camera whose worker has run in this
-// backend process. REGISTERED/DISCONNECTED are synthesized client-side for
-// the two cases grid_state is null — never started this process, vs
-// previously connected and now not running — from the same DB-column facts
-// (status, last_frame_at) the camera table already relied on before this.
+// grid_state (in memory, worker._set_grid_state, via GET /api/cameras) is the
+// real connection state for a camera whose worker ran in this process.
+// REGISTERED/DISCONNECTED are made up here for the two null cases (never
+// started vs was connected and isn't running) from status and last_frame_at.
 export type ConnState =
   | "REGISTERED" | "CONNECTING" | "CONNECTED" | "PROCESSING"
   | "DEGRADED" | "RECONNECTING" | "DISCONNECTED" | "AUTH_ERROR" | "ERROR";
@@ -45,19 +42,17 @@ export default function ConnectionBadge({ camera }: { camera: any }) {
   );
 }
 
-// AI processing is independent of connection state — a camera can be
-// CONNECTED with AI off. "AI ON" used to follow the ai_person/ai_vehicle
-// flags alone, so a disconnected camera read "DISCONNECTED · AI ON" although
-// nothing was running. RUNNING now means the worker is actually processing
-// (grid_state PROCESSING); ENABLED means AI is switched on for this camera but
-// no worker is processing it right now.
+// AI is independent of connection; CONNECTED with AI off is normal. "AI ON"
+// used to follow the flags alone, so a disconnected camera said
+// "DISCONNECTED · AI ON" with nothing running. RUNNING = actually processing
+// (grid_state PROCESSING), ENABLED = switched on but nothing processing now.
 export function AiBadge({ camera }: { camera: any }) {
   const enabled = !!(camera.ai_person || camera.ai_vehicle);
   const running = enabled && camera.grid_state === "PROCESSING";
   const [text, style, title] = running
     ? ["AI RUNNING", "text-accent border-accent/40 bg-accent/10", "AI is processing this camera's live frames"]
     : enabled && camera.ai_blocked
-      ? ["AI WAITING", "text-high border-high/40 bg-transparent", "AI capacity limit reached on this machine: this camera is streaming without AI until another camera's AI is stopped"]
+      ? ["AI WAITING", "text-high border-high/40 bg-transparent", "All AI slots are busy: this camera streams without AI until its turn comes round"]
     : enabled
       ? ["AI ENABLED", "text-slate-400 border-border border-dashed bg-transparent", "AI is switched on for this camera and will run once it is connected"]
       : ["AI OFF", "text-slate-500 border-border bg-transparent", "AI is switched off for this camera"];

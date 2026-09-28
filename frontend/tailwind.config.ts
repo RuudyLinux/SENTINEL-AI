@@ -16,15 +16,11 @@ const config: Config = {
         medium: "#eab308",
         low: "#3b82f6",
         ok: "#22c55e",
-        // Smart Shield brand accent (Gujarat Police Innovation Challenge
-        // 2026) — used SELECTIVELY (login badge, brand mark ring), never a
-        // wholesale recolor. The existing ink/panel palette is already deep
-        // navy/blue, which is most of the Smart Shield identity; this adds
-        // just the orange note that isn't otherwise in the palette.
+        // Smart Shield orange, used sparingly (login badge, brand ring). The
+        // navy palette already covers the rest of the identity
         "brand-orange": "#f97316",
       },
-      // Global animation language (Phase 7): a handful of named durations/
-      // keyframes reused everywhere instead of ad-hoc values per component.
+      // shared animation durations/keyframes instead of per-component values
       transitionDuration: {
         fast: "150ms",
         normal: "250ms",
