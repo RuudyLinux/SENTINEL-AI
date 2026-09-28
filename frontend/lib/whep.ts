@@ -1,10 +1,8 @@
-/** WHEP (RFC 9725) playback with the browser's RTCPeerConnection, no
- * library. The catalogue gives each camera a WHEP URL next to RTSP; the
- * browser plays it straight from the media server, sub-second, and the
- * backend does nothing.
+/** WHEP (RFC 9725) playback with the browser's RTCPeerConnection. The browser
+ * plays the camera's WHEP URL directly from the media server.
  *
- * Returns a stop function that closes the connection and, if the server gave
- * a session URL, DELETEs it as the protocol asks. */
+ * Returns a stop function that closes the connection and DELETEs the session
+ * URL if the server provided one. */
 export async function playWhep(url: string, video: HTMLVideoElement, signal?: AbortSignal): Promise<() => void> {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {

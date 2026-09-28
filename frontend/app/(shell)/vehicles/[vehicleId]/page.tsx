@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useParams, useRouter } from "next/navigation";
 import { ChevronLeft, ChevronRight, Pause, Play, ArrowLeft } from "lucide-react";
-import { api } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket, type LiveEvent } from "@/lib/useLiveSocket";
 import { EVENT } from "@/lib/useLiveFeed";

@@ -15,10 +15,8 @@ export default function LoginPage() {
   // short transition on success; router.push still fires right away, this
   // only covers the form in the moment before the route changes
   const [success, setSuccess] = useState(false);
-  // Which backend this dashboard really talks to, checked here since login is
-  // the first request. If NEXT_PUBLIC_API_BASE hits some other app (port 8000
-  // is contested on dev machines) all you'd see is "Login failed", no way to
-  // tell a wrong password from a wrong server.
+  // Check which backend this dashboard talks to before login, so a wrong
+  // NEXT_PUBLIC_API_BASE isn't mistaken for a wrong password.
   const [preflight, setPreflight] = useState<ApiPreflight | null>(null);
 
   useEffect(() => {

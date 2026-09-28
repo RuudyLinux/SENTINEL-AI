@@ -4,29 +4,23 @@ import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { hasLocation } from "@/lib/geo";
 
-// default marker icons reference bundled assets Next.js won't resolve; use divIcon instead
-//
-// Dot stays 14px, tap target is 28px. At 375px wide 33 markers failed WCAG
-// 2.5.8 (24x24): 14x14 icons that overlap in a district, so picking one on a
-// phone was luck. A bigger dot would make dense areas unreadable, and the
-// rule is about the tappable area anyway, so the dot sits centred in a
-// transparent 28x28 box and looks the same.
+// Default marker icons reference assets Next.js won't resolve, so use divIcon.
+// The dot is 14px inside a transparent 28px tap target (WCAG 2.5.8 minimum
+// is 24px) so dense areas stay readable.
 const ICON_BOX = 28; // >= the 24px WCAG minimum, with a little margin
 const DOT = 14;
 
-// count > 1: several cameras share one position (three Bilimora cameras only
-// have the town). Stacked markers hid all but the top one, so they get one
-// marker with the number on it and a popup listing each.
+// count > 1: several cameras share one position; they get one marker showing
+// the count, and the popup lists each camera.
 const cameraIcon = (color: string, count = 1) =>
   L.divIcon({
     className: "",
     html: `<div style="width:${ICON_BOX}px;height:${ICON_BOX}px;display:flex;align-items:center;justify-content:center"><div style="width:${count > 1 ? DOT + 6 : DOT}px;height:${count > 1 ? DOT + 6 : DOT}px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6);color:#0b0f14;font:700 10px/1 sans-serif;display:flex;align-items:center;justify-content:center">${count > 1 ? count : ""}</div></div>`,
-    // Leaflet centres a divIcon on its iconSize without an iconAnchor, so the
-    // dot still sits on the coordinate
+    // Leaflet centres a divIcon on its iconSize when no iconAnchor is set.
     iconSize: [ICON_BOX, ICON_BOX],
   });
 
-// same colours as StatusDot; degraded (reconnecting) used to draw grey like offline
+// Same colours as StatusDot.
 const STATUS_COLOR: Record<string, string> = { online: "#22c55e", degraded: "#f97316", offline: "#64748b" };
 const RANK = ["online", "degraded", "offline"];
 
@@ -42,13 +36,12 @@ export default function CameraMap({
   cameras: any[];
   route?: { lat: number; lng: number; label: string }[];
   center?: [number, number];
-  /** Route hop being replayed. Later hops are dimmed and this one enlarged so
-   * the journey reads as a progression. Undefined shows the whole route
-   * evenly, as before. */
+  /** Route hop being replayed: later hops are dimmed and this one enlarged.
+   * Undefined shows the whole route evenly. */
   activeIndex?: number;
 }) {
-  // cameras with no position are left off (not drawn at 0,0); the count
-  // below says how many
+  // Cameras without a position aren't drawn (never at 0,0); the overlay
+  // reports how many.
   const located = cameras.filter(hasLocation);
   const unlocated = cameras.length - located.length;
   // Each hop keeps its index in the full route, which is what activeIndex counts.
@@ -57,10 +50,9 @@ export default function CameraMap({
   const first = located[0] || routeOnMap[0];
   const mapCenter: [number, number] = center || (first ? [first.lat, first.lng] : [23.03, 72.58]);
 
-  // Plain Leaflet (BSD-2-Clause), not react-leaflet, whose Hippocratic licence
-  // isn't OSI open source. Map created once (like MapContainer, fixed centre);
-  // overlays only redraw when what they show changes, or every camera poll
-  // would close an open popup.
+  // Plain Leaflet (react-leaflet's licence isn't OSI-approved). The map is
+  // created once; overlays redraw only when their content changes, so a status
+  // poll doesn't close an open popup.
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const overlays = useRef<L.LayerGroup | null>(null);
@@ -82,9 +74,8 @@ export default function CameraMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Only the positions: refit when what's on the map moves (a different
-  // vehicle's route), not on every camera status poll, which would keep
-  // yanking the view back while the operator pans.
+  // Refit only when positions change (e.g. a different route), not on every
+  // status poll, so the view doesn't jump while the operator pans.
   const fitKey = useMemo(() => JSON.stringify([
     located.map((c) => [c.lat, c.lng]),
     routeOnMap.map((r) => [r.lat, r.lng]),
@@ -100,8 +91,7 @@ export default function CameraMap({
     if (points.length === 0) return;
     // the container may have been sized after the map was made (tabs)
     map.invalidateSize();
-    // cameras span the state (Ahmedabad to Junagadh to Navsari); a fixed
-    // zoom 12 on the first one showed a single city
+    // Cameras can span the whole state, so fit to all of them.
     if (points.length === 1) map.setView(points[0], 15);
     else map.fitBounds(L.latLngBounds(points), { padding: [30, 30], maxZoom: 16 });
     // eslint-disable-next-line react-hooks/exhaustive-deps

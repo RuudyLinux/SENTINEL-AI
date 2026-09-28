@@ -2,8 +2,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 
-/** Fetches backend data and tracks loading/error. A failed request is
- * `error`, never an empty result that looks like "no data yet".
+/** Fetches backend data and tracks loading and error state. A failed request
+ * is reported as `error`, never as an empty result.
  */
 export function useApiData<T>(
   path: string | null,
@@ -39,13 +39,8 @@ export function useApiData<T>(
     load();
     if (!opts?.pollMs) return;
 
-    // Polling pauses while the tab is hidden and refreshes once when shown.
-    //
-    // /dashboard made the same 7 requests every 30s visible or not, and
-    // control-room screens stay open all shift, so that was real DB load on a
-    // box already running YOLO for every camera. The refetch on becoming
-    // visible means nobody looks at a screen that stopped updating; live
-    // things (alerts) come over the websocket anyway.
+    // Polling pauses while the tab is hidden and refreshes once when it becomes
+    // visible again; live events arrive over the WebSocket.
     let timer: ReturnType<typeof setInterval> | null = null;
 
     function start() {

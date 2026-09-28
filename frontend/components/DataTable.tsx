@@ -44,11 +44,9 @@ export default function DataTable<T extends { id: string }>({
                 return (
                   <td
                     key={c.key}
-                    // whitespace-nowrap alone let one long value set the whole
-                    // table's width: a failed login with a 5,000-char username
-                    // (see app/audit.py) made the audit table 36,215px wide.
-                    // The cap ellipsizes the cell, full value on hover; normal
-                    // cells are way under it.
+                    // Cap the cell width so one very long value (e.g. an
+                    // audited username) can't widen the whole table; the full
+                    // value shows on hover.
                     className="px-3 py-2 whitespace-nowrap max-w-xs truncate"
                     title={typeof value === "string" ? value : undefined}
                   >

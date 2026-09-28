@@ -1,7 +1,6 @@
-// grid_state (in memory, worker._set_grid_state, via GET /api/cameras) is the
-// real connection state for a camera whose worker ran in this process.
-// REGISTERED/DISCONNECTED are made up here for the two null cases (never
-// started vs was connected and isn't running) from status and last_frame_at.
+// grid_state (from GET /api/cameras) is the live connection state when the
+// worker ran in this process. REGISTERED and DISCONNECTED are derived here for
+// the null cases (never started vs no longer running).
 export type ConnState =
   | "REGISTERED" | "CONNECTING" | "CONNECTED" | "PROCESSING"
   | "DEGRADED" | "RECONNECTING" | "DISCONNECTED" | "AUTH_ERROR" | "ERROR";
@@ -42,10 +41,8 @@ export default function ConnectionBadge({ camera }: { camera: any }) {
   );
 }
 
-// AI is independent of connection; CONNECTED with AI off is normal. "AI ON"
-// used to follow the flags alone, so a disconnected camera said
-// "DISCONNECTED · AI ON" with nothing running. RUNNING = actually processing
-// (grid_state PROCESSING), ENABLED = switched on but nothing processing now.
+// AI is independent of connection. RUNNING = actually processing (grid_state
+// PROCESSING); ENABLED = switched on but not processing right now.
 export function AiBadge({ camera }: { camera: any }) {
   const enabled = !!(camera.ai_person || camera.ai_vehicle);
   const running = enabled && camera.grid_state === "PROCESSING";

@@ -1,7 +1,5 @@
-/** Does a camera (or route hop) have a real position? The backend stores
- * unknown as 0,0, and the grid catalogue has no coordinates, so every grid
- * camera arrives that way. 0,0 is in the Gulf of Guinea; plotting it put the
- * cameras there and routes across the Atlantic. */
+/** Whether a camera (or route hop) has a real position. The backend stores
+ * an unknown position as 0,0, which must never be plotted. */
 export function hasLocation(p: { lat?: number | null; lng?: number | null } | null | undefined): boolean {
   if (!p) return false;
   const { lat, lng } = p;

@@ -10,8 +10,8 @@ import ErrorState from "@/components/ErrorState";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "@/components/ConnectionBadge";
 import KpiCard from "@/components/KpiCard";
 
-// mirrors require_roles("Administrator", "Control Room Operator") on the
-// camera routes; the backend enforces it, this just hides buttons that would 403
+// Mirrors the backend's role check on camera routes; only hides buttons that
+// would return 403.
 const CAN_MANAGE_CAMERAS = ["Administrator", "Control Room Operator"];
 
 export default function CamerasPage() {
@@ -80,8 +80,7 @@ export default function CamerasPage() {
     }
   }
 
-  // retiring keeps the history and hides the camera from active lists;
-  // backend enforces Administrator
+  // Retiring keeps the history and hides the camera from active lists.
   async function retire(c: any, e: React.MouseEvent) {
     e.stopPropagation();
     if (!window.confirm(`Retire ${c.camera_code}? It stops, disappears from active camera lists and can no longer be connected. Its history is kept.`)) return;
@@ -141,9 +140,8 @@ export default function CamerasPage() {
     }
   }
 
-  // Sync only registers cameras; connecting is a separate step here. /start
-  // and /stop already mean connect/disconnect (grid cameras go through the
-  // supervisor, the rest through start_worker/stop_worker), just clearer labels.
+  // Sync only registers cameras; connecting is a separate step. /start and
+  // /stop connect and disconnect the stream.
   async function bulkAction(action: "start" | "stop") {
     setBulkBusy(true);
     setActionError(null);
@@ -160,10 +158,8 @@ export default function CamerasPage() {
     }
   }
 
-  // Start/Stop AI isn't /start or /stop, those connect the stream. AI is the
-  // ai_person/ai_vehicle flags via PATCH, so the camera stays CONNECTED with
-  // AI off. ai_anpr is left alone: it can't fire without person/vehicle
-  // detections anyway, and shouldn't override a separate ANPR preference.
+  // Start/Stop AI toggles ai_person/ai_vehicle via PATCH; the stream stays
+  // connected. ai_anpr is left as configured (it needs vehicle detections).
   async function bulkAiAction(on: boolean) {
     setBulkBusy(true);
     setActionError(null);
@@ -225,15 +221,13 @@ export default function CamerasPage() {
     { key: "location", label: "Location" },
     { key: "camera_group", label: "Group", render: (c) => c.camera_group ? <span className="text-xs text-slate-400">{c.camera_group}</span> : <span className="text-xs text-slate-600">—</span> },
     {
-      // Connection lifecycle from grid_state (REGISTERED ... AUTH_ERROR/ERROR).
-      // The old online/offline dot couldn't tell "never connected" from
-      // "connected, then dropped".
+      // Connection lifecycle from grid_state, which distinguishes "never
+      // connected" from "dropped".
       key: "connection", label: "Connection",
       render: (c) => <ConnectionBadge camera={c} />,
     },
     {
-      // AI is its own column so "CONNECTED, AI OFF" doesn't look like AI is
-      // quietly running
+      // AI has its own column so a connected camera with AI off is explicit.
       key: "ai", label: "AI",
       render: (c) => <AiBadge camera={c} />,
     },
@@ -294,19 +288,15 @@ export default function CamerasPage() {
   const visibleCameras = groupFilter ? allCameras.filter((c: any) => c.camera_group === groupFilter) : allCameras;
   const editingCamera = editingId ? allCameras.find((c: any) => c.id === editingId) : null;
 
-  // Auto-connect summary, grid cameras only (external_catalog_id set), not a
-  // hand-added row of the same source_type. All from this poll's data.
-  // Connected includes PROCESSING; Processing is shown separately as a
-  // subset. Disconnected is the remainder so the numbers add up:
-  // Registered = Connected + Reconnecting + Disconnected.
+  // Auto-connect summary for grid cameras (external_catalog_id set).
+  // Registered = Connected (incl. Processing) + Reconnecting + Disconnected.
   const gridCameras = allCameras.filter((c: any) => c.source_type === "sentinel_grid" && c.external_catalog_id);
   const gridRegistered = gridCameras.length;
   const gridConnected = gridCameras.filter((c: any) => ["CONNECTED", "PROCESSING"].includes(deriveConnectionState(c))).length;
   const gridProcessing = gridCameras.filter((c: any) => deriveConnectionState(c) === "PROCESSING").length;
   const gridReconnecting = gridCameras.filter((c: any) => deriveConnectionState(c) === "RECONNECTING").length;
   const gridDisconnected = Math.max(0, gridRegistered - gridConnected - gridReconnecting);
-  // only true once a worker has actually started (a camera only gets
-  // grid_state then), not a hardcoded flag
+  // True once any worker has started (cameras only get grid_state then).
   const supervisorActive = gridCameras.some((c: any) => !!c.grid_state);
   const lastCatalogSync = gridCameras.reduce((latest: string | null, c: any) => {
     if (!c.catalog_synced_at) return latest;

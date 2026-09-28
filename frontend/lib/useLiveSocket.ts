@@ -4,41 +4,33 @@ import { WS_BASE, getToken } from "./api";
 
 export type LiveEvent = { type: string; data: any };
 
-/** Backend websocket, keeping recent events in memory. Real push from the
- * pipeline (app/ws.py), not polling.
- */
+/** Backend WebSocket (app/ws.py), keeping recent events in memory. */
 export function useLiveSocket(onEvent?: (e: LiveEvent) => void) {
   const [connected, setConnected] = useState(false);
   const [lastEvent, setLastEvent] = useState<LiveEvent | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  // The connect effect runs once (deps [] on purpose, reconnecting on every
-  // render would be much worse), so it closes over the first render's
-  // handler. A ref updated every render means the one socket always calls the
-  // current handler instead of a stale one.
+  // The connect effect runs once, so the handler is read through a ref to
+  // always call the current one.
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
 
   useEffect(() => {
     let cancelled = false;
-    // exponential backoff (bounded) instead of retrying every second forever;
-    // resets on every successful open so one blip doesn't leave a long delay
+    // Bounded exponential backoff, reset after each successful open.
     const BASE_DELAY_MS = 1000;
     const MAX_DELAY_MS = 30000;
     let retryDelay = BASE_DELAY_MS;
 
     function connect() {
       if (cancelled) return;
-      // No Authorization header on a websocket handshake, so the token is a
-      // query param (checked before accept, main.py /ws). Read fresh on every
-      // attempt so a login after mount is picked up on the next retry.
+      // WebSocket handshakes can't carry an Authorization header, so the token
+      // is a query parameter, read fresh on each attempt.
       const token = getToken();
       const url = token ? `${WS_BASE}/ws?token=${encodeURIComponent(token)}` : `${WS_BASE}/ws`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
       ws.onopen = () => {
-        // the socket can still be mid-handshake when the component unmounts,
-        // and onopen fires on the closing socket afterwards; don't let a stale
-        // socket set connected back to true
+        // Ignore a stale socket that opens after unmount.
         if (cancelled) return;
         setConnected(true);
         retryDelay = BASE_DELAY_MS; // recovered, reset the backoff

@@ -1,22 +1,14 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 
-/** Smart Shield mark, with the project's shield icon (app/icon.svg, always
- * there) as default and fallback.
+/** Smart Shield mark, falling back to the project's shield icon (app/icon.svg).
  *
- * The default used to be /branding/smart-shield-logo.png, which isn't in the
- * repo, so every page load logged a 404 even though the fallback rendered
- * fine. A console full of 404s teaches people to ignore 404s. The real logo is
- * opt-in via NEXT_PUBLIC_BRAND_LOGO_URL (public/branding/README.md).
- *
- * The fallback stays for a broken override. A plain <img onError> misses a
- * fast localhost 404: the native error fires before hydration attaches the
- * listener, so onError never runs (naturalWidth 0, /icon.svg never
- * requested). So we also check img.complete on mount. Shared by login and
- * sidebar.
+ * A custom logo is opt-in via NEXT_PUBLIC_BRAND_LOGO_URL
+ * (public/branding/README.md). img.complete is checked on mount as well as
+ * onError, because a fast 404 can fire before hydration attaches the listener.
  */
 const FALLBACK_LOGO = "/icon.svg";
-/** Module scope: NEXT_PUBLIC_* is inlined at build time, it's a constant. */
+/** NEXT_PUBLIC_* is inlined at build time. */
 const BRAND_LOGO_URL = process.env.NEXT_PUBLIC_BRAND_LOGO_URL || FALLBACK_LOGO;
 
 export default function BrandLogo({ size, className = "" }: { size: number; className?: string }) {

@@ -7,10 +7,8 @@ import ConnectionBadge, { AiBadge, deriveConnectionState } from "./ConnectionBad
 import { RecIndicator } from "./RecButton";
 
 export default function LiveVideoTile({ camera }: { camera: any }) {
-  // An overview grid, not a video wall. With the supervisor bringing cameras
-  // online by itself, opening every MJPEG on mount would start that many
-  // players the moment the page loads. Preview is opt-in per tile; VIEW is
-  // the single-camera page.
+  // Overview grid, not a video wall: previews are opt-in per tile so opening
+  // the page doesn't start an MJPEG stream for every camera.
   const [previewing, setPreviewing] = useState(false);
   const connectionState = deriveConnectionState(camera);
   const isLive = connectionState === "CONNECTED" || connectionState === "PROCESSING";
