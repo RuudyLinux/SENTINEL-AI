@@ -1,25 +1,10 @@
-"""Commit/flush retry with backoff for the camera pipeline. Per-camera tasks
-(worker.py, rules_engine.py) and FastAPI's sync handlers all write the same
-SQLite file; see db.py for WAL and busy_timeout.
+"""Commit/flush with retry for the camera pipeline.
 
-"database is locked" reaching Python means busy_timeout (30s) already ran
-out, so it's real contention, and a single try/commit/rollback just dropped
-the write.
-
-A bare retry loop doesn't work (checked against a real file with a second
-connection holding the lock). After commit() raises, the next call must be
-rollback() or you get PendingRollbackError, and rollback wrecks what a retry
-needs:
-- a new, never-committed object is detached, though its attributes survive
-  in memory, client-generated PK included (a FK taken from it still linked
-  fine after rollback + retry);
-- a persistent object's changed attributes are expired and revert to the
-  committed value, so re-reading camera.status to "reapply" it gives back
-  the old value.
-
-So after each rollback `reapply` has to redo the pending write: re-add new
-objects, and reassign persistent attributes from values captured before the
-first attempt, never re-read.
+A "database is locked" error means SQLite's busy_timeout already ran out. After
+a failed commit the session must be rolled back, and rollback detaches new
+objects and reverts changed attributes on persistent ones. So each retry calls
+`reapply` to redo the pending write: re-add new objects and reassign persistent
+attributes from values captured before the first attempt, never re-read.
 """
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -40,19 +25,11 @@ from ..db import SQLITE_BUSY_TIMEOUT_SECONDS
 
 logger = logging.getLogger("sentinel.worker")
 
-# Session operations get their own threads, not asyncio's default executor.
-#
-# A camera's flush takes SQLite's single write lock and holds it until the
-# commit, and the commit is another thread hop. On the shared default pool
-# that hop queued behind YOLO/OCR calls waiting on the model locks, frame
-# waits and RTSP opens, all while the lock stayed held. Measured with 30 grid
-# cameras: detection transactions held the lock 37-67 s, and every other
-# writer (camera status, self-heal, the login audit row) sat out the 30 s
-# busy_timeout and retried, so a login took 121-149 s.
-#
-# One thread per pooled connection: every in-flight session operation holds
-# a connection, so this is never the bottleneck and a transaction holder's
-# next step starts immediately.
+# Session operations run on their own executor, not asyncio's default one.
+# A flush takes SQLite's write lock until the commit, and the commit is another
+# thread hop; on the shared pool that hop could queue behind inference while the
+# lock stayed held, stalling every other writer. One thread per pooled
+# connection means a lock holder's next step always starts immediately.
 _DB_EXECUTOR = ThreadPoolExecutor(
     max_workers=settings.db_pool_size + settings.db_max_overflow,
     thread_name_prefix="sentinel-db",
@@ -60,27 +37,15 @@ _DB_EXECUTOR = ThreadPoolExecutor(
 
 
 async def run_db(func: Callable[..., Any], *args: Any) -> Any:
-    """asyncio.to_thread, but on the DB executor. For session work that must
-    not wait behind inference, and for the few non-DB steps that sit inside
-    an open write transaction."""
+    """Like asyncio.to_thread, but on the DB executor."""
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
     return await loop.run_in_executor(_DB_EXECUTOR, functools.partial(ctx.run, func, *args))
 
-# Session locking. Every DB call here goes through a worker thread (run_db), and the
-# thread keeps going if the awaiting task is cancelled. Cancelling a worker
-# mid-commit then ran `db.close()` on the loop thread while the other thread
-# was still in commit() (about 2 in 5 runs of the 12-worker stress test):
-#
-#   sqlalchemy.exc.IllegalStateChangeError: Method 'close()' can't be called
-#   here; method '_prepare_impl()' is already in progress
-#
-# Sessions aren't thread-safe, and that escaped to _camera_loop_supervised and
-# marked a healthy camera OFFLINE on any stop or shutdown.
-#
-# One lock per Session around each threaded call; close_session takes the
-# same lock and waits for the in-flight commit. Weak keys so the lock goes
-# away with the session.
+# Sessions aren't thread-safe, and a threaded call keeps running if the awaiting
+# task is cancelled. One lock per session serialises threaded calls, and
+# close_session takes the same lock so it never closes a session mid-commit.
+# Weak keys let the lock disappear with the session.
 _SESSION_LOCKS: "WeakKeyDictionary[Session, threading.Lock]" = WeakKeyDictionary()
 _LOCKS_GUARD = threading.Lock()
 
@@ -99,10 +64,8 @@ def _locked(db: Session, op: "Callable[[], None]") -> None:
         op()
 
 
-# How long teardown waits on the calling thread for an in-flight call. A
-# contended commit can legitimately sit in the whole busy_timeout, so a
-# shorter bound fires under exactly the load this is for (10s tripped every
-# full test run). Derived from the timeout so they can't drift.
+# How long teardown waits for an in-flight call. A contended commit can
+# legitimately take the whole busy_timeout, so the bound is derived from it.
 _CLOSE_LOCK_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_SECONDS + 5.0
 
 # then how long the fallback thread keeps trying. generous, not closing
@@ -128,12 +91,11 @@ def _close_when_free(db: Session, lock: threading.Lock) -> None:
 
 
 def close_session(db: Session) -> None:
-    """Close a Session a background thread may still be using. Use this, not
-    db.close(), when tearing down a worker (see IllegalStateChangeError above).
+    """Close a session a background thread may still be using. Use this instead
+    of db.close() when tearing down a worker.
 
-    On timeout the close is handed to a daemon thread, never skipped. Just
-    returning left the Session referenced and its write transaction open, and
-    every later test died on "database is locked".
+    If the in-flight call doesn't finish in time, the close is handed to a
+    daemon thread rather than skipped, so no write transaction is left open.
     """
     lock = _lock_for(db)
     if not lock.acquire(timeout=_CLOSE_LOCK_TIMEOUT_SECONDS):
@@ -155,8 +117,8 @@ def close_session(db: Session) -> None:
     finally:
         lock.release()
 
-# sqlite3 has no error code for this, so match the message. Narrow on
-# purpose: any other OperationalError is a real bug and must not be retried
+# sqlite3 exposes no error code for this, so match the message. Kept narrow: any
+# other OperationalError is a real error and must not be retried.
 _LOCK_MARKERS = ("locked", "busy")
 
 
@@ -174,15 +136,11 @@ async def _safe_write(
     max_attempts: int,
     on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None" = None,
 ) -> bool:
-    """Retry body shared by safe_commit and safe_flush (flush writes too, same
-    failure, same fix).
-
-    Calls go through run_db because they block on busy_timeout, which on
-    the loop thread would stall every camera.
+    """Retry loop shared by safe_commit and safe_flush.
 
     on_result, if given, is awaited once before returning with
-    (final_attempt, max_attempts, success, was_lock_error, duration_s). Purely
-    observational (self_heal.record_event), nothing here depends on it.
+    (final_attempt, max_attempts, success, was_lock_error, duration_s). It is
+    observational only (self-heal logging).
     """
     started = time.monotonic()
     attempts = max_attempts if reapply is not None else 1
@@ -252,24 +210,19 @@ async def _attempt_loop(
 
 
 async def locked_flush(db: Session) -> None:
-    """db.flush() under the session lock, no retry, exceptions propagate.
-    For callers that need to tell IntegrityError (a real unique conflict,
-    see correlate.upsert_vehicle_for_plate) from a lock; safe_flush swallows
-    both.
-    """
+    """db.flush() under the session lock, without retry; exceptions propagate.
+    For callers that must tell an IntegrityError from a lock error."""
     await run_db(_locked, db, db.flush)
 
 
 async def locked_commit(db: Session) -> None:
-    """db.commit() under the session lock, no retry, exceptions propagate.
-    Same idea as locked_flush, and for making a write visible to other
-    sessions right away (correlate's commit-on-create)."""
+    """db.commit() under the session lock, without retry; exceptions propagate.
+    Used where a write must be visible to other sessions immediately."""
     await run_db(_locked, db, db.commit)
 
 
 async def locked_rollback(db: Session) -> None:
-    """db.rollback() under the session lock. After a locked_* call raised,
-    roll back through this, not bare db.rollback()."""
+    """db.rollback() under the session lock; use after a locked_* call raised."""
     await run_db(_locked, db, db.rollback)
 
 
@@ -282,13 +235,9 @@ async def safe_commit(
 ) -> bool:
     """db.commit() that never raises into the calling task.
 
-    True on success, False if it gave up (already rolled back; the caller
-    decides if that matters).
-
-    Retries (rollback, reapply, backoff, commit) only on a lock/busy error
-    AND with a reapply given. Without reapply it's one attempt: retrying
-    after a rollback with nothing re-added would "succeed" having lost the
-    write, which is worse than a logged failure.
+    Returns True on success, False if it gave up (already rolled back). Retries
+    only on lock errors and only with a `reapply`: retrying after a rollback
+    with nothing re-added would silently lose the write.
     """
     return await _safe_write(db, "commit", db.commit, label, reapply, max_attempts, on_result)
 
@@ -300,7 +249,5 @@ async def safe_flush(
     max_attempts: int = 4,
     on_result: "Callable[[int, int, bool, bool, float], Awaitable[None]] | None" = None,
 ) -> bool:
-    """safe_commit for db.flush(). The detection flush in worker.py is a real
-    write and used to be unguarded, so a lock there dropped the detection.
-    reapply is usually just re-adding the new objects."""
+    """safe_commit for db.flush(); `reapply` usually just re-adds new objects."""
     return await _safe_write(db, "flush", db.flush, label, reapply, max_attempts, on_result)

@@ -1,9 +1,8 @@
-"""Camera connect/reconnect, split out of worker.py.
+"""Camera connect and reconnect.
 
-_open_with_timeout opens a source with our own timeout (FFmpeg doesn't
-reliably honour CAP_PROP_OPEN_TIMEOUT_MSEC) and _reopen_with_backoff retries
-a dropped one with exponential backoff. Both take source/camera/db as
-arguments and return a bool, no hidden state.
+_open_with_timeout opens a source under an asyncio timeout (FFmpeg doesn't
+reliably honour CAP_PROP_OPEN_TIMEOUT_MSEC); _reopen_with_backoff retries a
+dropped source with exponential backoff.
 """
 import asyncio
 import logging
@@ -22,11 +21,8 @@ logger = logging.getLogger("sentinel.worker")
 
 
 async def _open_with_timeout(source: "CameraSource", camera_id: str | None = None) -> bool:
-    """source.open() blocks on a raw VideoCapture connect, so it runs in a
-    thread with our own asyncio timeout: CAP_PROP_OPEN_TIMEOUT_MSEC isn't
-    honoured by every build (a dead RTSP host hung ~30s with 5s set). The
-    abandoned thread runs until cv2 gives up, but the loop moves on and keeps
-    backing off."""
+    """Open the source in a thread under our own timeout. An abandoned open keeps
+    running until OpenCV gives up, but the loop moves on."""
     try:
         ok = await asyncio.wait_for(asyncio.to_thread(source.open), timeout=settings.source_open_timeout_seconds)
         if camera_id:
@@ -46,12 +42,9 @@ async def _open_with_timeout(source: "CameraSource", camera_id: str | None = Non
 
 
 async def _reopen_with_backoff(source: "CameraSource", camera: models.Camera, db: Session, reason: str = "stream_read_failure") -> bool:
-    """Release and reopen a dropped source with exponential backoff. True
-    once reopened, False when out of retries (caller marks offline and stops).
-
-    `reason` just labels the Self-Heal event: "initial_connect" or
-    "stream_read_failure". cv2 only gives us read() == False, no decode error
-    detail, so we don't pretend to diagnose H264 problems."""
+    """Release and reopen a dropped source with exponential backoff. True once
+    reopened, False when out of retries. `reason` labels the Self-Heal event
+    ("initial_connect" or "stream_read_failure")."""
     camera_id = str(camera.id)
     camera_code = str(camera.camera_code)
     error_type = "CAMERA_CONNECT_FAILURE" if reason == "initial_connect" else "STREAM_READ_FAILURE"

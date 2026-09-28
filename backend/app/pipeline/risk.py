@@ -1,19 +1,16 @@
 """Explainable 0-100 risk score.
 
-Not machine-learned; there's no trained risk model, and an opaque number
-would be a claim nobody could check. It's a weighted sum over things the
-platform actually observed, and every point traces to a named factor with
-its evidence, so "why 87?" has a full answer:
+A transparent weighted sum over observed signals, not a trained model. Every
+point is attributed to a named factor with its evidence:
 
-    Risk 87/100 — HIGH
+    Risk 87/100 - HIGH
       +45  Watchlist match        plate GJ05AB1234, CRITICAL priority entry
       +20  Restricted zone entry  'Secure Yard' on C-014
       + 9  Plate read quality     94% peak OCR confidence over 4 reads
       + 8  Multi-camera activity  observed by 4 cameras
       + 5  Night-time activity    02:41
 
-The weights are a policing-priority judgement, not a measurement. They're
-here in the open and are the thing to tune if scores feel off.
+The weights reflect policing priorities, not a measurement; tune them here.
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -59,8 +56,7 @@ class RiskAssessment:
         return [f.as_dict() for f in self.factors]
 
     def explain(self) -> list[str]:
-        """Plain-text lines shaped like Alert.reasons, so the score can go
-        wherever reasons are shown."""
+        """Plain-text lines in the same shape as Alert.reasons."""
         return [f"+{f.points} {f.label}: {f.detail}" for f in self.factors]
 
 
@@ -75,10 +71,8 @@ class RiskSignals:
     camera_code: str = ""
     loitering_seconds: float | None = None     # dwell that breached a loitering rule
     plate_confidence: float = 0.0
-    # Corroborated across frames. Kept apart from plate_confidence: on the
-    # benchmark 6 of 7 wrong reads sit at or above the lowest correct read's
-    # confidence, so this is independent evidence. False by default, unknown
-    # isn't corroboration.
+    # Corroborated across frames; independent of plate_confidence. Unknown is
+    # not corroboration.
     plate_corroborated: bool = False
     plate_reads: int = 0
     cameras_visited: int = 0
@@ -100,8 +94,7 @@ def _is_night(at: datetime) -> bool:
 
 
 def assess(signals: RiskSignals) -> RiskAssessment:
-    """Score one event or vehicle. Pure (no DB, clock or I/O), so it's easy
-    to test and the same inputs always give the same answer."""
+    """Score one event or vehicle. Pure: same inputs, same result."""
     factors: list[RiskFactor] = []
 
     if signals.watchlist_priority:

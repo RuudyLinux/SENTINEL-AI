@@ -48,10 +48,9 @@ def purge_expired(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator")),
 ):
-    """Purge evidence older than evidence_retention_days. Dry run by default,
-    only lists what would go. Actually deleting needs dry_run=False AND
-    confirm=True. Every real purge is audited (which ids, who, when); evidence
-    must never disappear silently."""
+    """Purge evidence older than evidence_retention_days. Dry run by default;
+    deleting requires dry_run=False and confirm=True. Every purge is audited
+    (ids, actor, time)."""
     if settings.evidence_retention_days is None:
         raise HTTPException(
             status_code=400,
@@ -98,8 +97,7 @@ def purge_expired(
 
 
 def _purgeable_detections_query(db: Session):
-    """Old detections nothing points at. One that fired an alert, has a plate
-    read or is linked from evidence is part of an event and never eligible."""
+    """Old detections not referenced by an alert, plate read or evidence item."""
     if settings.detection_retention_days is None:
         return None
     cutoff = datetime.utcnow() - timedelta(days=settings.detection_retention_days)

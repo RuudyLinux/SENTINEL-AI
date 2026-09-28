@@ -1,12 +1,5 @@
-"""Registry of fire-and-forget tasks so shutdown can drain them.
-
-A clip encode mustn't stall the camera loop and a self-heal log write
-mustn't delay the recovery it describes, so they're spawned and not
-awaited. As bare create_task calls nothing held them: a pending
-build_event_clip got destroyed when the loop closed at shutdown, losing
-evidence for a real alert (and "Task was destroyed but it is pending").
-
-Just a set, a done callback and a bounded drain. Not a task queue.
+"""Registry of fire-and-forget tasks (clip encodes, self-heal writes) so
+shutdown can drain them instead of destroying them mid-flight.
 """
 import asyncio
 import logging
@@ -18,9 +11,8 @@ _TASKS: "set[asyncio.Task[Any]]" = set()
 
 
 def spawn(coro: "Coroutine[Any, Any, Any]", *, name: str) -> "asyncio.Task[Any]":
-    """Start a task shutdown will wait for. _TASKS holds a strong reference
-    until it finishes; asyncio only keeps a weak one, so an unstored task can
-    be garbage-collected mid-flight."""
+    """Start a task that shutdown will wait for. A strong reference is held until
+    it finishes; asyncio keeps only a weak one."""
     task = asyncio.create_task(coro, name=name)
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
@@ -32,9 +24,8 @@ def pending_count() -> int:
 
 
 async def drain(timeout: float) -> None:
-    """Let running tasks finish, then cancel the rest. Called after the
-    camera workers are stopped, so nothing new gets spawned. Past `timeout`
-    things are cancelled and logged, a clean exit beats one last clip."""
+    """Let running tasks finish, then cancel the rest after `timeout`. Called
+    once camera workers have stopped."""
     pending = [task for task in _TASKS if not task.done()]
     if not pending:
         return

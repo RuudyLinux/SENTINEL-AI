@@ -1,8 +1,5 @@
-"""Seed roles always, and in DEMO_MODE the demo accounts and one demo
-watchlist plate on first boot.
-
-No fake cameras, detections or alerts; those only show up once a real camera
-is added and the pipeline runs (README "Scope & Honesty").
+"""Seed roles always; in DEMO_MODE also the demo accounts and one demo watchlist
+plate on first boot. No cameras, detections or alerts are fabricated.
 """
 from datetime import datetime
 
@@ -63,14 +60,9 @@ def run_seed(db: Session) -> None:
     db.commit()
 
 
-# The two cameras the demo scenario uses. Both play a small demo clip kept in
-# git (app/demo_assets/car-detection.mp4) through real YOLO/ByteTrack/EasyOCR;
-# only the read of the demo watchlist plate is injected
-# (pipeline/demo_scenario.py).
-#
-# It's under app/ because backend/uploads/ is gitignored: pointing at
-# uploads/car-detection.mp4 only worked on one dev machine, and a fresh
-# checkout, Docker build or CI had no file to decode. CI caught it.
+# The two cameras the demo scenario uses. Both play a small clip kept in git
+# (app/demo_assets/, since uploads/ is gitignored) through the real pipeline;
+# only the demo plate read is injected (demo_scenario.py).
 DEMO_CAMERAS = [
     {"camera_code": "C-014", "name": "Ahmedabad Ring Road", "location": "Ahmedabad",
      "lat": 23.03, "lng": 72.58, "source_type": "video_file", "source_uri": "app/demo_assets/car-detection.mp4"},
@@ -81,21 +73,14 @@ DEMO_PLATE = "GJ05AB1234"
 
 
 def reset_demo_data(db: Session) -> dict:
-    """Back to a clean, repeatable demo state: wipe transactional data
-    (detections, plates, vehicles, tracks, alerts, incidents, evidence; not
-    users, roles or the audit trail) and make sure the demo cameras and
-    watchlist entry exist.
-
-    DEMO_MODE only. The router checks, and so does this, so real data can't
-    be wiped by accident.
+    """Reset to a clean, repeatable demo state: wipe transactional data (not users,
+    roles or the audit trail) and ensure the demo cameras and watchlist entry
+    exist. DEMO_MODE only; checked here as well as in the router.
     """
     if not settings.demo_mode:
         raise RuntimeError("reset_demo_data called outside DEMO_MODE — refusing")
 
-    # Children first: IncidentAlert before Incident/Alert, Alert before
-    # Detection (Alert.detection_id), anything pointing at a vehicle before
-    # Vehicle. IncidentAlert was missing once; SQLite without FK enforcement
-    # didn't mind, PostgreSQL raised and demo reset was broken in production.
+    # Delete children before parents so foreign keys hold on both backends.
     for model in (models.Evidence, models.IncidentNote, models.IncidentAlert,
                   models.Incident, models.Alert,
                   models.Plate, models.Track, models.Detection, models.Vehicle):

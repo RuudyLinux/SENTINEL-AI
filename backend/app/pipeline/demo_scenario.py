@@ -1,22 +1,13 @@
-"""Deterministic demo scenario trigger, DEMO_MODE only.
+"""Deterministic demo scenario trigger (DEMO_MODE only).
 
-The main demo needs the seeded watchlist plate GJ05AB1234 to show up on two
-cameras a few minutes apart. The only real footage we have
-(app/demo_assets/car-detection.mp4) doesn't contain that plate, so waiting for
-real ANPR to read it isn't something a live demo can rely on.
+Supplies the plate read for the seeded watchlist plate on two demo cameras, as
+a confident OCR read would, because the bundled footage doesn't contain that
+plate. Everything downstream is the real code: vehicle correlation, rule
+evaluation (watchlist match, alert, cooldown, incident) and route building.
 
-This replaces only the OCR read, as the README runbook says. Everything else
-is the real code: upsert_vehicle_for_plate, rules_engine.evaluate (watchlist
-match, alert, cooldown, auto-incident) and get_route. The ANPR gate isn't
-touched; read_plate/passes_anpr_gate aren't called, we just supply the value
-a confident read would have, like an operator typing in a watchlist entry.
-
-Rows are easy to tell apart: Detection.model_version is "demo-fixture" and
-every call is audit-logged as trigger_demo_scenario.
-
-Snapshot and clip are real when the camera is running: its current MJPEG
-frame (worker.LATEST_FRAMES) and its live clip ring buffer, triggered on
-demand instead of by a detection.
+Demo rows are identifiable: Detection.model_version is "demo-fixture" and each
+trigger is audit-logged as trigger_demo_scenario. Snapshots and clips are real
+when the camera is running.
 """
 import asyncio
 from datetime import datetime, timedelta
@@ -39,13 +30,9 @@ DEMO_FRAME_WAIT_TIMEOUT_S = 3.0  # see _wait_for_live_frame
 
 
 async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -> bytes | None:
-    """A worker started moments ago (POST /demo/reset starts both demo
-    cameras, routers/system.py) needs a moment to open the video and decode a
-    frame before LATEST_FRAMES has anything. Poll briefly; a camera that
-    isn't running still gets None within a few seconds.
-
-    timeout_s reads DEMO_FRAME_WAIT_TIMEOUT_S at call time, not as a default
-    argument (bound at import), so tests can monkeypatch it."""
+    """Wait briefly for a just-started camera's first decoded frame. A camera
+    that isn't running returns None within a few seconds. timeout_s is read at
+    call time so tests can patch it."""
     if timeout_s is None:
         timeout_s = DEMO_FRAME_WAIT_TIMEOUT_S
     loop = asyncio.get_event_loop()
@@ -60,8 +47,8 @@ async def _wait_for_live_frame(camera_id: str, timeout_s: float | None = None) -
 
 
 async def _save_demo_snapshot(camera_id: str, camera_code: str) -> str | None:
-    """Save the camera's current MJPEG frame as evidence if it's running.
-    None otherwise, same as the live pipeline before anything decodes."""
+    """Save the camera's current preview frame as evidence, or None if it isn't
+    running."""
     jpeg_bytes = await _wait_for_live_frame(camera_id)
     if not jpeg_bytes:
         return None
@@ -77,8 +64,7 @@ class DemoScenarioError(Exception):
 
 async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1234") -> dict:
     """One sighting of `plate` on each demo camera (C-014, then C-019 four
-    minutes later) through the real correlation/alerting path. DEMO_MODE
-    only; the caller checks and so does this."""
+    minutes later) through the real correlation and alerting path."""
     if not settings.demo_mode:
         raise DemoScenarioError("trigger_scenario called outside DEMO_MODE — refusing")
 
@@ -110,9 +96,8 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
         # retried like the rest of the pipeline; bare flush/commit here gave
         # a 500 when the demo cameras' workers were writing at the same time
         await safe_flush(db, "demo_scenario", reapply=lambda _det=det: db.add(_det))
-        # corroborated=True: this models a car read confidently and repeatedly
-        # across cameras, which is what legitimately reaches CRITICAL. False
-        # would demo a single-frame read the pipeline caps at HIGH.
+        # Modelled as a confident read repeated across frames, the case that
+        # legitimately reaches CRITICAL.
         vehicle = await upsert_vehicle_for_plate(db, plate, sighting_confidence, corroborated=True)
         plate_row = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera.id, detection_id=det.id,
@@ -126,10 +111,8 @@ async def trigger_scenario(db: Session, user: models.User, plate: str = "GJ05AB1
         vehicle_target_confidence = vehicle.plate_confidence
 
         def _reapply_plate_commit(_det=det, _plate_row=plate_row, _vehicle=vehicle):
-            # det and plate_row are new, so rollback just detaches them and
-            # re-add() restores them. vehicle may be an existing row whose
-            # last_seen/plate_confidence were only flushed above; rollback
-            # expires those, so reassign from the locals (same as worker.py)
+            # Same retry pattern as worker.py: re-add new rows, reassign changed
+            # fields on the existing vehicle.
             db.add(_det)
             db.add(_plate_row)
             db.add(_vehicle)

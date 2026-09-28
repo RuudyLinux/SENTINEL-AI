@@ -1,25 +1,14 @@
 """License-plate detection inside a vehicle crop.
 
-Replaces plate_detect.locate_plate (kept as a shim). What it adds:
+Returns ranked candidates rather than a single box, each with a quad (so
+plate_preprocess can straighten it) and a confidence tagged with its source:
+"model" (a trained detector's probability) or "heuristic" (a geometric
+plausibility score). The two are never compared or averaged.
 
-- Several ranked candidates, not one. A crop can hold a plate, a dealer
-  sticker and a reflector strip; with only the top box a wrong pick can't be
-  recovered.
-- Confidence with its source. A YOLO model gives a probability, the
-  classical localizer a geometric plausibility score. Different things, so
-  every box has `source` ("model" | "heuristic") and the two are never
-  compared or averaged.
-- A quad as well as the axis-aligned box, so plate_preprocess can warp an
-  off-axis plate front-on. The box is what's stored and drawn.
-
-Order: the dedicated model (settings.plate_model_name) if its weights exist.
-Not bundled, never auto-downloaded; missing weights log once and fall
-through. Then classical CV: edge density plus morphological closing merges
-glyph strokes into one blob, filtered on plate geometry (aspect, size,
-position) and scored.
-
-Nothing found = the caller reads the whole crop. A localization miss should
-make the read worse, not drop it.
+Uses the dedicated plate model (settings.plate_model_name) when its weights are
+present; they are not bundled or auto-downloaded. Otherwise falls back to
+classical CV (edge density and morphological closing, filtered on plate
+geometry). No candidate means the caller reads the whole crop.
 """
 import logging
 import threading
@@ -34,11 +23,9 @@ from ..config import BASE_DIR, settings
 
 logger = logging.getLogger("sentinel.plate_detector")
 
-# Indian single-row plates are ~500x120mm (aspect ~4.2), two-row plates and
-# oblique angles push it toward ~2.0. Ceiling is 8.0, not 4.2, because the
-# closing joins the character strokes, not the border, so the blob is the
-# text: a full GJ05AB1234 is ~440x65mm of text, aspect ~6.8, and 6.5 was
-# rejecting good full-length plates. Past 8.0 it's a bumper edge or shadow.
+# Aspect limits for the text blob (the closing merges glyph strokes, not the
+# plate border). Two-row and oblique plates approach 2.0; a full-length
+# single-row plate's text reaches about 6.8. Beyond 8.0 it's a bumper or shadow.
 MIN_ASPECT = 1.8
 MAX_ASPECT = 8.0
 IDEAL_ASPECT = 4.2
@@ -88,8 +75,8 @@ _PLATE_MODEL_LOCK = threading.Lock()
 
 @lru_cache(maxsize=1)
 def get_plate_model():
-    """Optional dedicated plate detector. Cached, and cached as None on any
-    failure, so a bad weights file costs one log line, not one per frame."""
+    """Optional dedicated plate detector, cached (as None on failure, so a bad
+    weights file is logged once)."""
     name = (settings.plate_model_name or "").strip()
     if not name:
         return None
@@ -115,12 +102,8 @@ def get_plate_model():
 
 
 def heuristic_score(x: int, y: int, w: int, h: int, crop_w: int, crop_h: int) -> float:
-    """How plate-like a region looks, 0..1: aspect vs a real plate, how far
-    down the vehicle it sits, and size.
-
-    Plausibility, not a detection probability ("shaped and placed like a
-    plate" is a much weaker claim than a trained detector's). PlateBox.source
-    keeps the two apart.
+    """Geometric plate plausibility, 0..1, from aspect ratio, vertical position
+    in the vehicle and size. Not a detection probability.
     """
     if h <= 0 or crop_h <= 0:
         return 0.0
@@ -179,8 +162,8 @@ def _detect_classical(crop: np.ndarray) -> list[PlateBox]:
 
 
 def _detect_model(crop: np.ndarray) -> list[PlateBox]:
-    """Plate model inference. [] when there's no model, no weights, or it
-    fails; all of those fall through to the classical path."""
+    """Plate model inference; [] without a model or on failure, which falls
+    through to the classical path."""
     model = get_plate_model()
     if model is None:
         return []
@@ -208,9 +191,8 @@ def _detect_model(crop: np.ndarray) -> list[PlateBox]:
 def detect_plates(vehicle_crop: np.ndarray) -> list[PlateBox]:
     """Candidate plate regions in a vehicle crop, best first.
 
-    If the model returns anything it wins outright; mixing its boxes with
-    geometric guesses would mix two meanings of confidence. [] means "read
-    the whole crop", not "no plate".
+    Model results win outright; they're never mixed with heuristic boxes. []
+    means "read the whole crop", not "no plate".
     """
     if vehicle_crop is None or vehicle_crop.size == 0:
         return []
@@ -218,9 +200,8 @@ def detect_plates(vehicle_crop: np.ndarray) -> list[PlateBox]:
 
 
 def crop_plate(vehicle_crop: np.ndarray, box: PlateBox) -> "np.ndarray | None":
-    """Cut the plate out of the vehicle crop with a small proportional pad.
-    The localizer hugs the glyphs and tends to clip the first or last
-    character, which costs a character in the read."""
+    """Cut the plate out of the vehicle crop with a small proportional pad; the
+    localizer hugs the glyphs and tends to clip the end characters."""
     if vehicle_crop is None or vehicle_crop.size == 0:
         return None
     crop_h, crop_w = vehicle_crop.shape[:2]
@@ -237,8 +218,8 @@ def crop_plate(vehicle_crop: np.ndarray, box: PlateBox) -> "np.ndarray | None":
 
 
 def quad_in_crop(box: PlateBox, vehicle_crop: np.ndarray) -> "list[list[float]] | None":
-    """Box's quad in the padded plate crop's coordinates (crop_plate moved
-    the origin). None without a quad, then perspective correction is skipped."""
+    """The box's quad in the padded crop's coordinates, or None without a quad
+    (perspective correction is then skipped)."""
     if box.quad is None or vehicle_crop is None or vehicle_crop.size == 0:
         return None
     crop_h, crop_w = vehicle_crop.shape[:2]

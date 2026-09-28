@@ -1,14 +1,9 @@
 """ANPR review queue.
 
-Plate reads below plate_review_confidence_floor already passed the gate, so
-they're kept, but marked pending_review (anpr.review_status_for) for an
-operator to accept, correct or reject. Every action is audited with
-reviewer and time, which also gives (OCR said, human said) pairs for future
-accuracy work.
-
-A correction doesn't re-point the Plate's vehicle_id. That ripples into
-watchlist matching, routes and risk and needs its own verification first;
-this just records the correction and clears the queue.
+Gate-passing reads below plate_review_confidence_floor, and uncorroborated
+reads, are marked pending_review for an operator to accept, correct or reject.
+Every action is audited. A correction is recorded but doesn't re-point the
+Plate's vehicle_id, which would affect watchlist matching, routes and risk.
 """
 from datetime import datetime
 
@@ -64,9 +59,8 @@ def correct_read(
     plate_id: str, payload: schemas.PlateReviewCorrectRequest,
     db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
-    """Operator gives the real plate text. plate_text_raw (OCR output) and
-    plate_text_normalized (after repair) stay as they are; corrected_text is
-    a third fact, what a human confirmed. All three stay queryable."""
+    """Record the operator's plate text. The OCR output (plate_text_raw) and the
+    repaired read (plate_text_normalized) are kept alongside corrected_text."""
     plate = _get_plate(db, plate_id)
     corrected = normalize_plate(payload.corrected_text)
     if not corrected:
@@ -85,9 +79,8 @@ def reject_read(
     plate_id: str, payload: schemas.PlateReviewRejectRequest,
     db: Session = Depends(get_db), user: models.User = Depends(require_operational_role),
 ):
-    """Operator marks the read unusable (unreadable plate, or the localizer
-    boxed a bumper sticker). The row stays with review_status=rejected: out of
-    the queue, still in the audit trail."""
+    """Mark the read unusable. The row stays (review_status=rejected), out of the
+    queue but in the audit trail."""
     plate = _get_plate(db, plate_id)
     plate.review_status = "rejected"
     plate.reviewed_by = user.id

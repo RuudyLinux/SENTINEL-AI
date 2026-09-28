@@ -23,13 +23,9 @@ from .. import geo
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
 
-# Every table with a FK to cameras.id has to be in exactly one of these two,
-# test_end_to_end_hardening.py fails if one's in neither. A table missed from
-# a delete list has bitten us three times already (here, seed.reset_demo_data,
-# and SelfHealEvent turning a camera delete into a 500).
-#
-# Blockers are history that outlives the camera and is evidence of what
-# happened. Deleting refuses with a 409 naming them.
+# Every table with a foreign key to cameras.id belongs in exactly one of these
+# lists (enforced by test_end_to_end_hardening.py). Blockers are history that
+# must outlive the camera, so deleting refuses with a 409 naming them.
 CAMERA_BLOCKER_MODELS = {
     "detections": models.Detection,
     "alerts": models.Alert,
@@ -41,9 +37,8 @@ CAMERA_BLOCKER_MODELS = {
     # delete_camera. retired zones are in CAMERA_CASCADE_MODELS
 }
 
-# Cascade rows describe the camera instead of outliving it: config the
-# operator already retired, and per-camera recovery telemetry. Neither is
-# evidence; the audit log is separate and never references a camera row.
+# Cascade rows only describe the camera (retired config, recovery telemetry)
+# and are deleted with it. The audit log never references camera rows.
 CAMERA_CASCADE_MODELS = (models.Zone, models.SelfHealEvent)
 
 
@@ -58,9 +53,8 @@ def list_cameras(
     if not include_retired:
         query = query.filter(models.Camera.retired == False)  # noqa: E712
     cameras = query.order_by(models.Camera.created_at.desc()).all()
-    # grid_state and friends live in memory (CAMERA_STATS), not the DB.
-    # Attached as transient attrs so the grid doesn't need a diagnostics call
-    # per row. None if the worker never ran in this process.
+    # Live state lives in memory (CAMERA_STATS), attached here so the list
+    # needs no per-row diagnostics call. None if the worker never ran.
     for camera in cameras:
         stats = CAMERA_STATS.get(camera.id, {})
         camera.grid_state = stats.get("grid_state")  # type: ignore[attr-defined]
@@ -142,13 +136,9 @@ async def sync_sentinel_grid(
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # stream to disk, never hold the whole file
 
-# Content check on top of the extension allow-list, which on its own happily
-# stored an exe or a zip renamed .mp4.
-#
-# Deny-list on purpose. An allow-list of containers would reject odd but real
-# encodings, and uploads are never served back over HTTP (no StaticFiles
-# mount, no FileResponse, only cv2.VideoCapture reads them). So refuse what's
-# clearly not video and let everything else through.
+# Content check in addition to the extension allow-list. A deny-list: odd but
+# valid encodings must still pass, and uploads are only ever read by
+# cv2.VideoCapture, never served back over HTTP.
 _NON_VIDEO_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"MZ", "a Windows executable"),
     (b"\x7fELF", "an ELF executable"),
@@ -219,9 +209,7 @@ async def upload_video(
                     raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_upload_mb}MB limit")
                 f.write(chunk)
         if written == 0:
-            # an empty file used to be accepted and left on disk, and a camera
-            # on it just burns through the whole reconnect budget. the handler
-            # below deletes it
+            # Reject empty files; the handler below removes them.
             raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
     except HTTPException:
         dest.unlink(missing_ok=True)
@@ -234,9 +222,8 @@ async def upload_video(
     return {"path": str(dest), "filename": safe_name, "original_filename": original_name}
 
 
-# Caps concurrent source probes. Per-process, like the to_thread pool it
-# protects (camera workers share it). Created lazily so it binds to the
-# running loop, not import time.
+# Caps concurrent source probes per process. Created lazily so it binds to the
+# running event loop.
 _probe_semaphore: "asyncio.Semaphore | None" = None
 
 
@@ -255,10 +242,8 @@ async def test_connection(
 ):
     """Probe a camera source before registering it.
 
-    Needs the same role as creating a camera. Left open, it was an
-    unauthenticated SSRF probe (connect anywhere, learn from ok/detail if
-    something's listening) that also held a worker thread for up to
-    source_open_timeout_seconds per request.
+    Requires the same role as creating a camera: an open probe endpoint would be
+    an SSRF oracle and could tie up worker threads.
     """
     # refuse internal targets before spending a probe slot. Off by default,
     # see pipeline/egress_policy.py (doesn't stop DNS rebinding)
@@ -266,10 +251,8 @@ async def test_connection(
     if refusal is not None:
         raise HTTPException(status_code=400, detail=refusal)
 
-    # Fail fast when the budget is spent; a queued probe would still wait out
-    # the full open timeout behind the others. Checking locked() instead of a
-    # zero-timeout acquire means two requests can both see it unlocked and one
-    # waits briefly, never past the semaphore's own limit.
+    # Fail fast when the probe budget is spent rather than queueing behind
+    # probes that may each wait out the full open timeout.
     semaphore = _get_probe_semaphore()
     if semaphore.locked():
         raise HTTPException(
@@ -334,9 +317,9 @@ def update_camera(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator", "Control Room Operator")),
 ):
-    """Edit name/location/group/lat/lng/analytics toggles in place. Source
-    changes are a reconnect, not an edit. Toggles reach a running worker within
-    about a second (_camera_loop refreshes them on a throttle)."""
+    """Edit name, location, group, coordinates and analytics toggles. Source
+    changes need a reconnect, not an edit. A running worker picks up toggle
+    changes within a few seconds."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -385,8 +368,8 @@ def camera_health(camera_id: str, db: Session = Depends(get_db), user: models.Us
 
 @router.get("/{camera_id}/diagnostics")
 def camera_diagnostics(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """Per-camera loop/inference timing, drop and reconnect counts, and whether
-    the worker task is actually alive. In-memory, reset on restart."""
+    """Per-camera timing, drop and reconnect counts, and worker liveness.
+    In memory; reset on restart."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -433,9 +416,8 @@ def system_diagnostics(user: models.User = Depends(require_roles("Administrator"
         "torch_num_threads": torch.get_num_threads(),
         "cv2_num_threads": _cv2.getNumThreads(),
         "cameras_running": sum(1 for t in RUNNING.values() if not t.done()),
-        # Transitions the lifecycle table didn't expect. They're still applied
-        # (refusing would leave state lying about the camera), so this counter
-        # is how a gap shows up. Should always be empty.
+        # Unexpected lifecycle transitions: still applied, counted here so gaps
+        # in the state table are visible. Should stay empty.
         "illegal_state_transitions": {
             f"{frm}->{to}": count for (frm, to), count in worker.ILLEGAL_TRANSITIONS.items()
         },
@@ -450,9 +432,8 @@ def system_diagnostics(user: models.User = Depends(require_roles("Administrator"
 
 @router.post("/{camera_id}/restart")
 async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """Goes through supervisor.restart, same as the bulk restart in
-    camera_control.py. Raw stop/start skipped the supervisor bookkeeping and a
-    grid camera fell out of the 24/7 reconnect sweep."""
+    """Restart through the supervisor (like the bulk restart) so a grid camera
+    stays in the reconnect sweep."""
     camera = _active_camera_or_error(db, camera_id)
     await supervisor.restart(camera_id, str(camera.source_type))
     log_action(db, user, "restart_camera", resource=camera.camera_code)
@@ -461,9 +442,8 @@ async def restart_camera(camera_id: str, db: Session = Depends(get_db), user: mo
 
 @router.post("/{camera_id}/start")
 async def start_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """Connect a registered camera. Doesn't change AI; ai_person/ai_vehicle/
-    ai_anpr stay as they are (PATCH to change them). A Sentinel Grid camera is
-    also marked auto-managed so the supervisor reconnects it if it drops."""
+    """Connect a registered camera. AI flags are unchanged (PATCH to change
+    them). Grid cameras are also marked auto-managed for reconnection."""
     camera = _active_camera_or_error(db, camera_id)
     if camera.source_type == "sentinel_grid":
         supervisor.connect(camera_id)
@@ -539,11 +519,10 @@ def _active_camera_or_error(db: Session, camera_id: str) -> models.Camera:
 
 @router.post("/{camera_id}/retire")
 def retire_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
-    """Take a camera out of service for good, keeping its history.
+    """Take a camera out of service permanently, keeping its history.
 
-    Deleting a camera with history is refused (409). Retiring stops the worker,
-    drops it from supervision and hides it from active views, counts and start
-    paths; historical records keep pointing at it.
+    Stops the worker, removes it from supervision and hides it from active views
+    and counts; historical records keep pointing at it.
     """
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
@@ -575,17 +554,10 @@ def reinstate_camera(camera_id: str, db: Session = Depends(get_db), user: models
 def delete_camera(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
     """Delete a camera that has no operational history.
 
-    Refused with a 409 naming the blockers while detections, alerts,
-    incidents, evidence, plates, tracks or active zones reference it: deleting
-    would orphan chain-of-custody records (docs/PRIVACY_GOVERNANCE.md). It used
-    to delete unconditionally, which also split the backends: SQLite without
-    foreign_keys=ON let it through, PostgreSQL raised a 500. db.py now turns
-    foreign keys on for SQLite too, and this guard gives both the same 409.
-
-    Retired zones don't block. DELETE /api/zones/{id} is a soft delete and the
-    zones list hides them, so counting them told the operator about a zone no
-    screen could show, and the camera couldn't be deleted from the UI at all.
-    Zones are config, not evidence, so retired ones go with the camera.
+    Refused with a 409 naming the blockers while detections, alerts, incidents,
+    evidence, plates, tracks or active zones reference it, since deleting would
+    orphan chain-of-custody records (docs/PRIVACY_GOVERNANCE.md). Retired zones
+    are configuration, not evidence, and are deleted with the camera.
     """
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:

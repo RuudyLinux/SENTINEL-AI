@@ -1,5 +1,5 @@
 """Global and advanced search. The "natural language" part is a keyword/regex
-parser that maps text to filters (doc §58), not an NLP model.
+parser that maps text to filters, not an NLP model.
 """
 import re
 from fastapi import APIRouter, Depends, Query
@@ -21,8 +21,7 @@ TIME_BEFORE_RE = re.compile(r"before\s+(\d{1,2})\s*(am|pm)?", re.IGNORECASE)
 
 
 def _to_24_hour(hour: int, meridiem: str) -> int:
-    """12h to 24h. 12pm is noon (12) and 12am is midnight (0); the am case was
-    missing, so "after 12am" became noon."""
+    """12h to 24h clock: 12pm is noon (12), 12am is midnight (0)."""
     meridiem = (meridiem or "").lower()
     if meridiem == "pm" and hour != 12:
         return hour + 12
@@ -32,12 +31,10 @@ def _to_24_hour(hour: int, meridiem: str) -> int:
 
 
 def parse_natural_language(text: str) -> dict:
-    """Tiny heuristic parser: a plate token and after/before hour hints.
+    """Heuristic parser for a plate token and after/before hour hints.
 
-    Also returns `text`, the query with recognized phrases removed, for the
-    free-text match. Leaving them in meant "GJ05AB1234 after 6pm" searched
-    for that literal string and found nothing, while the response said it had
-    understood the plate and the time.
+    Also returns `text`: the query with recognised phrases removed, used for
+    the free-text match.
     """
     filters: dict = {"raw_query": text}
     residual = text
@@ -96,11 +93,8 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     # no text, nothing to match cameras on (they have no timestamp for the
     # hour filter), so that section stays empty
 
-    # Hour hints are applied, not just echoed back in parsed_filters; the page
-    # used to show after_hour: 18 next to unfiltered results.
-    #
-    # Hour of day, not a date range: "after 6pm" asks what happens in the
-    # evenings. extract() works on SQLite and PostgreSQL.
+    # Hour hints filter by hour of day ("after 6pm" means evenings), not a date
+    # range. extract() works on SQLite and PostgreSQL.
     def _hour_conditions(column):
         conditions = []
         if "after_hour" in filters:
@@ -113,10 +107,8 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
     # section to add, but it can stop returning vehicles nobody asked for
     wants_vehicles = filters.get("entity") != "person"
 
-    # Each section applies only the constraints the query has and returns
-    # nothing when it has none for it. like is None for a query that's all
-    # recognized phrases (a bare plate), and .ilike(None) raised
-    # ArgumentError, a 500 on a plain plate search.
+    # Each section applies only the constraints present in the query. `like` is
+    # None when the query was entirely recognised phrases (e.g. a bare plate).
     if wants_vehicles:
         plate_filter = filters.get("plate")
         vehicle_hours = _hour_conditions(models.Vehicle.last_seen)
@@ -147,8 +139,7 @@ def global_search(q: str = Query(...), db: Session = Depends(get_db), user: mode
             for i in incidents_q.limit(20)
         ]
 
-    # alerts by the camera they fired on (code/name from above) and the plate;
-    # this used to ilike the opaque camera_id column, so it was always empty
+    # Alerts match by the camera's code/name and by plate.
     alert_filters = []
     camera_ids = [c["id"] for c in results["cameras"]]
     if camera_ids:

@@ -1,7 +1,5 @@
-"""Old entry point, delegating to plate_detector + plate_preprocess.
-
-Kept because tools/anpr_bench.py, tools/live_detect_probe.py and the tests
-call plate_detect.locate_plate. No logic of its own.
+"""Compatibility entry point delegating to plate_detector and plate_preprocess
+(used by tools/ and tests).
 """
 import numpy as np
 
@@ -18,8 +16,8 @@ from .plate_detector import (  # noqa: F401  (re-exported for existing callers/t
 
 
 def _preprocess_for_ocr(plate_crop: np.ndarray) -> np.ndarray:
-    """Upscale + contrast-normalize a plate before OCR. Same behaviour as
-    before (upscale, gray, CLAHE), now just the default `clahe` variant."""
+    """Upscale and contrast-normalize a plate before OCR (the default `clahe`
+    variant)."""
     variants = plate_preprocess.build_variants(plate_crop, quad=None, variant_names=("clahe",))
     return variants[0][1] if variants else plate_crop
 
@@ -27,9 +25,9 @@ def _preprocess_for_ocr(plate_crop: np.ndarray) -> np.ndarray:
 def locate_plate(vehicle_crop: np.ndarray) -> "tuple[np.ndarray, list[float]] | None":
     """Find the plate in a vehicle crop.
 
-    (ocr_ready_image, [x1, y1, x2, y2]) in crop coordinates, or None (caller
-    reads the whole crop). Single best box for old callers;
-    plate_detector.detect_plates is the richer one.
+    Returns (ocr_ready_image, [x1, y1, x2, y2]) in crop coordinates, or None, in
+    which case the caller reads the whole crop. plate_detector.detect_plates
+    returns ranked candidates.
     """
     boxes = plate_detector.detect_plates(vehicle_crop)
     if not boxes:

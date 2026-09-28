@@ -35,9 +35,8 @@ def create_access_token(user: models.User) -> str:
 
 
 def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.User]:
-    """get_current_user's JWT check without the header machinery, for the
-    WebSocket handshake where the token comes as a query param (main.py /ws).
-    Returns None instead of raising; the caller decides what that means."""
+    """get_current_user's JWT check for the WebSocket handshake, where the token
+    arrives as a query parameter. Returns None instead of raising."""
     if not token:
         return None
     try:
@@ -47,10 +46,8 @@ def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.Us
             return None
     except JWTError:
         return None
-    # Resource tokens use the same secret and `sub`, so without this one
-    # passed as a full session token. They sit in URLs (browser history, proxy
-    # logs) and stream tokens last an hour: holding one meant the whole API as
-    # that user. Only session tokens have no `scope`.
+    # Resource tokens share the secret and `sub`, so reject any scoped token
+    # here: they appear in URLs and must never work as a session token.
     if "scope" in payload:
         return None
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -89,10 +86,9 @@ OPERATIONAL_ROLES = ("Administrator", "Control Room Operator", "Investigator", "
 require_operational_role = require_roles(*OPERATIONAL_ROLES)
 
 
-# Resource tokens: short-lived and scoped to one resource, for URLs a browser
-# loads via plain <img src>/<a href> and can't send a bearer header with. The
-# client gets one from a normal authenticated request and adds ?token=. Same
-# JWT secret, no server-side state.
+# Resource tokens: short-lived, scoped to one resource, for URLs the browser
+# loads directly (<img src>, <a href>) and can't attach a bearer header to.
+# Stateless, signed with the JWT secret.
 
 def create_resource_token(resource: str, resource_id: str, user: models.User, ttl_seconds: int) -> str:
     expire = datetime.utcnow() + timedelta(seconds=ttl_seconds)
@@ -116,9 +112,8 @@ def get_user_from_resource_token(resource: str, resource_id: str, token: str, db
 
 
 def resource_token_expiry(token: str) -> "datetime | None":
-    """When this resource token expires, or None if it can't be read. exp is
-    checked when a token is presented, but a long response like an MJPEG
-    stream is authorized once, so the caller needs the deadline to cut it off.
+    """Expiry of a resource token, or None if it can't be decoded. Long responses
+    such as MJPEG are authorised once, so callers need the deadline to end them.
     """
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])

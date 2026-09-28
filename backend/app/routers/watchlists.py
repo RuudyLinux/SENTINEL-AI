@@ -18,10 +18,8 @@ def list_watchlist(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """In-force entries by default, include_inactive=true for everything.
-
-    Listing every row made a deactivated or expired entry look exactly like a
-    live one, so Deactivate seemed to do nothing. The rows are kept for audit.
+    """In-force entries by default; include_inactive=true lists everything
+    (inactive rows are kept for audit).
     """
     q = watchlist.entries_in_force(db) if not include_inactive else db.query(models.WatchlistEntry)
     if entity_type:
@@ -37,14 +35,9 @@ def create_watchlist_entry(
 ):
     """Add one entity to the watchlist.
 
-    409 if an in-force entry for the same (entity_type, identifier) exists.
-    Clicking SAVE three times made three, and since plate_entry_in_force takes
-    .first(), deactivating one left the plate just as flagged, with nothing on
-    screen to say why.
-
-    409 naming the existing entry rather than silently merging, since the
-    operator may have wanted a different priority or reason. Deactivated or
-    expired entries don't block re-adding.
+    409 if an in-force entry for the same (entity_type, identifier) already
+    exists, naming it instead of merging, since the operator may want a
+    different priority or reason. Inactive entries don't block re-adding.
     """
     identifier = normalize_plate(payload.identifier) if payload.entity_type == "plate" else payload.identifier
     existing = watchlist.entries_in_force(db).filter(
@@ -65,10 +58,8 @@ def create_watchlist_entry(
     )
     db.add(entry)
     if payload.entity_type == "plate":
-        # Recomputed, not just True: an entry with valid_until already past
-        # isn't in force.
-        # The flush is needed, SessionLocal has autoflush=False, so the
-        # recompute wouldn't see the new entry and would leave it unflagged.
+        # Recomputed rather than set, since an entry may already be expired.
+        # Flush first: autoflush is off, so the new entry wouldn't be seen.
         db.flush()
         vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == identifier).first()
         if vehicle:
@@ -86,10 +77,8 @@ def deactivate_entry(entry_id: str, db: Session = Depends(get_db), user: models.
         raise HTTPException(status_code=404, detail="Entry not found")
     entry.active = False
     if entry.entity_type == "plate":
-        # The cached flag has to follow the entry. Without this a deactivated
-        # plate stayed "⚠ WATCHLIST" everywhere and kept getting snapshots.
-        # Recomputed, not cleared: another in-force entry keeps it set. Flush
-        # first, same autoflush=False reason as create.
+        # Recompute the cached flag (another in-force entry may keep it set).
+        # Flush first, as in create.
         db.flush()
         vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == entry.identifier).first()
         if vehicle:

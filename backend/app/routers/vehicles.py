@@ -29,12 +29,8 @@ def list_vehicles(
 # before /vehicles/{vehicle_id} so this isn't captured as an id
 @router.get("/vehicles/by-plate/{plate}", response_model=schemas.VehicleOut)
 def get_vehicle_by_plate(plate: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Plate straight to its vehicle.
-
-    Investigations start from a plate an officer types. The frontend used to
-    list-search and take the first hit, which picked an arbitrary match on a
-    substring. Normalized like an OCR read, so 'GJ 05 AB 1234' and
-    'gj05ab1234' both work.
+    """Exact plate lookup. The input is normalized like an OCR read, so
+    'GJ 05 AB 1234' and 'gj05ab1234' both match.
     """
     normalized = normalize_plate(plate)
     if not normalized:

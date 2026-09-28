@@ -1,6 +1,5 @@
-"""Commit/flush wrappers that log lock recoveries as Self-Heal events (split
-out of worker.py). Camera loop code uses _safe_commit/_safe_flush instead of
-db_retry directly and gets the logging for free.
+"""Commit/flush wrappers for the camera loop that log lock recoveries as
+Self-Heal events.
 """
 from sqlalchemy.orm import Session
 
@@ -19,11 +18,8 @@ def _self_heal_camera_id(camera_code: str) -> str | None:
 
 
 def _db_self_heal_on_result(camera_code: str, op_name: str):
-    """The on_result hook for safe_commit/safe_flush. Only logs when a lock
-    actually happened; a clean first try every time would just be noise.
-
-    Plain def returning an async closure; it used to be async itself for no
-    reason, costing a coroutine per commit on every camera."""
+    """on_result hook for safe_commit/safe_flush; logs only when a lock actually
+    occurred."""
     async def _on_result(attempt: int, max_attempts: int, success: bool, was_lock: bool, duration_s: float):
         if not was_lock:
             return

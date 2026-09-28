@@ -1,15 +1,13 @@
 """Camera Control Center: bulk camera operations.
 
-Same per-camera actions as the single-camera endpoints (cameras.py,
-worker.start_worker/stop_worker, supervisor.connect/disconnect), run with
-bounded concurrency, with progress broadcasts and one audit entry per call.
+Runs the same per-camera actions as the single-camera endpoints, with bounded
+concurrency, progress broadcasts and one audit entry per call.
 
 Actions:
   connect    open the stream/worker; AI unchanged (= POST /{id}/start)
-  start      same as connect; there's no real difference for a worker
-  start_ai   connect if needed, then ai_person/ai_vehicle/ai_anpr = True.
-             Never a second worker for a running camera
-  stop       AI flags False, stream stays connected ("AI STOPPED")
+  start      same as connect
+  start_ai   connect if needed, then enable ai_person/ai_vehicle/ai_anpr
+  stop       disable AI; the stream stays connected
   restart    disconnect then reconnect (= POST /{id}/restart)
   disconnect stop the worker (= POST /{id}/stop)
 """
@@ -41,9 +39,8 @@ DISRUPTIVE_ACTIONS = {"restart", "disconnect", "stop"}
 
 MAX_CONCURRENT = 5  # never fire dozens of operations at once
 
-# Cameras some in-flight bulk call is working on. A camera already here is
-# skipped instead of racing two bulk ops on one worker (double clicks,
-# overlapping calls). In memory, removed as each camera finishes either way.
+# Cameras an in-flight bulk call is working on; overlapping calls skip them
+# rather than race on one worker.
 _IN_PROGRESS: set[str] = set()
 
 
@@ -53,9 +50,8 @@ class BulkRequest(BaseModel):
 
 
 async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code: str) -> bool:
-    """Through safe_commit like the pipeline writes; a bulk call runs up to
-    MAX_CONCURRENT of these at once, more writers than one request normally
-    makes."""
+    """Commit through safe_commit, since a bulk call runs several concurrent
+    writers."""
     camera.ai_person = enabled  # type: ignore[assignment]
     camera.ai_vehicle = enabled  # type: ignore[assignment]
     camera.ai_anpr = enabled  # type: ignore[assignment]
@@ -69,9 +65,8 @@ async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code
 
 
 async def _apply_one(action: BulkAction, camera_id: str) -> dict:
-    """One camera's action on its own short-lived session (these run
-    concurrently, so never the request's session). Never raises; every
-    outcome becomes a result dict so one failure can't abort the batch."""
+    """Run one camera's action on its own short-lived session. Never raises:
+    every outcome is a result dict, so one failure can't abort the batch."""
     db = SessionLocal()
     try:
         camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
@@ -133,9 +128,7 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
     except Exception as exc:
         return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": f"{type(exc).__name__}: {exc}"}
     finally:
-        # close_session, not db.close(): safe_commit runs the commit on a
-        # thread, and a cancelled close() races it (IllegalStateChangeError,
-        # see db_retry.close_session)
+        # close_session waits for a commit still running in a thread.
         close_session(db)
 
 

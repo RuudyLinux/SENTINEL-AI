@@ -1,14 +1,9 @@
 """Live event fan-out to connected dashboards.
 
-Event names are canonical `domain.action` values in EventType. The old ad hoc
-names are still sent next to them for low-frequency events (LEGACY_ALIASES)
-so unmigrated consumers keep working; that's an extra frame per alert, which
-is fine, but not per detection.
-
-Detections are the only high-frequency event (N cameras x inference rate,
-each a React update in every dashboard), so they're coalesced into one
-detection.batch frame per flush interval. Alerts, incidents and camera state
-are never batched; an extra 250ms on a CRITICAL watchlist hit isn't worth it.
+Event names are `domain.action` values from EventType; low-frequency events are
+also sent under their legacy names (LEGACY_ALIASES) for older consumers.
+Detections are coalesced into one detection.batch frame per flush interval;
+alerts, incidents and camera state are always sent immediately.
 """
 import asyncio
 import json
@@ -65,14 +60,9 @@ class ConnectionManager:
             self.active.remove(ws)
 
     async def broadcast(self, event_type: str, payload: dict[str, Any]):
-        """Send one event to every client right now. Low-level; publish() adds
-        aliasing and batching on top.
-
-        Iterates a copy of self.active: send_text yields, and a client
-        disconnecting meanwhile (manager.disconnect from its own receive
-        task) mutated the list and could skip a live client for that
-        broadcast, CRITICAL alerts included. tests/test_ws_broadcast_race.py
-        reproduces it.
+        """Send one event to every client immediately (publish() adds aliasing
+        and batching). Iterates a copy of the client list because a client can
+        disconnect while send_text yields.
         """
         message = json.dumps({"type": event_type, "data": payload}, default=str)
         dead = []
@@ -97,9 +87,8 @@ class ConnectionManager:
 
     def _buffer(self, event_type: str, batch_type: str, payload: dict[str, Any]) -> None:
         buffer = self._buffers.setdefault(batch_type, [])
-        # Hard cap so a stalled flush can't turn into a memory problem. Drop
-        # the oldest, the newest matter most on a live feed, and the batch
-        # reports how many were dropped.
+        # Hard cap so a stalled flush can't grow without bound. The oldest are
+        # dropped and the batch reports how many.
         buffer.append({"type": event_type, **payload})
         overflow = len(buffer) - settings.ws_batch_max_events
         if overflow > 0:
@@ -109,9 +98,8 @@ class ConnectionManager:
     def _ensure_flush_task(self) -> None:
         if self._flush_task is not None and not self._flush_task.done():
             return
-        # Check for a loop before building the coroutine. create_task(
-        # self._flush_loop()) inside a try builds the coroutine first, then the
-        # RuntimeError drops it: a "never awaited" warning on every sync publish.
+        # Check for a running loop before creating the coroutine, so a sync
+        # caller doesn't leave a never-awaited coroutine behind.
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -122,8 +110,8 @@ class ConnectionManager:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def _flush_loop(self) -> None:
-        """Flush the batch buffers on an interval. Exits once they're empty and
-        _buffer restarts it, so an idle process has no timer running."""
+        """Flush the batch buffers on an interval; exits when they're empty, so an
+        idle process runs no timer."""
         while True:
             await asyncio.sleep(settings.ws_batch_interval_seconds)
             if not await self._flush():
@@ -141,13 +129,10 @@ class ConnectionManager:
         return sent
 
     async def shutdown(self) -> None:
-        """Stop the flush task and send whatever's still buffered.
+        """Stop the flush task and send whatever is still buffered.
 
-        The task is awaited, cancel() only asks. The final flush happens here,
-        not in a CancelledError handler inside the task: a task cancelled
-        before it ever ran never enters its body, so an event buffered right
-        before shutdown was lost. _flush empties the buffers, so a double
-        flush is harmless.
+        The final flush happens here rather than in the task's cancel handler: a
+        task cancelled before it first runs never enters its body.
         """
         task, self._flush_task = self._flush_task, None
         if task is not None and not task.done():

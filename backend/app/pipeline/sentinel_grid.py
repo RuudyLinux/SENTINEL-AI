@@ -1,16 +1,11 @@
 """Sentinel Camera Grid integration.
 
-Discovery isn't a public JSON endpoint: GET {base_url}/cameras.json without a
-session redirects (302) to /auth/login, a cookie login (POST /auth/login with
-email/password form fields). So we log in once and fetch the catalogue in the
-same httpx.AsyncClient, which carries the cookie.
+The catalogue (GET {base_url}/cameras.json) requires a cookie session from
+POST /auth/login, so one httpx client logs in and fetches in the same session.
 
-Credentials come from .env only; never hardcoded, logged, put in an exception
-message or returned by the API. Missing or rejected credentials raise
-SentinelGridError, keeping "not configured" and "rejected" apart.
-
-Sync only registers cameras (upsert_grid_cameras), like pipeline/catalog.py;
-it never starts AI.
+Credentials come from .env only and are never logged, included in errors or
+returned. Missing and rejected credentials raise distinct SentinelGridErrors.
+Sync only registers cameras; it never starts workers.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,8 +23,8 @@ from .catalog import _first  # same tolerant key lookup as the catalogue
 
 
 class SentinelGridError(Exception):
-    """Any grid login/fetch/parse failure. The sync endpoint turns it into a
-    clear HTTP error; no fallback camera data."""
+    """Any grid login, fetch or parse failure; surfaced as an HTTP error by the
+    sync endpoint."""
 
 
 @dataclass
@@ -103,9 +98,8 @@ async def _login(client: httpx.AsyncClient) -> None:
     except httpx.RequestError as exc:
         raise SentinelGridError(f"Sentinel Camera Grid host unreachable: {exc.__class__.__name__}")
 
-    # a 3xx back to /auth/login (httpx doesn't follow here) or 401/403 means
-    # rejected credentials, reported separately from "not configured" and
-    # without the credentials in the message
+    # A redirect back to /auth/login or a 401/403 means rejected credentials,
+    # reported without the credentials themselves.
     if resp.status_code in (401, 403):
         raise SentinelGridError(
             "Sentinel Camera Grid login rejected (AUTH_ERROR) — check "
@@ -153,11 +147,9 @@ async def fetch_grid_cameras() -> list[dict]:
 
 def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
     """Idempotent register-only sync, matched on a `grid:<id>` marker in
-    external_catalog_id (prefix keeps it apart from official catalogue ids).
-    source_uri is the bare grid id; the credentialed RTSP URL is only built in
-    memory by adapters.SentinelGridAdapter at connect time, never stored.
-    Cameras missing from the response get catalog_stale=True (same as
-    catalog.py) and are never deleted, so their history stays."""
+    external_catalog_id. source_uri is the bare grid id; the credentialed URL
+    exists only in memory at connect time. Cameras missing from the response are
+    marked catalog_stale, never deleted."""
     created, updated, skipped_invalid = 0, 0, 0
     seen_markers: set[str] = set()
     for raw in raw_records:
@@ -181,10 +173,8 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
                 external_catalog_id=marker,
                 camera_group="Sentinel Grid",
                 status="offline",  # registered, not connected
-                # AI on by default, every camera stays connected and running
-                # AI. Same as the column default and POST /api/cameras. The
-                # supervisor still never touches ai_* itself; PATCH
-                # /api/cameras/{id} turns AI off per camera.
+                # AI on by default, like the column default and POST
+                # /api/cameras; PATCH turns it off per camera.
                 ai_person=True,
                 ai_vehicle=True,
                 ai_anpr=True,

@@ -1,16 +1,9 @@
 """Gujarat Police camera catalogue client.
 
-GET {base_url}/api/ingest (per sentinel.gujarat.gov.in/resource) returns
-records with id, location, codec, live status and RTSP/WHEP/HLS URLs. The
-exact field names weren't pinned down in the material we had, so
-_normalize_record accepts a few spellings and leaves anything it can't find
-blank instead of guessing.
-
-No host is hardcoded: camera_catalog_base_url is empty by default and sync
-refuses to run until it's set.
-
-Sync only registers cameras. Starting them is a separate operator action
-(POST /api/cameras/{id}/start or bulk start in the UI).
+GET {base_url}/api/ingest returns records with id, location, codec, live status
+and stream URLs. _normalize_record accepts several field spellings and leaves
+unknown fields blank rather than guessing. camera_catalog_base_url is empty by
+default and sync refuses to run until it is set. Sync only registers cameras.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,8 +17,7 @@ from ..self_heal.http_retry import request_with_retry
 
 
 class CatalogError(Exception):
-    """Any catalogue fetch/parse failure. The sync endpoint turns it into a
-    clear HTTP error; no fallback camera data."""
+    """Any catalogue fetch or parse failure; surfaced as an HTTP error."""
 
 
 @dataclass
@@ -60,8 +52,7 @@ def _first(record: dict, *keys, default=""):
 
 
 def normalize_record(record: dict) -> NormalizedCameraRecord | None:
-    """Normalize one record. None when there's no usable id at all; the
-    caller counts it as skipped instead of us inventing an id."""
+    """Normalize one record; None when there is no usable id."""
     if not isinstance(record, dict):
         return None
     external_id = _first(record, "id", "camera_id", "cameraId")
@@ -139,11 +130,9 @@ async def fetch_catalog() -> list[dict]:
 
 
 def upsert_from_catalog(db: Session, raw_records: list[dict]) -> dict:
-    """Idempotent sync: existing cameras (matched by external_catalog_id)
-    are updated in place, new ones are created, and any previously-synced
-    camera absent from this response is marked catalog_stale=True (never
-    deleted, history/evidence linked to it must survive). No worker is
-    started for any camera here."""
+    """Idempotent sync: existing cameras (by external_catalog_id) are updated,
+    new ones created, and previously synced cameras missing from the response
+    marked catalog_stale (never deleted). No workers are started."""
     seen_ids: set[str] = set()
     created, updated, skipped_invalid = 0, 0, 0
     now = datetime.utcnow()

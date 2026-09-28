@@ -1,15 +1,14 @@
-"""Camera/VMS adapters (Model 3, VMS federation layer).
+"""Camera/VMS adapters.
 
-Every source is wrapped in a CameraAdapter before the AI pipeline sees it, so
-detector/ANPR/rules code never deals with a vendor.
+Every source is wrapped in a CameraAdapter, so detection, ANPR and rules code
+never deals with a vendor.
 
-- Webcam/VideoFile/RTSP: what every real camera here uses (source.py wraps them).
-- MockVMSAdapter: synthetic frames, to show a generic VMS plugs in end to end.
-- ONVIFAdapter: stub. No ONVIF device to test discovery, PTZ or auth against,
-  so open() raises NotImplementedError instead of pretending.
+- Webcam, VideoFile, RTSP: the real camera sources (wrapped by source.py).
+- SentinelGridAdapter: grid cameras over RTSP.
+- MockVMSAdapter: synthetic frames, demonstrating a generic VMS end to end.
+- ONVIFAdapter: interface stub; open() raises NotImplementedError.
 
-A vendor VMS (Milestone, Genetec, Hikvision CMS...) would be another subclass
-registered in _ADAPTERS.
+A vendor VMS would be another subclass registered in _ADAPTERS.
 """
 import os
 import time
@@ -110,9 +109,9 @@ class VideoFileAdapter(CameraAdapter):
 
 
 class _GrabMixin:
-    """Live streams send frames faster than the camera loop uses them. grab()
-    decodes (unavoidable for H.264/HEVC), retrieve() converts to BGR, which is
-    about half the cost, so the reader only retrieves frames it will hand out."""
+    """grab()/retrieve() split for live streams: grab() decodes, retrieve()
+    converts to BGR (about half the cost), so only frames that will be used are
+    converted."""
 
     def grab(self) -> bool:
         return self.cap is not None and self.cap.grab()
@@ -124,16 +123,13 @@ class _GrabMixin:
 
 
 class RTSPAdapter(_GrabMixin, CameraAdapter):
-    """transport: "tcp" or "udp", None = rtsp_force_tcp decides. The Gujarat
-    sandbox needs TCP ("UDP fails across NAT/firewalls"). OpenCV has no
-    per-capture option for it, only the process-wide
-    OPENCV_FFMPEG_CAPTURE_OPTIONS env var, read on each open(), so it's set
-    right before opening.
+    """transport: "tcp" or "udp"; None lets rtsp_force_tcp decide.
 
-    No lock around it: an open can hang for the whole open timeout, and a
-    lock made every other camera time out behind it (all 30 grid cameras
-    down). The race left is a UDP grid camera and a TCP camera opening at
-    the same instant, one of them getting the other's transport."""
+    OpenCV only exposes this through the process-wide
+    OPENCV_FFMPEG_CAPTURE_OPTIONS variable, read on each open(), so it is set
+    just before opening. Deliberately unlocked: an open can block for its whole
+    timeout, and a lock would stall every other camera behind it.
+    """
 
     def __init__(self, source_uri: str, transport: "str | None" = None):
         self.source_uri = source_uri
@@ -182,12 +178,11 @@ class RTSPAdapter(_GrabMixin, CameraAdapter):
 
 
 class SentinelGridAdapter(CameraAdapter):
-    """Sentinel Camera Grid over RTSP, via RTSPAdapter.
+    """Sentinel Camera Grid over RTSP.
 
-    source_uri is the bare grid id (e.g. "cam04"). The credentialed
-    rtsp://email:password@host:port/stream/<id> URL is built from env settings
-    inside open() and only lives in the RTSPAdapter; never logged or returned.
-    Email is percent-encoded since it sits in the userinfo part."""
+    source_uri is the bare grid id (e.g. "cam04"). The credentialed RTSP URL is
+    built from settings inside open() and is never stored, logged or returned.
+    The email is percent-encoded for the userinfo part."""
 
     def __init__(self, source_uri: str):
         self.grid_camera_id = source_uri
@@ -237,9 +232,8 @@ class SentinelGridAdapter(CameraAdapter):
 
 
 class MockVMSAdapter(CameraAdapter):
-    """Synthetic generic VMS: a moving box, fed through the real pipeline, to
-    show the adapter boundary works without a vendor backend. source_uri is
-    unused."""
+    """Synthetic VMS feed (a moving box) that exercises the adapter boundary
+    without a vendor backend. source_uri is unused."""
 
     def __init__(self, source_uri: str):
         self.source_uri = source_uri

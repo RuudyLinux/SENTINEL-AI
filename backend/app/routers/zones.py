@@ -35,12 +35,9 @@ def list_zones(
 def create_zone(payload: schemas.ZoneCreate, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Supervisor"))):
     """Create a zone on a camera.
 
-    Unknown camera_id: used to insert an orphan row, then with FKs on became
-    a 500 with a raw DB error. So 404.
-
-    Coordinates are frame fractions and _bbox_center_in_zone checks
-    x1 <= cx <= x2, so an inverted or out-of-range box matches nothing: the
-    zone exists, looks configured and can never fire. So 400.
+    404 for an unknown camera. 400 for coordinates outside 0..1 or an inverted
+    box, which would create a zone that can never fire (the rules engine checks
+    x1 <= cx <= x2).
     """
     if not db.query(models.Camera).filter(models.Camera.id == payload.camera_id).first():
         raise HTTPException(status_code=404, detail="Camera not found")

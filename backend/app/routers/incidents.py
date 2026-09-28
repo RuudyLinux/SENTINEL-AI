@@ -18,12 +18,8 @@ def list_incidents(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent incidents, newest first, optionally by status.
-
-    Bounded like the other list endpoints (alerts 200, detections 100/500,
-    audit 500); one incident per CRITICAL alert, so a bare .all() only gets
-    slower on a screen operators open constantly. ge=1 because SQLite reads
-    LIMIT -1 as no limit.
+    """Most recent incidents, newest first, optionally by status. Bounded like
+    the other list endpoints; ge=1 because SQLite treats LIMIT -1 as unlimited.
     """
     q = db.query(models.Incident)
     if status:
@@ -32,9 +28,8 @@ def list_incidents(
 
 
 def _require_exists(db: Session, model, value: "str | None", label: str) -> None:
-    """404 for a referenced row that doesn't exist. These are all foreign
-    keys; unchecked, an unknown id became a 500 "FOREIGN KEY constraint
-    failed" (and before SQLite enforced FKs, a silently dangling reference).
+    """404 for a referenced row that doesn't exist, instead of a foreign-key
+    error.
     """
     if value and not db.query(model).filter(model.id == value).first():
         raise HTTPException(status_code=404, detail=f"{label} not found")
@@ -63,11 +58,9 @@ def get_incident(incident_id: str, db: Session = Depends(get_db), user: models.U
 
 @router.get("/{incident_id}/summary")
 def incident_summary(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Investigator summary: what happened, why it was flagged, where the
-    vehicle was seen, what evidence backs it and how confident we are, in
-    one call instead of five. Everything is read from what's already been
-    computed (risk.py, the Plate table, correlate.get_route, evidence
-    verification); nothing is recomputed here.
+    """Investigator summary in one call: what happened, why it was flagged, where
+    the vehicle was seen, the supporting evidence and its confidence. Reads
+    already-computed data; nothing is recomputed here.
     """
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:

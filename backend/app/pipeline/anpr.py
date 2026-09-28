@@ -1,6 +1,5 @@
-"""OCR-based ANPR on EasyOCR. Confidence is whatever EasyOCR reports, never
-clamped or floored, and low-confidence reads are kept with that confidence so
-ANPR quality can actually be measured.
+"""ANPR text reading on EasyOCR. Reported confidence is EasyOCR's own value,
+never adjusted, so read quality stays measurable.
 """
 import re
 import threading
@@ -13,19 +12,11 @@ from ..config import settings
 
 PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}$")
 
-# Bharat (BH) series, the 2021 all-India registration: YY + "BH" + 4 digits +
-# 1-2 letters, e.g. 23BH1234AA. Separate regex so PLATE_RE doesn't have to
-# start accepting digits in the state-code slot.
+# Bharat (BH) series: YY + "BH" + 4 digits + 1-2 letters, e.g. 23BH1234AA.
 BH_SERIES_RE = re.compile(r"^\d{2}BH\d{4}[A-Z]{1,2}$")
 
-# Every registration prefix an Indian state or UT issues.
-#
-# PLATE_RE alone takes any two letters, so QQ00QQ0000 or XX12AB1234 count as
-# plates. That's the dangerous case the benchmark measures: plate-shaped but
-# wrong, it clears the gate and becomes a Vehicle row. Checking against codes
-# that exist costs nothing.
-#
-# A set rather than a regex alternation so it's easy to grep and amend.
+# Registration prefixes issued by Indian states and UTs. PLATE_RE alone accepts
+# any two letters, and a plate-shaped but invalid read is the dangerous case.
 INDIAN_STATE_CODES = frozenset({
     # States
     "AP",  # Andhra Pradesh
@@ -71,15 +62,9 @@ INDIAN_STATE_CODES = frozenset({
     "PY",  # Puducherry
 })
 
-# Positional character repair. Most common real failure in
-# tools/anpr_bench.py is a class confusion in an otherwise right read:
-# GJ05AB1234 read as GJO5AB1234, which then fails looks_like_plate and gets
-# thrown away over one glyph.
-#
-# The plate grammar (2 state letters, 1-2 digit RTO, 1-3 letter series, 3-4
-# digit number) says which class each position should be, so a swap only
-# happens where the grammar wants the other class, and only if the result
-# parses. A read that already parses is left alone.
+# Positional character repair: the plate grammar says whether each position is
+# a letter or a digit, so a common OCR confusion (GJO5AB1234 for GJ05AB1234) is
+# fixed only where the grammar requires the other class and the result parses.
 _TO_DIGIT = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8", "G": "6"})
 _TO_LETTER = str.maketrans({"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G", "4": "A"})
 
@@ -120,14 +105,11 @@ def normalize_plate(raw: str) -> str:
 
 
 def order_fragments(results: list) -> list:
-    """Order OCR fragments top row first, then left to right in each row.
+    """Order OCR fragments top row first, then left to right within each row.
 
-    Sorting by left x alone interleaves two-row plates (common in India):
-    KL07BX7197 came back as INDBX7197KL07 and no grammar repair can fix that.
-    Rows are found by clustering fragment centre-y, starting a new band when a
-    fragment is more than half the median fragment height below the current
-    one. Relative to height because crops range from 40px to 900px wide.
-    Single-row plates end up in one band, same as a plain x sort.
+    Two-row plates are common in India, and an x-only sort interleaves them.
+    Rows are clustered by fragment centre-y relative to the median fragment
+    height, since crops vary widely in size.
     """
     if not results:
         return results
@@ -173,12 +155,9 @@ class OcrCandidate:
 class OcrRead:
     """Result of reading one plate crop.
 
-    confidence is exactly what the OCR engine reported, never adjusted for
-    agreement. variants_agreeing/variant_count are corroboration across
-    preprocessing variants, and on the labelled corpus they separate right
-    from wrong reads much better than confidence (<=2 of 7 agreeing: 0 of 13
-    correct; >=5 of 7: 4 of 4). So they're kept separate instead of blended
-    into one score; the gate looks at both.
+    confidence is the OCR engine's value. variants_agreeing / variant_count
+    record agreement across preprocessing variants, a separate and stronger
+    signal, so the two are kept apart rather than blended.
     """
     raw: str
     normalized: str
@@ -193,10 +172,9 @@ class OcrRead:
 
 
 def read_plate(crop: np.ndarray) -> tuple[str, str, float]:
-    """(raw_text, normalized_text, confidence). Confidence is the mean OCR
-    confidence over fragments, 0.0 if nothing was read. The legacy worker path,
-    the benchmark and tests use this tuple form; read_plate_structured is the
-    richer one.
+    """(raw_text, normalized_text, confidence), with confidence the mean over
+    fragments (0.0 if nothing was read). Tuple form used by the legacy path and
+    the benchmarks; read_plate_structured is the richer variant.
     """
     if crop is None or crop.size == 0:
         return "", "", 0.0
@@ -206,11 +184,8 @@ def read_plate(crop: np.ndarray) -> tuple[str, str, float]:
     results = order_fragments(results)  # row-aware, see order_fragments
     raw = "".join(r[1] for r in results)
     confidence = sum(r[2] for r in results) / len(results)
-    # raw stays the literal OCR output for the audit trail; normalized gets
-    # the repair. Confidence isn't touched, the repair doesn't make OCR more
-    # sure of itself.
-    # Extract first (drops "IND" and sticker text), then repair. The other
-    # way round the repair works on a string that can't parse anyway.
+    # raw keeps the literal OCR output for audit; only normalized is repaired.
+    # Extract before repairing, so the repair sees a string that can parse.
     normalized = disambiguate_plate(extract_plate(normalize_plate(raw)))
     return raw, normalized, float(confidence)
 
@@ -236,18 +211,10 @@ def read_candidate(crop: np.ndarray, variant: str) -> OcrCandidate:
 def select_candidate(candidates: "list[OcrCandidate] | tuple[OcrCandidate, ...]") -> OcrRead:
     """Pick between several variants' reads of the same crop, by agreement.
 
-    On the 25-plate corpus (docs/ANPR_ACCURACY.md), taking the highest
-    confidence of 7 variants gave exact 0.24 / CER 0.3160 and raised false
-    positives 0.28 -> 0.40. Most-agreed text gave 0.28 / 0.2814 with FP 0.32,
-    and on original+sharpen+adaptive held FP at 0.28 while the wrong rate among
-    accepted reads fell 0.58 -> 0.50.
-
-    Max-of-N confidence is also biased upward and would quietly loosen every
-    gate downstream. Reported confidence is the mean over the reads that
-    agreed on the winner; agreement goes in variants_agreeing.
-
-    Ties go to a gate-passing read, then summed confidence. Empty never beats
-    non-empty.
+    The most-agreed text wins; reported confidence is the mean over the reads
+    that agreed. Taking the maximum confidence instead is biased upward and
+    would loosen every gate downstream (see docs/ANPR_ACCURACY.md). Ties go to
+    a gate-passing read, then summed confidence; empty never beats non-empty.
     """
     candidates = tuple(candidates)
     if not candidates:
@@ -290,17 +257,15 @@ def select_candidate(candidates: "list[OcrCandidate] | tuple[OcrCandidate, ...]"
 def read_plate_structured(
     variants: "list[tuple[str, np.ndarray]]",
 ) -> OcrRead:
-    """Read every (variant_name, image) and select between them. With the
-    default single variant that's one OCR pass returned as is."""
+    """Read every (variant_name, image) and select between the reads."""
     if not variants:
         return OcrRead(raw="", normalized="", confidence=0.0, variant="", variants_agreeing=0, variant_count=0)
     return select_candidate([read_candidate(image, name) for name, image in variants])
 
 
 def looks_like_plate(normalized: str) -> bool:
-    """Well-formed Indian registration: state-coded (GJ05AB1234) with a real
-    state/UT prefix, or Bharat series (23BH1234AA). The prefix check is the
-    cheapest false-positive defence here, the regex alone takes QQ00QQ0000."""
+    """Well-formed Indian registration: a valid state/UT prefix (GJ05AB1234) or
+    a Bharat series plate (23BH1234AA)."""
     if not normalized:
         return False
     if BH_SERIES_RE.match(normalized):
@@ -311,11 +276,10 @@ def looks_like_plate(normalized: str) -> bool:
 def disambiguate_plate(normalized: str) -> str:
     """Fix character-class confusions using the plate grammar.
 
-    Returns the corrected plate if the input is within _MAX_SUBSTITUTIONS
-    glyph swaps of a valid one, otherwise the input unchanged. Never adds or
-    drops characters and never touches a read that already parses.
-    Segmentations are tried rather than assumed since RTO, series and number
-    all vary in length (GJ05AB1234 and GJ5ABC123 are both valid).
+    Returns the corrected plate if the input is within _MAX_SUBSTITUTIONS swaps
+    of a valid one, otherwise the input unchanged. Never adds or drops
+    characters and never changes a read that already parses. Segmentations are
+    tried because RTO, series and number lengths vary.
     """
     if not normalized or looks_like_plate(normalized):
         return normalized
@@ -344,19 +308,14 @@ def disambiguate_plate(normalized: str) -> str:
 
 
 def extract_plate(normalized: str) -> str:
-    """Pull a valid registration out of a read with extra text glued on.
+    """Pull a valid registration out of a read with extra text around it.
 
-    After the row-ordering fix most remaining errors were real plate text plus
-    whatever else OCR saw on or near the plate:
+        INDKL07BX7197   -> KL07BX7197    ("IND" country marker)
+        SUCUNDL3CD1210  -> DL3CD1210     (sticker/dealer text)
 
-        KL07BX7197  ->  INDKL07BX7197     ("IND" country marker)
-        DL3CD1210   ->  SUCUNDL3CD1210    (sticker/dealer text)
-
-    Returns the longest substring that passes looks_like_plate. A read that
-    already parses is returned as is, characters are never changed or
-    reordered, and a string with no valid plate in it comes back unchanged.
-    Longest wins since a shorter match is usually a truncation (KL07BX719).
-    plate_text_raw keeps the literal OCR output for auditing.
+    Returns the longest substring that passes looks_like_plate (shorter matches
+    are usually truncations). A read that already parses, or contains no valid
+    plate, is returned unchanged; characters are never altered or reordered.
     """
     if not normalized or looks_like_plate(normalized):
         return normalized
@@ -378,23 +337,18 @@ def passes_format_and_confidence(normalized: str, confidence: float) -> bool:
 
 
 def passes_anpr_gate(normalized: str, confidence: float) -> bool:
-    """A read only becomes a Vehicle/Plate record if it looks like a plate and
-    clears the confidence floor. passes_read_gate is the variant-aware form."""
+    """A read becomes a vehicle/plate record only if it looks like a plate and
+    clears the confidence floor. See passes_read_gate for structured reads."""
     return passes_format_and_confidence(normalized, confidence)
 
 
 def passes_read_gate(read: OcrRead) -> bool:
     """Gate for a structured read.
 
-    Format and confidence as in passes_anpr_gate, and when more than one
-    variant was read the winner must also have plate_min_variants_agreeing
-    of them behind it.
-
-    This can only make the gate stricter. Selecting among variants pushes
-    reported confidence up (the agreeing subset skews to easy crops), which
-    would otherwise nudge borderline reads past plate_min_confidence and the
-    review floor. High confidence from one variant isn't corroboration.
-    With one variant (default) this is the same as passes_anpr_gate.
+    Same format and confidence checks as passes_anpr_gate; with more than one
+    variant, the winner also needs plate_min_variants_agreeing behind it. This
+    only ever makes the gate stricter. With a single variant it is identical to
+    passes_anpr_gate.
     """
     if not passes_format_and_confidence(read.normalized, read.confidence):
         return False
@@ -408,13 +362,9 @@ def better_read(
 ) -> tuple[str, str, float]:
     """The more trustworthy of two reads of the same plate.
 
-    Localization turned out to cut accuracy on 25 real plates (exact match
-    0.16 -> 0.04, CER 0.524 -> 0.636) because _locate_classical sometimes
-    returns part of the plate and OCR then reads nothing. It's still ~3x
-    cheaper and often right, so it's kept but not trusted blindly.
-
-    Order: a gate-passing read wins, then non-empty beats empty, then higher
-    confidence. second=None (no fallback computed) returns first.
+    Localized reads are cheaper but can cover only part of the plate, so they
+    aren't trusted blindly. A gate-passing read wins, then non-empty over empty,
+    then higher confidence. second=None returns first.
     """
     if second is None:
         return first
@@ -433,16 +383,11 @@ _HUMAN_REVIEW_STATES = {"corrected", "rejected"}
 def review_status_for(
     confidence: float, current: str | None = None, corroborated: bool = True,
 ) -> str:
-    """Whether a plate sighting needs an operator to look at it.
+    """Review status for a plate sighting.
 
-    A gate-passing read below plate_review_confidence_floor is kept but marked
-    pending_review. If later reads push it over the floor it goes back to
-    auto_accepted, unless a human already corrected or rejected it; those are
-    final and new OCR frames never overwrite them.
-
-    corroborated=False (plate_tracker.has_consensus never saw enough agreeing
-    reads) always means pending_review however confident the frame was. One
-    confident frame isn't corroborated evidence.
+    Gate-passing reads below plate_review_confidence_floor, and any
+    uncorroborated read, are pending_review; later reads can move a sighting to
+    auto_accepted. An operator's correction or rejection is final.
     """
     if current in _HUMAN_REVIEW_STATES:
         return current

@@ -1,17 +1,10 @@
-"""Zone + watchlist rules -> explainable Alert (+ Incident on CRITICAL).
+"""Zone, watchlist and loitering rules -> explainable Alert (+ Incident on
+CRITICAL).
 
-Every alert carries a `reasons` list built from the rule that actually
-matched, so the UI can show why it fired (doc §55).
-
-Cooldown per track: an object sitting in a zone gets re-detected every
-inference cycle, and without de-duplication that's an alert per frame. Keyed
-on (camera, track or vehicle, rule), repeats within COOLDOWN_SECONDS are
-suppressed.
-
-Rule types: watchlist_plate and zone_entry fire for every active watchlist
-entry / zone. loitering only applies to a zone an active
-AlertRule(rule_type="loitering", zone_id=...) points at. All three respect the
-zone's schedule_start/schedule_end window (_within_schedule).
+Every alert carries the `reasons` of the rule that matched. Repeats for the same
+(camera, track or vehicle, rule) within COOLDOWN_SECONDS are suppressed, since an
+object in a zone is re-detected every inference cycle. Loitering applies only to
+zones targeted by an active loitering rule; all rules respect the zone schedule.
 """
 import asyncio
 import time
@@ -27,15 +20,12 @@ from .. import runtime_state
 from ..evidence_hash import sha256_file
 
 COOLDOWN_SECONDS = 45.0
-# Not a dict of time.monotonic() readings: monotonic time has a per-process
-# origin, so a second worker can't compare (every alert doubles) and a restart
-# re-fires everything the cooldown was holding back. See app/runtime_state.py.
-# Redis-backed when redis_url is set and reachable at startup, in-process otherwise.
+# Cooldown store (runtime_state.py): wall-clock based so it works across
+# processes and restarts; Redis-backed when configured, in-process otherwise.
 _alert_claims = runtime_state.build_claims_store("alert_cooldown", settings)
 
-# (camera_id, zone_id, track_key) -> (first_seen, last_seen, frames seen in
-# zone), monotonic. Dwell time for loitering and the frame count behind
-# zone_entry_min_frames. Stale entries are pruned each call.
+# (camera_id, zone_id, track_key) -> (first_seen, last_seen, frames in zone),
+# monotonic. Drives loitering and zone_entry_min_frames; pruned each call.
 _zone_presence: dict[tuple, tuple[float, float, int]] = {}
 _PRESENCE_STALE_FLOOR_SECONDS = 300.0
 
@@ -49,14 +39,10 @@ def _bbox_center_in_zone(bbox: list[float], frame_w: int, frame_h: int, zone: mo
 
 
 async def _on_cooldown(key: tuple) -> bool:
-    """True when this key fired recently and the alert should be suppressed.
+    """True if this key fired recently and the alert should be suppressed.
 
-    Checking records the firing (inverse of claim()); callers rely on that,
-    see the ordering note on the watchlist rule.
-
-    Async only for the Redis store. evaluate() is awaited straight from the
-    frame loop, so a blocking round trip here would stall every camera. The
-    local store is a dict op and runs inline; only Redis goes to a thread.
+    Checking records the firing, so call it only when about to alert. Only the
+    Redis store goes to a thread; the local store is a dict operation.
     """
     if _alert_claims.is_local:
         return not _alert_claims.claim(key, COOLDOWN_SECONDS)
@@ -75,9 +61,8 @@ def _parse_hhmm(value: str) -> "tuple[int, int] | None":
 
 
 def _within_schedule(zone: models.Zone, at: datetime) -> bool:
-    """Whether `at` is inside the zone's HH:MM window (can wrap midnight, e.g.
-    22:00-06:00). An unparseable schedule counts as always on, same as the
-    default 00:00-23:59, rather than never firing."""
+    """Whether `at` is inside the zone's HH:MM window (may wrap midnight). An
+    unparseable schedule counts as always on."""
     start = _parse_hhmm(zone.schedule_start)
     end = _parse_hhmm(zone.schedule_end)
     if start is None or end is None:
@@ -98,12 +83,8 @@ def _prune_stale_presence(floor_seconds: float) -> None:
 
 
 def find_incident_for_alert(db: Session, alert_id: str) -> "models.Incident | None":
-    """The incident an alert belongs to.
-
-    An alert that opened an incident is linked by Incident.alert_id; one
-    correlated into an existing incident goes through IncidentAlert. Look up
-    through here so callers don't need to know which.
-    """
+    """The incident an alert belongs to, whether it opened the incident
+    (Incident.alert_id) or was correlated into it (IncidentAlert)."""
     link = db.query(models.IncidentAlert).filter(models.IncidentAlert.alert_id == alert_id).first()
     if link is not None:
         incident = db.query(models.Incident).filter(models.Incident.id == link.incident_id).first()
@@ -118,12 +99,10 @@ _PRIORITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 def _find_correlatable_incident(
     db: Session, vehicle: "models.Vehicle | None", camera: models.Camera, at: datetime,
 ) -> "models.Incident | None":
-    """An open incident this alert belongs to instead of opening a new one.
+    """An open incident this alert should join instead of opening a new one.
 
-    Conservative on purpose. Same vehicle within the window (a plate is a hard
-    identity, one car over five cameras is one pursuit), or same camera with
-    no vehicle identified (repeat zone breaches at one spot). Never merged on
-    looks or proximity alone; two similar vehicles are two incidents.
+    Conservative: the same vehicle within the window, or the same camera when no
+    vehicle is identified. Never merged on appearance or proximity alone.
     """
     window_start = at - timedelta(seconds=settings.incident_correlation_window_seconds)
     query = db.query(models.Incident).filter(
@@ -141,12 +120,10 @@ def _find_correlatable_incident(
 
 
 def _rule_switched_off(db: Session, rule_type: str, zone_id: "str | None" = None) -> bool:
-    """True when every rule of this type (for this zone) has been disabled.
+    """True when every rule of this type (for this zone) is disabled.
 
-    Watchlist and zone-entry alerts fire with no AlertRule row at all, that's
-    the default. Once a rule exists though, the Disable button in Admin ->
-    Rules has to actually stop it (it used to only label the alert). One
-    active rule of the type keeps it on.
+    Watchlist and zone alerts fire by default with no rule row. Once rules
+    exist, disabling all of them stops the alerts; one active rule keeps it on.
     """
     query = db.query(models.AlertRule.active).filter(models.AlertRule.rule_type == rule_type)
     if zone_id is not None:
@@ -156,9 +133,8 @@ def _rule_switched_off(db: Session, rule_type: str, zone_id: "str | None" = None
 
 
 def _plate_is_corroborated(vehicle: models.Vehicle) -> bool:
-    # Read off the Vehicle row (correlate.upsert_vehicle_for_plate keeps it
-    # up to date), not queried from sightings, this runs per detection.
-    # NULL (old rows, legacy single-frame path) counts as not corroborated.
+    # Read from the Vehicle row (kept current by correlate.py) since this runs
+    # per detection. NULL counts as not corroborated.
     return bool(getattr(vehicle, "plate_corroborated", False))
 
 
@@ -178,14 +154,9 @@ async def evaluate(
     # fired, never by parsing reason strings
     signals = risk.RiskSignals(camera_code=str(camera.camera_code))
 
-    # watchlist_plate (cooldown per camera+vehicle)
-    #
-    # The entry is the authority, the flag is just a cache (app/watchlist.py).
-    # Firing on the flag alone kept alerting after an entry was deactivated or
-    # expired, with a reason string claiming an active entry that didn't exist.
-    #
-    # Look up the entry BEFORE the cooldown: _on_cooldown records a firing, so
-    # checking it first and then not firing would burn the window for nothing.
+    # watchlist_plate, cooldown per camera + vehicle. The watchlist entry is the
+    # authority (the vehicle flag is only a cache). Look it up before the
+    # cooldown check, because checking the cooldown records a firing.
     entry = (
         watchlist.plate_entry_in_force(db, vehicle.plate_text)
         if vehicle and vehicle.watchlist_flag and not _rule_switched_off(db, "watchlist_plate")
@@ -199,22 +170,10 @@ async def evaluate(
         signals.watchlist_priority = entry.priority
         signals.plate_text = str(vehicle.plate_text or "")
 
-        # A match is never suppressed for being uncertain, but severity must
-        # not overstate how sure the read is. Below the floor it's capped at
-        # HIGH and the reason says it needs confirmation.
-        #
-        # Corroboration is a separate gate. OCR confidence doesn't separate
-        # right from wrong reads on the benchmark: correct reads span
-        # 0.262-0.990, wrong plate-shaped ones 0.260-0.956, and 6 of 7 wrong
-        # reads sit at or above the lowest correct one. No threshold gets
-        # precision over 0.5 (docs/ANPR_ACCURACY.md, "A1").
-        #
-        # Concretely UP84AE9889 was read as UP81AE9889 at 0.956. Confidence
-        # alone would raise a CRITICAL and open an incident naming a vehicle
-        # that was never there, a wrongful-stop risk. So CRITICAL needs a
-        # confident read AND corroboration across frames. Uncorroborated
-        # matches still alert, capped at HIGH and labelled. corroborated=None
-        # counts as not corroborated.
+        # A match always alerts, but severity must not overstate the read:
+        # CRITICAL needs a confident read corroborated across frames, because OCR
+        # confidence alone doesn't separate right from wrong reads (see
+        # docs/ANPR_ACCURACY.md). Otherwise it is HIGH and labelled.
         plate_confidence = float(vehicle.plate_confidence or 0.0)
         corroborated = _plate_is_corroborated(vehicle)
         signals.plate_corroborated = corroborated
@@ -256,10 +215,9 @@ async def evaluate(
         first_seen, _, frames_in_zone = _zone_presence.get(presence_key, (now_mono, now_mono, 0))
         frames_in_zone += 1
         _zone_presence[presence_key] = (first_seen, now_mono, frames_in_zone)
-        # Alert only on confident detections, and for a tracked object only
-        # once it's been in the zone for zone_entry_min_frames frames: a
-        # one-frame ghost box shouldn't raise a CRITICAL. Untracked detections
-        # can't be counted, so they aren't held back.
+        # Alert only on confident detections, and for tracked objects only after
+        # zone_entry_min_frames frames in the zone. Untracked detections can't be
+        # counted, so they aren't held back.
         confident = float(detection.confidence or 0.0) >= settings.zone_alert_min_confidence
         confirmed = detection.track_id is None or frames_in_zone >= settings.zone_entry_min_frames
         if not (confident and confirmed):
@@ -335,15 +293,12 @@ async def evaluate(
         risk_factors=assessment.as_dicts(),
     )
     db.add(alert)
-    # was a bare db.flush() on the event loop: waiting on a locked database
-    # froze every camera and request for up to the busy_timeout
+    # Flushed off the event loop so waiting on the lock doesn't block it.
     await locked_flush(db)
     alerts.append(alert)
     metrics.ALERTS_TOTAL.labels(camera_code=str(camera.camera_code), severity=severity).inc()
 
-    # CRITICAL alerts open an incident, or join the open one they belong to,
-    # so a watchlisted car crossing four cameras is one incident whose
-    # title/description/priority grow with it, not four.
+    # CRITICAL alerts open an incident or join the open one they belong to.
     incident = None
     incident_link = None
     incident_evidence = None
@@ -419,8 +374,7 @@ async def evaluate(
         # split by outcome so the noise reduction from correlation is visible
         metrics.INCIDENTS_TOTAL.labels(outcome="correlated" if incident_targets else "opened").inc()
         if detection.snapshot_path:
-            # same shape as worker.py's evidence backfill; without
-            # alert_id/detection_id the UI showed "Alert: —"
+            # Same shape as worker.py's evidence rows, linked to the alert.
             incident_evidence = models.Evidence(
                 incident_id=incident.id,
                 evidence_type="snapshot",
@@ -438,10 +392,8 @@ async def evaluate(
             )
             db.add(incident_evidence)
 
-    # alert, incident_link and incident_evidence are new in this call, so a
-    # rollback only detaches them and re-add() restores them (db_retry.py).
-    # A correlated `incident` is persistent and was mutated in place, so its
-    # fields are reassigned from incident_targets.
+    # New objects are re-added on retry; the correlated incident is persistent,
+    # so its changed fields are reassigned from incident_targets.
     def _reapply():
         db.add(alert)
         if incident is not None:

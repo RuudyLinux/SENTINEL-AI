@@ -1,13 +1,9 @@
-"""Per-camera event clips, bounded.
+"""Per-camera event clips.
 
-A small ring buffer of recent JPEG frames per camera feeds the pre-event
-window and any clip being built. Entries age out after
-clip_pre_event_seconds, and a clip build only listens for new frames for
-clip_post_event_seconds, then unregisters. Nothing buffers a whole stream.
-
-worker.py pushes the JPEG it already encodes via push_frame(), and on an
-alert runs build_event_clip() as a background task so the camera loop never
-waits out the post-event window.
+A small per-camera ring buffer of recent JPEG frames supplies the pre-event
+window. On an alert, build_event_clip() runs as a background task, collects
+frames for clip_post_event_seconds, and writes a bounded MP4 plus an Evidence
+row, so the camera loop never waits.
 """
 import asyncio
 import logging
@@ -34,9 +30,8 @@ logger = logging.getLogger(__name__)
 
 _RING: dict[str, deque[tuple[float, bytes]]] = {}
 
-# max clips encoding at once. one 1080p libx264 encode already uses several
-# cores, and a busy zone fires many alerts a second; unbounded encodes
-# starved the camera loops and ran out of RAM
+# Maximum clips encoding at once; each 1080p encode uses several cores and a
+# busy zone can fire many alerts.
 _ENCODE_SLOTS = threading.BoundedSemaphore(2)
 _ENCODE_THREADS = 2  # per encode, so clips use at most 4 threads in all
 _SUBSCRIBERS: dict[str, list[asyncio.Queue]] = {}
@@ -69,9 +64,8 @@ def _timed_recent_frames(camera_id: str) -> list[tuple[float, bytes]]:
 
 
 def _playback_fps(timed_frames: list[tuple[float, bytes]]) -> float:
-    """The rate frames were actually captured at, so clips play in real time.
-    The loop only takes the newest frame now (~2-3fps under AI), and encoding
-    at the nominal 10fps played evidence 3-5x too fast."""
+    """The rate frames were actually captured at, so clips play back in real
+    time."""
     if len(timed_frames) < 2:
         return settings.clip_fps
     span = timed_frames[-1][0] - timed_frames[0][0]
@@ -81,23 +75,18 @@ def _playback_fps(timed_frames: list[tuple[float, bytes]]) -> float:
 
 
 def _encode_clip(frames: list[bytes], path: str, fps: "float | None" = None) -> bool:
-    """CPU-bound: decode each buffered JPEG and encode a bounded MP4. Run via
-    to_thread. False (nothing written) if no frame decodes.
+    """Decode the buffered JPEGs and encode a bounded MP4 (CPU-bound; run in a
+    thread). Returns False if no frame decodes.
 
-    Uses a piped ffmpeg (libx264) instead of cv2.VideoWriter. This OpenCV
-    build has no working H.264 encoder (its OpenH264 DLL won't load, every
-    avc1/h264/X264 fourcc fails), and the one fourcc that works, mp4v, isn't
-    something browsers decode: Chrome's <video> sat at NETWORK_NO_SOURCE.
-    imageio-ffmpeg (already a dependency) ships a static libx264, which gives
-    a normal H.264/yuv420p MP4."""
+    Uses a piped ffmpeg (libx264 from imageio-ffmpeg) rather than
+    cv2.VideoWriter: this OpenCV build has no working H.264 encoder, and mp4v
+    output doesn't play in browsers."""
     with _ENCODE_SLOTS:
         return _encode_clip_now(frames, path, fps)
 
 
 def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> bool:
-    # Decode one frame at a time while feeding ffmpeg. Decoding the whole
-    # batch first held every raw frame: 6.2 MB each at 1080p, ~750 MB for a
-    # 15s clip at 8 fps, and a few clips from a busy zone ran out of memory.
+    # Decode one frame at a time while feeding ffmpeg to keep memory flat.
     decoded = (
         arr for arr in (cv2.imdecode(np.frombuffer(b, dtype=np.uint8), cv2.IMREAD_COLOR) for b in frames)
         if arr is not None
@@ -117,15 +106,8 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         "-movflags", "+faststart",
         str(path),
     ]
-    # stderr to a temp FILE, not a pipe, on purpose. Nobody reads a PIPE
-    # while we're writing frames, so a chatty ffmpeg fills the OS buffer and
-    # blocks on stderr while we block on stdin: deadlock, and wait(timeout)
-    # is never reached because we're stuck in the frame loop. communicate()
-    # afterwards has the same hole. `-loglevel error` only hides it. A file
-    # has no limit and gets read after exit.
-    #
-    # `with proc` closes stdin however the block exits (the "unclosed file"
-    # ResourceWarning in tests).
+    # stderr goes to a temp file, not a pipe: an unread pipe can fill and
+    # deadlock ffmpeg while we block writing frames to stdin.
     err = b""
     with tempfile.TemporaryFile() as errfile:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errfile)
@@ -140,9 +122,8 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         except Exception as exc:
             proc.kill()
             proc.wait(timeout=10)
-            # usually BrokenPipeError: ffmpeg rejected its args and exited
-            # while we were still writing. log it, or a broken encoder looks
-            # just like an empty ring buffer
+            # Usually BrokenPipeError: ffmpeg exited early. Logged so a broken
+            # encoder doesn't look like an empty buffer.
             errfile.seek(0)
             detail = errfile.read().decode("utf-8", "replace").strip()[-500:]
             logger.warning("clip encode failed (%s): %s", type(exc).__name__, detail or exc)
@@ -170,10 +151,9 @@ async def build_event_clip(
     event_type: str,
     source_timestamp: datetime | None,
 ) -> None:
-    """Background task: collect frames for the post-event window, stitch pre +
-    post into a bounded MP4 and write an Evidence(evidence_type="clip") row.
-    Never blocks the camera loop. No frames (camera dropped) = no clip and no
-    Evidence row."""
+    """Background task: collect post-event frames, stitch them with the
+    pre-event buffer into an MP4 and write an Evidence(evidence_type="clip")
+    row. No frames means no clip and no row."""
     pre_frames = _timed_recent_frames(camera_id)
 
     max_post_frames = int(settings.clip_post_event_seconds * 30) + 10  # generous upper bound, still finite

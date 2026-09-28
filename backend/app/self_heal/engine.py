@@ -1,10 +1,8 @@
 """Self-Heal: recovery event log and open-problem index.
 
-Doesn't do any recovering itself. The real recovery code is db_retry.py
-(lock rollback + retry), worker.py / camera_connection.py (reconnect and
-backoff), supervisor.py (24/7 reconnect sweep) and self_heal/http_retry.py.
-This records what those do so operators see it in one place
-(GET /api/self-heal/*, the SELF-HEAL UI).
+Records what the recovery code does (db_retry.py lock retries, camera
+reconnect/backoff, the grid supervisor, http_retry.py) so operators see it in
+one place (GET /api/self-heal/*). It performs no recovery itself.
 """
 import asyncio
 import logging
@@ -23,26 +21,20 @@ logger = logging.getLogger("sentinel.self_heal")
 _GLOBAL = "_global"
 
 # Latest event per (component, camera_id), so /problems doesn't rescan the
-# events table on every poll. Rebuilt from the DB at startup
-# (rebuild_open_problems); the DB is the source of truth.
+# table on every poll. Rebuilt from the DB at startup.
 _LATEST: dict[tuple[str, str], "models.SelfHealEvent"] = {}
 
 # latest status in here = not an open problem. anything else (RECOVERING,
 # FAILED, CONFIG_REQUIRED, DEGRADED) is
 _RESOLVED_STATUSES = {"RECOVERED"}
 
-# A camera under steady lock contention can hit and recover a lock on almost
-# every heartbeat commit, and Error Logs drowned in identical "recovered" rows.
-# Repeats of the same (component, camera_id, error_type) RECOVERED event
-# inside this window are skipped. Never FAILED, CONFIG_REQUIRED or critical
-# events, and the first one of a burst is always written.
+# Repeats of the same RECOVERED event (component, camera_id, error_type) inside
+# this window are skipped, so steady lock contention doesn't flood the log.
+# FAILED, CONFIG_REQUIRED and critical events are always written.
 _DEDUP_WINDOW_S = 10.0
-# Shared via app/runtime_state.py; a monotonic dict can't be read by another
-# process and resets on restart, so the burst got written anyway.
-#
-# Sync is fine here: record_event_sync runs either in a caller that's already
-# off the loop or via record_event's to_thread, so a blocking Redis call never
-# hits the event loop.
+# Shared through runtime_state.py so the window holds across processes and
+# restarts. Synchronous calls are fine: record_event_sync never runs on the
+# event loop.
 _recovered_claims = runtime_state.build_claims_store("self_heal_dedup", settings)
 
 
@@ -67,12 +59,9 @@ def record_event_sync(
     status: str = "RECOVERED", duration_seconds: float = 0.0,
     endpoint: str = "", metadata: dict[str, Any] | None = None,
 ) -> "models.SelfHealEvent | None":
-    """Best-effort synchronous write, never raises. Own short-lived session so
-    logging can't interfere with or get rolled back by the operation it
-    describes. Losing the odd row under heavy contention is fine.
-
-    None (nothing written) for a suppressed duplicate; record_event already
-    treats None as nothing to broadcast."""
+    """Best-effort synchronous write that never raises. Uses its own session so
+    it can't interfere with, or be rolled back by, the operation it describes.
+    Returns None for a suppressed duplicate."""
     if _is_noisy_duplicate(component, camera_id, error_type, status, severity):
         return None
     db = SessionLocal()
@@ -103,8 +92,8 @@ def record_event_sync(
 
 
 async def record_event(**kwargs) -> "models.SelfHealEvent | None":
-    """Write on a thread (like db_retry.py) and push it over the websocket so
-    Recovery Activity / Problems update live."""
+    """Write on a thread and broadcast the event so the Self-Heal screens update
+    live."""
     row = await asyncio.to_thread(record_event_sync, **kwargs)
     if row is not None:
         try:
@@ -131,9 +120,8 @@ def serialize(row: "models.SelfHealEvent") -> dict[str, Any]:
 
 
 def classify_exception(exc: BaseException) -> tuple[str, str]:
-    """(error_type, severity) for a generic exception, for callers that don't
-    know better (worker's per-iteration except). Anything unrecognized is
-    UNKNOWN/warning rather than a guess."""
+    """(error_type, severity) for a generic exception. Anything unrecognised is
+    UNKNOWN/warning."""
     name = type(exc).__name__
     msg = str(exc).lower()
     if "operational" in name.lower() and ("locked" in msg or "busy" in msg):
@@ -146,8 +134,8 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
 
 
 def rebuild_open_problems() -> None:
-    """Startup: reload the latest event per (component, camera_id) from the
-    last 24h so open problems survive a restart."""
+    """Reload the latest event per (component, camera_id) from the last 24 h so
+    open problems survive a restart."""
     db = SessionLocal()
     try:
         cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -167,10 +155,7 @@ def rebuild_open_problems() -> None:
 
 
 def forget_camera(camera_id: str) -> None:
-    """Forget a deleted camera. Its SelfHealEvent rows go with it
-    (routers/cameras.py), but this index kept the last one and the Problems
-    page showed a camera that no longer existed until the next restart.
-    """
+    """Forget a deleted camera so it no longer appears under open problems."""
     for key in [k for k in _LATEST if k[1] == camera_id]:
         _LATEST.pop(key, None)
 

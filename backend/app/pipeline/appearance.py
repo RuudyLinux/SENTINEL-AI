@@ -1,11 +1,8 @@
 """Person appearance signature for cross-camera similarity.
 
-Not face recognition, not identity. A small HSV histogram of the person crop
-(roughly clothing colour) used only to rank sightings on other cameras by
-how similar they look, for an investigator to check by hand. See
-routers/persons.py and README "Cross-camera intelligence".
-
-cv2/numpy only.
+A small HSV histogram of the person crop (roughly clothing colour), used only
+to rank sightings on other cameras for an investigator to check by hand. Not
+face recognition and not identity.
 """
 import numpy as np
 import cv2
@@ -35,10 +32,8 @@ def compute_signature(crop: "np.ndarray") -> "list[float] | None":
     return sig
 
 
-# Hue is the main colour signal; Value (brightness) varies most between
-# cameras, so it counts least. One flat concatenated vector (tried first)
-# scored pure red vs pure blue high, since matching S/V spikes outweighed
-# the mismatched H.
+# Hue is the main colour signal; Value (brightness) varies most between cameras,
+# so it is weighted least. Channels are compared separately.
 _CHANNEL_WEIGHTS = (0.6, 0.3, 0.1)  # H, S, V
 
 

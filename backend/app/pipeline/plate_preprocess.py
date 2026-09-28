@@ -1,30 +1,12 @@
 """Plate crop preprocessing variants and perspective correction.
 
-Sits between plate_detector (found a region) and anpr (read it):
-- perspective correction: an off-axis plate is a quad; when the detector
-  gives one (the classical localizer does, via minAreaRect) a four-point
-  warp straightens it before OCR
-- variants: the same crop as grayscale, CLAHE, denoise, sharpen,
-  adaptive/Otsu threshold, so OCR can read several and
-  anpr.select_candidate can compare them
+Sits between plate_detector (region found) and anpr (text read):
+- perspective correction warps a skewed quad front-on before OCR;
+- variants (grayscale, CLAHE, denoise, sharpen, adaptive/Otsu threshold) let
+  OCR read the same crop several ways for anpr.select_candidate to compare.
 
-Variants are off by default. On the 25-plate corpus (docs/ANPR_ACCURACY.md),
-selecting by agreement:
-
-    clahe alone (production)     exact 0.24  CER 0.3896  FP 0.28  1 OCR call
-    original+sharpen+adaptive    exact 0.28  CER 0.3030  FP 0.28  3 calls
-    all seven                    exact 0.28  CER 0.2814  FP 0.32  7 calls
-
-The exact-match change is one sample in 25, inside the noise, so it isn't an
-accuracy gain. The CER gain is real (~250 characters, not 25 yes/no) but costs
-3-7x the OCR time, the most expensive thing in the camera loop. That's the
-operator's call, so PLATE_PREPROCESS_VARIANTS defaults to the one variant
-that matches the old behaviour, and multi-variant is opt-in.
-
-Escalating (variants only when the cheap read fails the gate) was tried and
-dropped: variants rescue crops where the first read passes with the wrong
-text, and escalation never fires on those. Exact stayed 0.24, false positives
-went up. Numbers in docs/ANPR_ACCURACY.md.
+Multiple variants cost one OCR pass each, so the default is a single variant;
+the trade-off is documented in docs/ANPR_ACCURACY.md.
 """
 import cv2
 import numpy as np
@@ -32,16 +14,10 @@ import numpy as np
 from ..config import settings
 
 # Names allowed in PLATE_PREPROCESS_VARIANTS. Each takes an already-upscaled
-# crop; upscaling happens once up front since it's the same for all of them
-# and dominates their cost.
-#
-# "clahe" is the default because it's exactly what the pipeline did before
-# (plate_detect._preprocess_for_ocr: upscale -> gray -> CLAHE), so variants
-# off means byte-for-byte the old behaviour.
+# crop. "clahe" (upscale -> gray -> CLAHE) is the default single variant.
 VARIANT_NAMES = ("original", "gray", "clahe", "denoise", "sharpen", "adaptive", "otsu")
 
-# best measured cost/benefit set if someone turns multi-variant on. exported
-# so operators and the benchmark use the same one
+# Best cost/benefit set when multi-variant is enabled; shared with the benchmark.
 RECOMMENDED_RECOVERY_VARIANTS = ("original", "sharpen", "adaptive")
 
 
@@ -50,15 +26,14 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def _clahe(image: np.ndarray) -> np.ndarray:
-    """CLAHE, not global equalizeHist: plates are often half in shadow
-    (overhang, headlight glare) and a global stretch blows out the lit half."""
+    """CLAHE rather than a global histogram stretch, which blows out the lit half
+    of a plate in partial shadow."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(_to_gray(image))
 
 
 def _denoise(image: np.ndarray) -> np.ndarray:
-    """Bilateral filter: smooths sensor/compression noise but keeps the hard
-    glyph edges OCR needs. Gaussian would soften both."""
+    """Bilateral filter: removes noise while keeping the glyph edges OCR needs."""
     return cv2.bilateralFilter(_clahe(image), 7, 50, 50)
 
 
@@ -93,12 +68,8 @@ _VARIANT_FUNCTIONS = {
 
 
 def upscale_for_ocr(image: np.ndarray, target_height: int | None = None) -> np.ndarray:
-    """Upscale a small crop to a readable glyph height.
-
-    Glyph height is what decides OCR accuracy on real CCTV; an 18px plate is
-    at the edge of what EasyOCR resolves. A few ms, and unlike swapping the
-    OCR engine it can't break reads that already work. Crops already tall
-    enough are returned as is.
+    """Upscale a small crop to a readable glyph height; crops already tall
+    enough are returned unchanged.
     """
     if image is None or image.size == 0:
         return image
@@ -115,9 +86,8 @@ def upscale_for_ocr(image: np.ndarray, target_height: int | None = None) -> np.n
 def order_quad(points: np.ndarray) -> np.ndarray:
     """Order corners top-left, top-right, bottom-right, bottom-left.
 
-    boxPoints' order depends on rotation, and warping unordered corners gives
-    a mirrored or 90°-turned plate at some angles. Top-left has the smallest
-    x+y, bottom-right the largest, top-right the smallest y-x.
+    boxPoints' order depends on rotation, and unordered corners warp to a
+    mirrored or rotated plate.
     """
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
     ordered = np.zeros((4, 2), dtype=np.float32)
@@ -131,9 +101,8 @@ def order_quad(points: np.ndarray) -> np.ndarray:
 
 
 def four_point_transform(image: np.ndarray, quad) -> "np.ndarray | None":
-    """Warp a quad plate region to a front-on rectangle. None for a
-    degenerate quad (collinear, or smaller than a readable plate), and the
-    caller keeps the unwarped crop."""
+    """Warp a quad plate region to a front-on rectangle. None for a degenerate
+    quad; the caller then keeps the unwarped crop."""
     if image is None or image.size == 0 or quad is None:
         return None
     try:
@@ -156,9 +125,8 @@ def four_point_transform(image: np.ndarray, quad) -> "np.ndarray | None":
 
 
 def needs_perspective_correction(quad, tolerance: float = 0.08) -> bool:
-    """Is the quad skewed enough to be worth warping? A near-axis-aligned box
-    warps to about itself, so it's just time and resampling blur.
-    `tolerance` is how much opposite edges may differ, as a fraction of size.
+    """Whether the quad is skewed enough to be worth warping. `tolerance` is how
+    much opposite edges may differ, as a fraction of their size.
     """
     if quad is None:
         return False
@@ -179,9 +147,8 @@ def needs_perspective_correction(quad, tolerance: float = 0.08) -> bool:
 
 
 def configured_variants() -> tuple[str, ...]:
-    """Enabled variant names. Unknown ones are dropped, not raised: a typo in
-    an env var shouldn't kill a camera worker. Empty/all invalid falls back
-    to the default so OCR always gets one image.
+    """Enabled variant names. Unknown names are dropped rather than raising, and
+    an empty result falls back to the default so OCR always gets an image.
     """
     raw = (settings.plate_preprocess_variants or "").strip()
     if not raw:
@@ -197,11 +164,8 @@ def build_variants(
     quad=None,
     variant_names: "tuple[str, ...] | None" = None,
 ) -> list[tuple[str, np.ndarray]]:
-    """Plate crop as [(variant_name, image), ...] for OCR.
-
-    Perspective correction (given a skewed quad) and upscaling happen once
-    before branching, same work for every variant. With the default single
-    variant this is exactly the old pipeline's one image.
+    """Plate crop as [(variant_name, image), ...] for OCR. Perspective correction
+    and upscaling happen once before the variants branch.
     """
     if plate_crop is None or plate_crop.size == 0:
         return []

@@ -1,21 +1,18 @@
-"""Camera runtime lifecycle state (split out of worker.py).
+"""Camera runtime lifecycle state.
 
-CAMERA_STATS is the in-memory per-camera diagnostic record, keyed by camera
-id. Its grid_state is the 9-state connection lifecycle (DISCOVERING,
-CONNECTING, CONNECTED, PROCESSING, DEGRADED, RECONNECTING, DISCONNECTED,
-AUTH_ERROR, ERROR). _TRANSITIONS says which moves are legal,
-_set_grid_state is the only place state changes, and
-_DB_STATUS_FOR_GRID_STATE maps it to the 3-value Camera.status column.
+CAMERA_STATS holds per-camera in-memory diagnostics, including grid_state, the
+connection lifecycle (DISCOVERING, CONNECTING, CONNECTED, PROCESSING, DEGRADED,
+RECONNECTING, DISCONNECTED, AUTH_ERROR, ERROR). _set_grid_state is the only
+place it changes; _DB_STATUS_FOR_GRID_STATE maps it to Camera.status.
 
-No cv2, torch, DB session or event loop here, so anything can import it.
+Has no cv2, torch, DB or event-loop dependencies, so anything can import it.
 """
 import logging
 from typing import Any
 
 logger = logging.getLogger("sentinel.worker")
 
-# per-camera runtime counters (latency, drops, reconnects, last error).
-# in-memory, per-process, deliberately lightweight
+# Per-camera runtime counters, in memory and per process.
 CAMERA_STATS: dict[str, dict[str, Any]] = {}
 
 
@@ -34,13 +31,9 @@ def _stats(camera_id: str) -> dict[str, Any]:
         "inference_ms_ema": None,
         "loop_gap_ms_ema": None,  # wall-clock time between consecutive loop iterations
         "last_error": None,
-        # Lifecycle state for GET /api/cameras/{id}/diagnostics, separate from
-        # Camera.status which lots of code expects to be online/offline/degraded.
-        #
-        # None, not "CONNECTING": setdefault creates this the first time
-        # anything asks about a camera, not when a worker starts it. Priming
-        # it to CONNECTING made every fresh camera's first real move look
-        # illegal. _set_grid_state treats None as "anything goes".
+        # Lifecycle state for the diagnostics endpoint, separate from
+        # Camera.status. Starts as None (not CONNECTING) because the entry is
+        # created on first lookup, not when a worker starts.
         "grid_state": None,
     })
 
@@ -51,12 +44,8 @@ GRID_STATES = {
     "RECONNECTING", "DISCONNECTED", "AUTH_ERROR", "ERROR",
 }
 
-# Legal transitions. Only checking that the new state was a known name let
-# DISCONNECTED -> PROCESSING through, and it was an assert, gone under -O.
-#
-# Self-transitions are listed since the loop re-asserts its state most
-# iterations. Every state can reach DISCONNECTED (operator stop) and both
-# failure states, so those get added to every row below.
+# Legal transitions. Self-transitions are listed because the loop re-asserts
+# its state; every state can reach DISCONNECTED and both failure states.
 _ALWAYS_REACHABLE = {"DISCONNECTED", "AUTH_ERROR", "ERROR"}
 _TRANSITIONS: dict[str, set[str]] = {
     "DISCOVERING": {"DISCOVERING", "CONNECTING"},
@@ -65,10 +54,8 @@ _TRANSITIONS: dict[str, set[str]] = {
     "PROCESSING": {"PROCESSING", "CONNECTED", "DEGRADED", "RECONNECTING"},
     "DEGRADED": {"DEGRADED", "CONNECTED", "PROCESSING", "RECONNECTING"},
     "RECONNECTING": {"RECONNECTING", "CONNECTED", "PROCESSING", "DEGRADED"},
-    # A stopped or failed camera only comes back by starting again. Also seen
-    # live: the first connect can fail fast enough that _open_with_timeout
-    # marks DISCONNECTED and then _reopen_with_backoff, in the same call,
-    # marks RECONNECTING. That fallback is intended.
+    # A stopped or failed camera only comes back by starting again. A fast
+    # first-connect failure can go DISCONNECTED -> RECONNECTING in one call.
     "DISCONNECTED": {"DISCONNECTED", "DISCOVERING", "CONNECTING", "RECONNECTING"},
     "AUTH_ERROR": {"AUTH_ERROR", "DISCOVERING", "CONNECTING"},
     # ERROR comes from the loop's catch-all and the next good iteration goes
@@ -79,20 +66,17 @@ _TRANSITIONS: dict[str, set[str]] = {
 for _from, _to in _TRANSITIONS.items():
     _to |= _ALWAYS_REACHABLE
 
-# Illegal transitions seen at runtime, (from, to) -> count. Read by the
-# diagnostics endpoint and tests. A count, not an exception, see
-# _set_grid_state.
+# Illegal transitions seen at runtime, (from, to) -> count; read by the
+# diagnostics endpoint and tests.
 ILLEGAL_TRANSITIONS: dict[tuple[str, str], int] = {}
 
 
 def _set_grid_state(camera_id: str, state: str) -> None:
-    """Move a camera to `state`, counting it if the move isn't legal.
+    """Move a camera to `state`, counting the move if it isn't legal.
 
-    Illegal moves are still applied: refusing would leave CAMERA_STATS
-    claiming something the camera isn't doing, and raising would kill a live
-    worker over a gap in the table. The pair is counted and logged instead,
-    and test_camera_state_machine.py asserts the counter stays empty after
-    driving the real lifecycle.
+    Illegal moves are still applied, so CAMERA_STATS never misreports the
+    camera and a gap in the table can't kill a live worker. The counter should
+    stay empty (test_camera_state_machine.py).
     """
     if state not in GRID_STATES:
         raise ValueError(f"unknown grid_state: {state}")
@@ -107,12 +91,8 @@ def _set_grid_state(camera_id: str, state: str) -> None:
     stats["grid_state"] = state
 
 
-# DB Camera.status a grid_state write also sets. States missing here
-# (CONNECTING, DISCOVERING, ERROR) leave status alone, same as before; ERROR
-# is the per-iteration catch-all and a DB write on every blip would cost.
-#
-# Call sites derive status from the same variable they pass to
-# _set_grid_state, so "degraded" and "DEGRADED" can't drift apart again.
+# Camera.status set alongside each grid_state. States not listed leave status
+# unchanged; ERROR is a per-iteration catch-all and not worth a DB write.
 _DB_STATUS_FOR_GRID_STATE: dict[str, str] = {
     "CONNECTED": "online",
     "PROCESSING": "online",

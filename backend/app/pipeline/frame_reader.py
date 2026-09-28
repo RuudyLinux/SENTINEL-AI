@@ -1,18 +1,13 @@
-"""Latest-frame reader: decoding runs separately from frame processing.
+"""Latest-frame reader: decoding runs independently of frame processing.
 
-The loop used to read, then do clip buffer, inference, persistence and MJPEG
-before reading again. Live RTSP keeps sending 25-30fps regardless, so frames
-queued up: on the real grid the loop did ~5fps, the picture ran at ~0.2x real
-time, fell ~48s further behind each minute, and the server eventually dropped us.
+Live streams keep sending at their own rate, so reading between processing
+steps lets frames queue up and the picture fall behind. One thread per session
+reads continuously and keeps only the newest frame; the loop takes it when
+ready. Sequence numbers only increase, so the tracker still sees frames in
+order.
 
-Now one thread per session reads nonstop and keeps only the newest frame. The
-loop takes the newest one when it's ready, the rest are dropped. One frame of
-memory, never more than one iteration behind, and the tracker still gets frames
-in order since sequence numbers only go up.
-
-The reader thread owns the source from start() until it exits (every read,
-pos_msec() and the final release()); a VideoCapture can't be shared between
-threads.
+The reader thread owns the source from start() until it exits: a VideoCapture
+can't be shared between threads.
 """
 import logging
 import threading
@@ -38,9 +33,8 @@ class FrameResult:
 
 class LatestFrameReader:
     def __init__(self, source: Any, name: str, pace_fps: "float | None" = None):
-        """pace_fps is for sources that don't pace themselves (a file or a
-        synthetic feed would be read as fast as the CPU goes). Live streams
-        pass None."""
+        """pace_fps paces sources that don't pace themselves (files, synthetic
+        feeds); live streams pass None."""
         self._source = source
         self._name = name
         self._pace_s = (1.0 / pace_fps) if pace_fps and pace_fps > 0 else None
@@ -53,9 +47,8 @@ class LatestFrameReader:
         self._frame_seq = 0    # decode number of the frame we're holding
         self._fail_seq = 0
         self.frames_read = 0
-        # Grab-capable sources: every frame is decoded (grab) but only turned
-        # into a BGR image when the consumer is waiting for one. Halves the
-        # CPU per stream when the loop runs slower than the camera.
+        # Grab-capable sources decode every frame but convert to BGR only when
+        # the consumer is waiting for one.
         self._grab = bool(getattr(source, "can_grab", False)) and pace_fps is None
         self._wanted = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"reader-{name}", daemon=True)
@@ -121,9 +114,9 @@ class LatestFrameReader:
                 logger.exception("reader %s: release failed", self._name)
 
     def next_frame(self, after_seq: int, after_fail_seq: int, timeout: float) -> FrameResult:
-        """Newest frame after after_seq. Otherwise frame=None once a failure
-        after after_fail_seq shows up, or after `timeout` (a stream that
-        neither delivers nor errors). A newer frame beats a failure."""
+        """Newest frame after after_seq; otherwise frame=None on a failure after
+        after_fail_seq or after `timeout`. A newer frame takes precedence over a
+        failure."""
         deadline = time.monotonic() + timeout
         with self._cond:
             # a frame newer than after_seq that we already hold is good enough

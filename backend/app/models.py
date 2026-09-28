@@ -1,4 +1,4 @@
-"""ORM models (doc §51 / §7)."""
+"""SQLAlchemy ORM models."""
 import uuid
 from datetime import datetime
 
@@ -64,28 +64,21 @@ class Camera(Base):
     catalog_live_status = Column(String, default="")
     catalog_synced_at = Column(DateTime, nullable=True)
     catalog_stale = Column(Boolean, default=False)
-    # Retired cameras are kept so their history still points at a real row.
-    # Never connects, starts or counts as active again (POST /{id}/retire),
-    # undo with POST /{id}/reinstate.
+    # Retired cameras are kept so their history still resolves; they never
+    # connect again until reinstated.
     retired = Column(Boolean, default=False, nullable=False, server_default=sa_false())
-    # The catalogue's other two stream URLs. NULL when missing. Unlike
-    # source_uri (can embed RTSP credentials, never returned by the API) these
-    # are meant for clients (WHEP for browser preview, HLS as fallback), so
-    # CameraOut exposes them.
+    # Client-facing stream URLs from the catalogue (WHEP preview, HLS fallback).
+    # Unlike source_uri, which may embed credentials, these are exposed by the API.
     whep_url = Column(String, nullable=True)
     hls_url = Column(String, nullable=True)
-    # Free-form grouping ("North Zone", "Highway Cams"), filtered client side.
-    # Empty string not null so old rows migrate cleanly (ensure_columns in
-    # main.py). Not `group`: reserved word, and the raw-SQL ensure_* helpers
-    # don't quote it.
+    # Free-form grouping ("North Zone"). Not named `group`, a reserved word the
+    # raw-SQL ensure_* helpers don't quote.
     camera_group = Column(String, default="")
 
 
 class Detection(Base):
     __tablename__ = "detections"
-    # The live camera page polls a camera's newest detections every few
-    # seconds. With just the camera_id index SQLite read and sorted all of a
-    # camera's rows: 27 ms on 22k and growing. With this, 50 rows, 0.12 ms.
+    # Serves the live page's "newest detections for a camera" query.
     __table_args__ = (Index("ix_detections_camera_id_timestamp", "camera_id", "timestamp"),)
     id = Column(String, primary_key=True, default=lambda: uid("det"))
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
@@ -99,19 +92,15 @@ class Detection(Base):
     track_id = Column(String, nullable=True, index=True)
     model_version = Column(String, default="")
     snapshot_path = Column(String, nullable=True)
-    # HSV color-histogram signature, persons only (pipeline/appearance.py).
-    # Not biometric, just visual similarity for ranking leads. Null when not
-    # computed (worker.py._process_frame).
+    # HSV colour-histogram signature for persons (appearance.py): visual
+    # similarity for ranking leads, not biometric. Null when not computed.
     appearance_signature = Column(JSON, nullable=True)
 
 
 class Track(Base):
-    """One tracked object's life on one camera. ByteTrack ids are only unique
-    per predictor and detector.py keeps one per camera.
-
-    Written by worker.py for every tracked vehicle; vehicle_id gets filled in
-    once the track's plate is read, so "track 284 is GJ05AB1234" is one row
-    instead of a three-join inference."""
+    """One tracked object's lifetime on one camera. ByteTrack ids are unique only
+    per camera, so they're stored with camera_id. vehicle_id is filled in once
+    the track's plate is read."""
     __tablename__ = "tracks"
     id = Column(String, primary_key=True, default=lambda: uid("trk"))
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
@@ -128,24 +117,15 @@ class Track(Base):
 class Vehicle(Base):
     __tablename__ = "vehicles"
     id = Column(String, primary_key=True, default=lambda: uid("veh"))
-    # Unique: two camera workers seeing a brand-new plate at the same moment
-    # could each insert a row and split one vehicle's route/sightings/risk in
-    # two, silently. Now the second insert raises IntegrityError and
-    # correlate.upsert_vehicle_for_plate merges it into the winner. Multiple
-    # NULLs are still allowed (tests/test_vehicle_upsert_race.py).
-    #
-    # Gap: SQLite's ALTER TABLE ADD COLUMN (db.ensure_columns) can't add
-    # UNIQUE to an existing table, so an old SQLite DB upgraded in place only
-    # gets the narrower race window until the file is recreated. Fresh
-    # create_all and the Alembic/PostgreSQL path get the real constraint.
-    # Noted in docs/THREAT_MODEL.md.
+    # Unique so two workers seeing a new plate at once can't create two vehicles;
+    # the second insert is merged by correlate.upsert_vehicle_for_plate. SQLite
+    # databases upgraded in place via ensure_columns lack the constraint (see
+    # docs/THREAT_MODEL.md).
     plate_text = Column(String, unique=True, index=True, nullable=True)
     plate_confidence = Column(Float, default=0.0)
-    # Ever corroborated across frames (plate_tracker.has_consensus). Kept apart
-    # from plate_confidence: on the benchmark confidence doesn't separate right
-    # from wrong reads (0.262-0.990 vs 0.260-0.956), so this is independent
-    # evidence. Only ratchets up. NULL on old rows = not corroborated, which
-    # can't buy a CRITICAL (rules_engine.py).
+    # Whether the plate was ever corroborated across frames. Independent of
+    # plate_confidence and only ever set, never cleared. NULL = not corroborated,
+    # which can't produce a CRITICAL alert.
     plate_corroborated = Column(Boolean, default=False)
     vehicle_type = Column(String, default="")
     color = Column(String, default="")
@@ -156,14 +136,9 @@ class Vehicle(Base):
 
 
 class Plate(Base):
-    """A plate read, and in V2 a vehicle sighting: one row per (camera,
-    vehicle track), not per OCR frame.
-
-    Pre-V2 a car waiting at a signal made dozens of identical rows, and since
-    correlate.get_route() builds the journey from these rows, dozens of fake
-    hops. Now the row is created on the first confident read and updated
-    (confidence, reads_count, last_seen) while the track stays in frame
-    (pipeline/plate_tracker.py)."""
+    """A plate read; in V2 a vehicle sighting, one row per (camera, track)
+    rather than per OCR frame, updated while the track stays in view
+    (plate_tracker.py). The vehicle's route is built from these rows."""
     __tablename__ = "plates"
     id = Column(String, primary_key=True, default=lambda: uid("plt"))
     vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
@@ -175,9 +150,8 @@ class Plate(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time, first confident read
     source_timestamp = Column(DateTime, nullable=True)  # SOURCE time, see Detection.source_timestamp
     snapshot_path = Column(String, nullable=True)
-    # V2 sighting fields
-    # ByteTrack id as text (matches Detection.track_id). Null without a track
-    # id and on pre-V2 rows, never backfilled.
+    # V2 sighting fields. track_id matches Detection.track_id; null without a
+    # track and on pre-V2 rows.
     track_id = Column(String, nullable=True, index=True)
     # last time the track was still seen here. with timestamp = dwell time
     last_seen = Column(DateTime, nullable=True)
@@ -186,27 +160,20 @@ class Plate(Base):
     # the vehicle's YOLO class/confidence at recognition, saves a join
     vehicle_class = Column(String, default="")
     detection_confidence = Column(Float, default=0.0)
-    # Full-frame pixel coords. plate_bbox null = no plate region found and OCR
-    # read the whole vehicle crop, which is less trustworthy; never filled
-    # with the vehicle box.
+    # Full-frame pixel coordinates. plate_bbox is null when OCR read the whole
+    # vehicle crop, which is less trustworthy.
     vehicle_bbox = Column(JSON, nullable=True)
     plate_bbox = Column(JSON, nullable=True)
-    # ANPR review.
-    # auto_accepted: cleared the gate, nothing to do.
-    # pending_review: kept but below the review floor, or uncorroborated, or
-    #   below the watchlist floor on a watchlist match. waiting on an operator.
-    # corrected: operator gave the real text. rejected: not usable.
+    # ANPR review status: auto_accepted, pending_review (below the review floor
+    # or uncorroborated), corrected (operator supplied the text) or rejected.
     review_status = Column(String, default="auto_accepted", index=True)
     reviewed_by = Column(String, ForeignKey("users.id"), nullable=True)
     reviewed_at = Column(DateTime, nullable=True)
     # Operator's text, separate from plate_text_raw (what OCR said) and
     # plate_text_normalized (what the parser made of it).
     corrected_text = Column(String, nullable=True)
-    # ANPR explainability. Separate signals, stored unblended; `confidence`
-    # stays the OCR engine's own number.
-    #
-    # preprocessing variant that won ("clahe" by default, plate_preprocess.py).
-    # null on older rows
+    # ANPR explainability signals, stored separately from `confidence`.
+    # Winning preprocessing variant (plate_preprocess.py); null on older rows.
     ocr_variant = Column(String, nullable=True)
     # variants that agreed on the text; 1 unless multi-variant is on
     variants_agreeing = Column(Integer, nullable=True)
@@ -254,9 +221,8 @@ class Zone(Base):
     schedule_start = Column(String, default="00:00")
     schedule_end = Column(String, default="23:59")
     active = Column(Boolean, default=True)
-    # Loitering dwell threshold in seconds. Only checked when set AND an
-    # active AlertRule(rule_type="loitering") points at the zone
-    # (rules_engine.py). Zone entry doesn't care.
+    # Loitering threshold in seconds; applies only when an active loitering rule
+    # targets this zone.
     loitering_seconds = Column(Float, nullable=True)
 
 
@@ -299,11 +265,8 @@ class Alert(Base):
 
 
 class IncidentAlert(Base):
-    """Many alerts -> one incident.
-
-    Incident.alert_id stays the originating alert (callers use it). But a
-    watchlisted car entering a zone and then showing up on three more cameras
-    is one event with five alerts, not five incidents."""
+    """Links alerts to an incident. Incident.alert_id stays the originating
+    alert; correlated alerts from other cameras are linked here."""
     __tablename__ = "incident_alerts"
     id = Column(String, primary_key=True, default=lambda: uid("ia"))
     incident_id = Column(String, ForeignKey("incidents.id"), nullable=False, index=True)
@@ -373,23 +336,18 @@ class AuditLog(Base):
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    # Tamper-evident chain. id is random, so the chain needs its own position:
-    # max(chain_seq)+1 in app/audit.py. Unique so a concurrent write raises
-    # instead of mis-ordering (audit.py retries).
+    # Chain position (ids are random). Unique so a concurrent append fails and
+    # audit.py retries instead of mis-ordering.
     chain_seq = Column(Integer, nullable=True, unique=True, index=True)
-    # prev_hash is the previous row's entry_hash ("0"*64 for the first);
-    # entry_hash = sha256(prev_hash + this row's canonical fields). Edit or
-    # delete a row and every hash after it breaks, which is what verify-chain
-    # looks for.
+    # entry_hash = sha256(prev_hash + canonical fields), prev_hash being the
+    # previous row's hash ("0"*64 for the first). Any edit breaks the chain.
     prev_hash = Column(String, nullable=True)
     entry_hash = Column(String, nullable=True)
 
 
 class SelfHealEvent(Base):
-    """One row per real recovery attempt (app/self_heal/engine.py). Not
-    written for routine successes, only when something went wrong and a
-    recovery ran. Best-effort diagnostics; losing a row under heavy contention
-    is fine and never blocks the operation it describes."""
+    """One row per recovery attempt (self_heal/engine.py). Best-effort
+    diagnostics: a lost row never blocks the operation it describes."""
     __tablename__ = "self_heal_events"
     id = Column(String, primary_key=True, default=lambda: uid("sh"))
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)

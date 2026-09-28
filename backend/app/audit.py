@@ -1,14 +1,11 @@
 """Audit logging with a tamper-evident hash chain.
 
-entry_hash = sha256(prev_hash + the row's canonical fields), prev_hash is the
-previous row's entry_hash ("0"*64 for the first). Edit or delete any row and
-every hash after it breaks; verify_chain (GET /api/audit/verify-chain) looks
-for that. Just hash chaining for tamper evidence on an append-only log, no
-consensus or ledger.
+entry_hash = sha256(prev_hash + the row's canonical fields), prev_hash being the
+previous row's hash ("0"*64 for the first). Editing or deleting any row breaks
+every later hash, which verify_chain (GET /api/audit/verify-chain) detects.
 
-chain_seq orders the chain (ids are random) and is unique, so a concurrent
-writer raises IntegrityError and we retry against the new tail instead of
-mis-ordering it.
+chain_seq orders the chain and is unique, so a concurrent writer gets an
+IntegrityError and retries against the new tail.
 """
 import hashlib
 import logging
@@ -23,14 +20,8 @@ logger = logging.getLogger("sentinel.audit")
 GENESIS_HASH = "0" * 64
 _MAX_CHAIN_RETRIES = 5
 
-# Max length of `resource`. A failed login audits the submitted username, so
-# this takes unauthenticated attacker text: a 5,000-char username made a
-# 5,000-char row and the audit table (whitespace-nowrap) rendered 36,215px
-# wide. The rate limiter bounds how many attempts, not how big each row is.
-#
-# Here and not in the login route because every audit write goes through this
-# function. 512 is way above any real resource (uids are ~14 chars, the
-# longest is demo_reset's camera list).
+# Max length of `resource`. Failed logins audit the submitted username, which is
+# unauthenticated input, so every audit write is capped here.
 MAX_AUDIT_RESOURCE_CHARS = 512
 _TRUNCATION_MARKER = "...[truncated]"
 
@@ -65,9 +56,9 @@ def log_action(
 ):
     """Insert an audit row and extend the chain.
 
-    Retries on a chain_seq collision instead of corrupting the chain. If it
-    still can't land a link after a few tries it logs and returns: a missed
-    audit link must never block the operation being audited.
+    Retries on chain_seq collisions and lock errors. If a link still can't be
+    written it logs and returns: a missed audit link must never block the
+    operation being audited.
     """
     from datetime import datetime
 
@@ -98,9 +89,8 @@ def log_action(
             db.rollback()
             continue
         except OperationalError as exc:
-            # A camera worker held the write lock past the busy timeout. This
-            # used to escape as a 500 on whatever was being audited (upload,
-            # ack, download). Retried like a collision; other errors raise.
+            # Locked database (busy_timeout exceeded): retried like a collision.
+            # Other errors raise.
             if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                 raise
             db.rollback()
@@ -112,8 +102,8 @@ def log_action(
 
 def verify_chain(db: Session) -> dict:
     """Walk the chain and check every link. Returns {"valid", "checked",
-    "broken_at", "detail"}. Rows from before the chain existed (chain_seq
-    NULL) are reported as such, not skipped or counted as valid."""
+    "broken_at", "detail"}. Rows predating the chain (chain_seq NULL) are
+    reported as such, not counted as valid."""
     rows = db.query(models.AuditLog).order_by(models.AuditLog.chain_seq.asc()).all()
     unchained = [r for r in rows if r.chain_seq is None]
     chained = [r for r in rows if r.chain_seq is not None]

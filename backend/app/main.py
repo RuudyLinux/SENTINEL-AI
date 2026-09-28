@@ -69,26 +69,20 @@ def _cuda_available() -> bool:
 def _size_thread_pool(camera_count: int) -> int:
     """Threads the shared executor needs for this many cameras.
 
-    Each camera parks a thread on a blocking source.read(), in the same pool
-    as DB commits, inference and probes. Python's default min(32, cpu+4)
-    doesn't know about cameras, so past that they queue on each other and
-    flicker online/degraded with no error: a read waiting for a thread looks
-    just like one waiting for the camera.
+    Each camera can park a thread on a blocking read in the same pool as
+    inference and probes; Python's default size doesn't account for cameras,
+    and starved reads look exactly like dead streams.
     """
     if settings.worker_thread_pool_size > 0:
         return settings.worker_thread_pool_size
-    # Two per camera: each loop can hold one waiting for a frame or the GPU
-    # while its DB commit needs another. At one per camera, a camera that had
-    # already written couldn't get a thread to commit while every other
-    # writer sat in SQLite's 30s busy wait on its lock ("database is locked"
-    # everywhere with 30 cameras).
+    # Two per camera: a loop can wait on a frame or the GPU while another call
+    # of its own needs a thread.
     return max(32, min(settings.worker_thread_pool_max, 2 * camera_count + settings.worker_thread_pool_headroom))
 
 
 def _ignore_client_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-    """Windows' Proactor loop logs a full traceback (ConnectionResetError in
-    _call_connection_lost) every time a browser leaves an MJPEG stream.
-    Nothing failed. Swallow that one, pass everything else on."""
+    """Suppress the ConnectionResetError traceback Windows' Proactor loop logs
+    whenever a browser leaves an MJPEG stream; pass everything else on."""
     exc = context.get("exception")
     if isinstance(exc, ConnectionResetError) and "_call_connection_lost" in str(context.get("handle", "")):
         return
@@ -112,9 +106,8 @@ async def _install_thread_pool() -> None:
 
 
 def _mark_all_cameras_offline(db) -> int:
-    """No worker survives a restart, so every camera starts offline until its
-    worker reports in. Otherwise a camera online when the process was killed
-    stayed "online" with nothing behind it ("4/34 online" with 2 workers)."""
+    """Mark every camera offline at startup; no worker survives a restart, and
+    each one reports in as it connects."""
     reset = (
         db.query(models.Camera)
         .filter(models.Camera.status != "offline")
@@ -125,9 +118,9 @@ def _mark_all_cameras_offline(db) -> int:
 
 
 def _resume_local_workers(db) -> list[str]:
-    """Restart workers for local cameras (webcam, video_file, mock_vms).
-    rtsp/onvif and grid cameras need an operator start (POST /{id}/start).
-    Retired cameras never resume."""
+    """Restart workers for local cameras (webcam, video_file, mock_vms). RTSP,
+    ONVIF and grid cameras need an operator start or the supervisor. Retired
+    cameras never resume."""
     started = []
     for camera in db.query(models.Camera).filter(models.Camera.retired == False).all():  # noqa: E712
         if camera.source_type in ("webcam", "video_file", "mock_vms"):
@@ -162,10 +155,8 @@ async def _on_startup():
     ensure_columns("cameras", {"camera_group": "VARCHAR"}, backfill_defaults={"camera_group": "''"})
     ensure_columns("detections", {"appearance_signature": "JSON"})
     ensure_columns("zones", {"loitering_seconds": "FLOAT"})
-    # V2 plate pipeline fields on plates and tracks. Backfills have to be true
-    # of the old row: a pre-V2 plate was one single-frame read so
-    # reads_count=1, but track_id/plate_bbox/last_seen were never captured and
-    # stay NULL.
+    # V2 plate pipeline fields. Pre-V2 plates were single reads (reads_count=1);
+    # fields never captured then stay NULL.
     ensure_columns(
         "plates",
         {
@@ -204,9 +195,7 @@ async def _on_startup():
     # Audit chain. Old rows stay NULL and verify_chain() reports them as
     # unchained; a retroactive hash would vouch for writes it never saw.
     ensure_columns("audit_logs", {"chain_seq": "INTEGER", "prev_hash": "VARCHAR", "entry_hash": "VARCHAR"})
-    # ANPR explainability, NULL on old rows. corroborated especially isn't
-    # backfilled to true: those rows came from a pipeline that persisted on a
-    # single read. NULL = unknown, which is accurate.
+    # ANPR explainability fields; NULL on old rows means unknown.
     ensure_columns(
         "plates",
         {
@@ -214,9 +203,8 @@ async def _on_startup():
             "corroborated": "BOOLEAN", "plate_crop_path": "VARCHAR",
         },
     )
-    # Not backfilled to true either, old rows escalated on confidence alone.
-    # NULL = not corroborated, capping watchlist alerts at HIGH until a fresh
-    # corroborated sighting comes in.
+    # Not backfilled: NULL = not corroborated, so old sightings can't produce
+    # CRITICAL watchlist alerts.
     ensure_columns("vehicles", {"plate_corroborated": "BOOLEAN"})
     # every existing camera is active
     ensure_columns("cameras", {"retired": "BOOLEAN NOT NULL DEFAULT 0"})
@@ -233,8 +221,8 @@ async def _on_startup():
     ensure_indexes("vehicles", ["plate_text", "last_seen"])
     ensure_indexes("alerts", ["risk_score", "vehicle_id"])
     ensure_indexes("incident_alerts", ["incident_id", "alert_id"])
-    # List sort keys and the per-alert correlation lookup; measured in
-    # alembic/versions/20260928_0600_list_and_lookup_indexes.py.
+    # List sort keys and the per-alert correlation lookup (see Alembic
+    # revision 20260928_0600).
     ensure_indexes("detections", [("camera_id", "timestamp")])
     ensure_indexes("alerts", ["timestamp"])
     ensure_indexes("audit_logs", ["timestamp"])
@@ -263,9 +251,8 @@ async def _on_startup():
         except Exception:
             logger.exception("startup: model warmup failed, cameras will load it on first use")
 
-    # Grid auto-connect: discover and register the catalogue (logged and
-    # skipped if the grid is down or unconfigured), then the supervisor keeps
-    # eligible cameras connected and reconnects drops. It never enables AI.
+    # Discover and register the grid catalogue (skipped if the grid is down or
+    # unconfigured); the supervisor then keeps cameras connected.
     await supervisor.discover_and_register()
     supervisor.start_supervisor()
 
@@ -276,14 +263,9 @@ async def _on_startup():
 async def _on_shutdown():
     # stops the sweep loop and the grid cameras it manages
     await supervisor.stop_supervisor()
-    # Local cameras were started directly at startup and aren't in
-    # AUTO_MANAGED, so stop everything left in RUNNING too (snapshot, since
-    # stop_worker pops). Otherwise their tasks and VideoCaptures leaked at exit.
-    #
-    # Each stop is guarded on its own so one bad cleanup doesn't stop the rest
-    # or blow up shutdown. And the tasks are awaited: cancel() only requests
-    # it, and the release in their finally only runs once they're scheduled
-    # again, which isn't guaranteed before uvicorn tears the loop down.
+    # Stop every remaining worker, including local cameras outside the
+    # supervisor, each guarded separately, and await the tasks so captures are
+    # released before the loop closes.
     pending_tasks = []
     for camera_id in list(RUNNING.keys()):
         try:
@@ -294,9 +276,7 @@ async def _on_shutdown():
             logger.exception("shutdown: stop_worker failed for camera %s, continuing", camera_id)
     if pending_tasks:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
-    # Workers are gone, now let their background work finish. A clip task
-    # waits up to clip_post_event_seconds before writing Evidence, and one
-    # killed with the loop loses evidence for a real alert (app/background.py).
+    # Let background work (event clips) finish so no alert loses its evidence.
     await background.drain(settings.shutdown_drain_seconds)
     # stop_worker already asked recordings to finish; wait so the files and
     # their evidence rows get written
@@ -318,9 +298,9 @@ def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str | None = None):
-    # Live detection/alert feed, so it needs auth. Browsers can't set an
-    # Authorization header on a WebSocket handshake, so the token comes as a
-    # query param (like the evidence/stream tokens) and is checked before accept.
+    # Authenticated live feed. Browsers can't set headers on a WebSocket
+    # handshake, so the token arrives as a query parameter and is checked
+    # before accept.
     db = SessionLocal()
     try:
         user = get_user_from_token(token, db)
@@ -329,9 +309,8 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = None):
     if user is None:
         await ws.close(code=4401)
         return
-    # Checked once at the handshake, and a socket lives as long as the tab, so
-    # an expired 8h token kept getting events forever. Close when the token
-    # expires (same as MJPEG); the client reconnects with its current token.
+    # Close the socket when the token expires; the client reconnects with its
+    # current token.
     deadline = resource_token_expiry(token)
     await manager.connect(ws)
     try:

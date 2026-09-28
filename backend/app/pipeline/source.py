@@ -1,6 +1,5 @@
-"""CameraSource: the stable class worker.py, routers/cameras.py and tests use,
-delegating to the adapters in pipeline/adapters.py (doc §48). A new vendor
-adapter goes there, nothing here changes.
+"""CameraSource: the stable interface used by worker.py, routers and tests,
+delegating to pipeline/adapters.py. New vendor adapters go there.
 """
 import cv2
 import numpy as np
@@ -8,10 +7,8 @@ import numpy as np
 from ..config import settings
 from .adapters import CameraAdapter, get_adapter
 
-# cv2/settings aren't used below but test_source_rtsp.py patches them through
-# this module (source_mod.cv2.VideoCapture, source_mod.settings.*); cv2 is the
-# same module object adapters.py imports, which is what the test relies on.
-# Plain pyflakes ignores noqa, hence the explicit reference.
+# cv2 and settings are re-exported because test_source_rtsp.py patches them
+# through this module; the explicit reference keeps pyflakes quiet.
 _ = (cv2, settings)
 
 

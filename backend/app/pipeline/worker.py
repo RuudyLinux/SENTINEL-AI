@@ -1,12 +1,8 @@
-"""Per-camera background task: frames -> YOLO detection -> ANPR -> persist ->
-rules -> broadcast. Runs against a webcam, RTSP stream or uploaded video file
-(see source.py).
+"""Per-camera background task: frames -> detection -> ANPR -> persist -> rules
+-> broadcast, for any source type (see source.py).
 
-State machine, reconnect logic and frame helpers live in camera_state.py,
-camera_connection.py, db_helpers.py and frame_utils.py; their names are
-re-exported below because routers and tests import them from here.
-_process_frame and _camera_loop stay together on purpose: they're one control
-flow sharing one session, and the ANPR helpers are only reached from there.
+State, reconnect and frame helpers live in camera_state.py, camera_connection.py,
+db_helpers.py and frame_utils.py and are re-exported here for existing imports.
 """
 import asyncio
 import logging
@@ -58,15 +54,10 @@ VIEWERS: dict[str, int] = {}
 def is_watched(camera_id: str) -> bool:
     return VIEWERS.get(camera_id, 0) > 0 or recorder.is_recording(camera_id)
 
-# Both JPEGs made from a frame are consumed at no more than this rate: MJPEG
-# sends at most 10 frames/s (routers/streams.py) and clips encode at their
-# capture rate (clips._playback_fps). Encoding every source frame on the event
-# loop cost ~30 ms per 1080p frame, ~68% of the loop at 23 fps for ONE camera.
-# Measured 2026-09-28.
+# Upper bound on how often a frame is JPEG-encoded for preview and clips; MJPEG
+# serves at most 10 frames/s and encoding every source frame is expensive.
 _PREVIEW_INTERVAL_S = 0.1
-# Nobody watching (no MJPEG viewer, no recording): refresh the preview this
-# often, just so snapshots and the demo have a recent frame. With 30 cameras
-# connected the 10/s preview encodes were CPU nobody looked at.
+# Preview refresh interval when nobody is watching, so snapshots stay recent.
 _IDLE_PREVIEW_INTERVAL_S = 2.0
 # Loop period for a camera running neither AI nor a viewer: only the
 # heartbeat and the occasional preview need a frame.
@@ -85,10 +76,8 @@ def _encode_annotated(frame: np.ndarray, detections: list[dict[str, Any]]) -> "b
 
 VEHICLE_CLASSES = ("car", "truck", "bus", "motorbike")
 
-# Fields an upsert may mutate on an already-persistent row. Rollback expires a
-# persistent object's changes back to the last committed values (it doesn't
-# just detach it like a new object), so a retry reassigns these from values
-# captured before the rollback. re-add() alone would restore the stale row.
+# Fields an upsert may change on an existing row. Rollback reverts them to the
+# committed values, so a retry reassigns them from values captured beforehand.
 _PLATE_REAPPLY_FIELDS = (
     "confidence", "plate_text_normalized", "plate_text_raw", "reads_count",
     "last_seen", "snapshot_path", "plate_bbox", "vehicle_bbox",
@@ -114,14 +103,10 @@ async def _read_plate_for_track(
 ) -> "tuple[Any, list[float] | None, np.ndarray | None]":
     """Localize a plate in a vehicle crop and read it.
 
-    Returns (OcrRead, full-frame plate bbox or None, plate crop or None).
-
-    Only the best detected region is read, since each extra region is a full
-    OCR pass. Perspective correction only fires on a skewed quad. If the
-    localized read fails the gate, the whole vehicle crop is read as a
-    fallback: localization sometimes returns a sub-region of the plate and OCR
-    then reads nothing (exact match 0.16 -> 0.04 on the labelled corpus, see
-    docs/ANPR_ACCURACY.md). The fallback only costs anything on failure.
+    Returns (OcrRead, full-frame plate bbox or None, plate crop or None). Only
+    the best region is read. If the localized read fails the gate, the whole
+    vehicle crop is read as a fallback, since localization can return a partial
+    plate (see docs/ANPR_ACCURACY.md).
     """
     metrics.PLATE_DETECT_ATTEMPTS.labels(camera_code=camera_code).inc()
     detect_started = time.monotonic()
@@ -150,9 +135,8 @@ async def _read_plate_for_track(
                 box.x1 + offset_x, box.y1 + offset_y, box.x2 + offset_x, box.y2 + offset_y,
             ]
     if not variants and plate_detector.get_plate_model() is not None and not settings.plate_whole_crop_fallback_with_model:
-        # Trained detector found no plate, so nothing legible. Whole-crop OCR
-        # here was ~200ms per vehicle per frame for reads that almost never
-        # passed the gate (see config.plate_whole_crop_fallback_with_model).
+        # The trained detector found no plate; whole-crop OCR is rarely worth its
+        # cost here (config.plate_whole_crop_fallback_with_model).
         return OcrRead(raw="", normalized="", confidence=0.0, variant="", variants_agreeing=0, variant_count=0), None, None
     if not variants:
         # no plate region: read the whole vehicle crop. plate_bbox stays None
@@ -188,15 +172,10 @@ def _better_structured_read(first, second):
 async def _anpr_ocr(
     detection: dict[str, Any], frame: np.ndarray, camera_id: str, camera_code: str,
 ) -> "dict[str, Any] | None":
-    """The OCR half of ANPR: the slow part, no database.
+    """The OCR half of ANPR, with no database access.
 
-    Run BEFORE the detection row is flushed. The flush opens SQLite's single
-    write transaction until the per-detection commit, and OCR sitting inside it
-    held the write lock for seconds per read. API requests and clip writes then
-    hit the 30s busy timeout ("database is locked"), seen live as a 500 on
-    camera creation and as lost event clips.
-
-    Returns None for an empty crop, else the inputs _run_anpr needs.
+    Runs before the detection is flushed so slow OCR never holds SQLite's write
+    lock. Returns None for an empty crop, else the inputs _run_anpr needs.
     """
     x1, y1, x2, y2 = [max(0, int(v)) for v in detection["bbox"]]
     crop = frame[y1:y2, x1:x2]
@@ -205,9 +184,7 @@ async def _anpr_ocr(
     raw_track_id = detection.get("track_id")
     if not settings.plate_pipeline_v2 or raw_track_id is None:
         raw, normalized, conf = await asyncio.to_thread(read_plate, crop)
-        # The snapshot _run_anpr will attach, saved now for the same reason as
-        # the OCR: inside the transaction this thread hop held the write lock
-        # while it queued behind other cameras' inference.
+        # Saved here, outside the write transaction, like the OCR.
         snapshot_path = (
             await asyncio.to_thread(_save_snapshot, frame, camera_code)
             if passes_anpr_gate(normalized, conf) else None
@@ -239,10 +216,9 @@ async def _anpr_ocr(
             # the reverify interval instead of retrying every cycle
             plate_tracker.mark_ocr_attempt(camera_id, track_id)
 
-    # A new sighting gets one snapshot (see _run_anpr). Decided from tracker
-    # state only, the same conditions _run_anpr checks before it saves: a
-    # winning read, consensus if strict mode wants it, and no row yet (no row
-    # means should_persist is True).
+    # A new sighting gets one snapshot, saved before any write. These are the
+    # conditions _run_anpr checks: a winning read, consensus in strict mode,
+    # and no sighting row yet.
     snapshot_path = plate_crop_path = None
     best = state.best()
     if (
@@ -264,12 +240,9 @@ async def _run_anpr(
 ) -> "tuple[models.Vehicle | None, models.Plate | None, str | None]":
     """ANPR for one vehicle detection. Returns (vehicle, plate_row, snapshot_path).
 
-    V2 (default) needs a ByteTrack id: OCR runs only while the track still
-    needs a read, reads vote instead of overwriting, and there's one sighting
-    row per (camera, track) that gets updated.
-
-    Legacy (PLATE_PIPELINE_V2=false, or no track id yet on an object's first
-    frames): whole crop to OCR, one row per passing frame, same as before V2.
+    V2 (default, needs a track id): OCR only while the track needs a read, reads
+    are voted, one sighting row per (camera, track). Legacy (V2 off, or no track
+    id yet): one row per passing frame.
     """
     # ocr is _anpr_ocr's result when the caller ran it outside the write
     # transaction (the frame loop always does). False = run it here
@@ -309,9 +282,8 @@ async def _run_anpr(
     if best is None:
         return None, None, None
     plate_text, peak_confidence, reads = best
-    # A plate is only trusted once enough frames agree. An uncorroborated read
-    # is still recorded (a car crossing in one cycle is real) but goes to
-    # pending_review, so one lucky frame can't pose as a settled identity.
+    # An uncorroborated read is recorded but goes to pending_review, so a single
+    # lucky frame can't pose as a settled identity.
     corroborated = plate_tracker.has_consensus(camera_id, track_id)
     if not corroborated and settings.plate_require_consensus:
         # strict mode, operator wants nothing uncorroborated
@@ -366,9 +338,8 @@ async def _process_frame(
     db: Session, camera: models.Camera, frame: np.ndarray, frame_idx: int, w: int, h: int,
     frame_source_ts: datetime | None, last_detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Inference (every detect_every_n_frames), ANPR, persistence and alerting
-    for one frame. Returns the detections to draw on the MJPEG frame and pass
-    back in next time."""
+    """Inference, ANPR, persistence and alerting for one frame. Returns the
+    detections to draw on the preview and pass back in next time."""
     # Column()-style models type attributes as Column[T] for a checker; at
     # runtime they're plain values. The casts are for the checker only.
     camera_id = str(camera.id)
@@ -377,9 +348,7 @@ async def _process_frame(
     want_vehicle = bool(camera.ai_vehicle)
     ai_enabled = want_person or want_vehicle
 
-    # Connected with AI off must cost nothing past decode/MJPEG, so skip
-    # detect_and_track entirely.
-    # No free AI slot (pipeline/ai_capacity.py) = stream without inference.
+    # AI off, or no free AI slot (ai_capacity.py): stream without inference.
     if ai_enabled and not ai_capacity.try_acquire(camera_id):
         ai_enabled = want_person = want_vehicle = False
         if not _stats(camera_id).get("ai_blocked"):
@@ -411,10 +380,9 @@ async def _process_frame(
             anpr_wanted = bool(camera.ai_anpr) and d["cls"] in VEHICLE_CLASSES
             # OCR first, while no write transaction is open (see _anpr_ocr)
             ocr = await _anpr_ocr(d, frame, camera_id, camera_code) if anpr_wanted else None
-            # Cross-camera appearance signature, also before the write: an
-            # await inside the transaction holds SQLite's write lock while it
-            # waits for a thread. Visual similarity only, never identity; a
-            # failure leaves it null and the detection stays.
+            # Appearance signature (visual similarity only, never identity),
+            # computed before the write for the same reason as OCR. A failure
+            # leaves it null.
             signature = None
             if d["cls"] == "person":
                 try:
@@ -430,10 +398,8 @@ async def _process_frame(
                 appearance_signature=signature,
             )
             db.add(det_row)
-            # A real write (assigns det_row's id). Unguarded, a lock here fell
-            # through to the loop's outer except and dropped the detection.
-            # If it still fails after retries, skip this one detection and
-            # keep the rest of the frame.
+            # Flush assigns det_row's id. If it still fails after retries, skip
+            # this detection and keep the rest of the frame.
             flushed = await _safe_flush(db, camera_code, reapply=lambda _det_row=det_row: db.add(_det_row))
             if not flushed:
                 continue
@@ -450,9 +416,8 @@ async def _process_frame(
                     snapshot_path = anpr_snapshot
                     det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
 
-            # A tracked vehicle is worth a Track row whether or not its plate
-            # was read; vehicle_id gets filled in once the plate identifies it.
-            # Throttled by should_persist_track.
+            # Tracked vehicles get a Track row whether or not the plate is read;
+            # vehicle_id is filled in later. Throttled by should_persist_track.
             if settings.plate_pipeline_v2 and d["cls"] in VEHICLE_CLASSES and d.get("track_id") is not None:
                 track_key = str(d["track_id"])
                 plate_tracker.touch(camera_id, track_key)
@@ -471,17 +436,9 @@ async def _process_frame(
                         logger.exception("camera %s: track upsert failed for track %s", camera_code, track_key)
                         track_row = None
 
-            # One commit per detection, not per frame. Tried per-frame to cut
-            # WAL growth; holding the transaction across a whole frame's OCR and
-            # snapshot awaits caused real "database is locked" with 2 cameras.
-            # WAL growth is handled by wal_autocheckpoint in db.py instead.
-            #
-            # Retry-with-reapply (see db_retry.py): det_row/plate_row may be
-            # new objects, which rollback just detaches, so re-add() restores
-            # them. vehicle can be an existing row whose last_seen and
-            # plate_confidence were just changed (correlate.py); rollback
-            # expires those, so reapply sets them from values captured here,
-            # never by re-reading vehicle.* (could be the stale value).
+            # One commit per detection keeps each write transaction short.
+            # On retry, new objects are re-added and changed fields on existing
+            # rows are restored from the values captured here (see db_retry.py).
             vehicle_target_last_seen = vehicle.last_seen if vehicle is not None else None
             vehicle_target_confidence = vehicle.plate_confidence if vehicle is not None else None
             # V2 plate_row/track_row can be existing rows updated in place too,
@@ -504,10 +461,8 @@ async def _process_frame(
 
             await _safe_commit(db, camera_code, reapply=_reapply_detection_commit)
 
-            # A watchlisted vehicle's detection needs a snapshot for the alert
-            # evaluate() is about to raise. Saved after the commit: taken
-            # between the flush and the commit, this thread hop held the write
-            # lock while it waited for a free thread.
+            # Watchlist alerts need a snapshot; taken after the commit so the
+            # file write never happens inside the transaction.
             if not snapshot_path and vehicle is not None and bool(vehicle.watchlist_flag):
                 snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
                 det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
@@ -521,9 +476,8 @@ async def _process_frame(
                 incident = find_incident_for_alert(db, str(alert.id))
                 event_type = "watchlist_match" if bool(alert.vehicle_id) else "zone_entry"
 
-                # rules_engine only attaches a snapshot if the detection already
-                # had one (ANPR/watchlist path). A plain zone_entry alert needs
-                # one from this same frame. Existing snapshot_path skips this.
+                # A zone alert without an ANPR/watchlist snapshot gets one from
+                # this frame.
                 if not alert.snapshot_path:
                     evidence_snapshot_path = await asyncio.to_thread(_save_snapshot, frame, f"{camera_code}_{alert.id}")
                     # alert and det_row are both committed by now, so rollback
@@ -562,9 +516,8 @@ async def _process_frame(
 
                     await _safe_commit(db, camera_code, reapply=_reapply_evidence_commit)
 
-                # Registered so shutdown drains it. It waits up to
-                # clip_post_event_seconds before writing Evidence, and an
-                # untracked task got killed by the closing loop.
+                # Tracked so shutdown waits for it; it writes Evidence after the
+                # post-event window.
                 background.spawn(
                     clips.build_event_clip(
                         camera_id, camera_code, str(alert.id), str(det_row.id),
@@ -666,9 +619,7 @@ async def _camera_loop(camera_id: str) -> None:
             setattr(camera, "fps", initial_fps),
             setattr(camera, "resolution", initial_resolution),
         ))
-        # Cached instead of read off camera.* each iteration: rollback expires
-        # every attribute, and a bare read then triggers an implicit reload.
-        # These don't change for the session (fps is refreshed on reconnect).
+        # Cached so a read after rollback doesn't trigger an implicit reload.
         camera_fps_cached = float(camera.fps)  # type: ignore[arg-type]  # Column() attr, plain float at runtime
         camera_source_type_cached = str(camera.source_type)
         camera_code_cached = str(camera.camera_code)
@@ -680,14 +631,11 @@ async def _camera_loop(camera_id: str) -> None:
         st = _stats(camera_id)
         st["started_at"] = session_opened_at.isoformat()
         last_loop_end = time.monotonic()
-        # Committing last_frame_at/status every frame was the main source of
-        # SQLite write pressure with 2+ cameras. 1s was still too much with 5+,
-        # hence 2s. Detections/alerts still commit immediately.
+        # Heartbeat writes are throttled; detections and alerts commit at once.
         HEARTBEAT_MIN_INTERVAL_S = 2.0
         last_heartbeat_commit_at = 0.0
-        # With expire_on_commit=False (db.py) `camera` never sees another
-        # session's commit, so a PATCH to ai_person/ai_vehicle would stay
-        # invisible until reconnect. Refreshed on the heartbeat cadence.
+        # expire_on_commit is off (db.py), so AI flags changed by another
+        # session are refreshed explicitly on the heartbeat cadence.
         last_ai_refresh_at = 0.0
         last_preview_at = 0.0
         last_ring_at = 0.0
@@ -703,12 +651,7 @@ async def _camera_loop(camera_id: str) -> None:
         st["frames_dropped"] = 0
         st["frame_age_ms"] = None
         while True:
-            # The whole iteration is guarded. With only the processing half
-            # wrapped, a worker could still die silently: an implicit SELECT
-            # from a bare attribute read after commit could hit "database is
-            # locked" with 2+ cameras. Root cause fixed in db.py
-            # (expire_on_commit=False); this keeps any new call site from
-            # bringing it back.
+            # Every iteration is guarded so one failure never ends the worker.
             loop_sleep_s = 1.0
             try:
                 t_read0 = time.monotonic()
@@ -736,11 +679,8 @@ async def _camera_loop(camera_id: str) -> None:
                         status_changed = camera.status != _DB_STATUS_FOR_GRID_STATE[new_state]
                         camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
                         _set_grid_state(camera_id, new_state)
-                        # The status change commits now. A failing stream then
-                        # retries every second, and committing each error_count
-                        # bump was one write transaction per second per camera
-                        # (29 degraded grid cameras, ~29/s); the count rides the
-                        # heartbeat cadence instead and lands with the next commit.
+                        # Commit status changes immediately; error_count bumps
+                        # ride the heartbeat cadence to limit write volume.
                         now_fail = time.monotonic()
                         if status_changed or now_fail - last_heartbeat_commit_at >= HEARTBEAT_MIN_INTERVAL_S:
                             await _safe_commit(db, camera_code_cached, reapply=lambda: (
@@ -750,11 +690,8 @@ async def _camera_loop(camera_id: str) -> None:
                             last_heartbeat_commit_at = now_fail
                         loop_sleep_s = 1.0
                     else:
-                        # Stream really dropped, reconnect with backoff.
-                        # The old reader releases its capture itself once its
-                        # current read returns; a fresh source object means
-                        # nothing here touches a capture another thread may
-                        # still be reading.
+                        # Stream dropped: reconnect with backoff. The old reader
+                        # releases its capture itself, so use a fresh source.
                         reader.stop()
                         reader = None
                         source = CameraSource(camera_source_type_cached, str(camera.source_uri))
@@ -785,9 +722,7 @@ async def _camera_loop(camera_id: str) -> None:
                         st["frames_dropped"] += max(0, got.seq - last_seq - 1)
                     last_seq = got.seq
                     st["frame_age_ms"] = round(got.age_ms, 1)
-                    # CONNECTED = frames flowing, AI off. PROCESSING = frames +
-                    # AI on. Throttled refresh so a PATCH from another request
-                    # shows up; _process_frame reads the same camera object.
+                    # CONNECTED = frames, AI off; PROCESSING = frames with AI.
                     now_mono_ai = time.monotonic()
                     if now_mono_ai - last_ai_refresh_at >= HEARTBEAT_MIN_INTERVAL_S:
                         db.refresh(camera, attribute_names=["ai_person", "ai_vehicle", "ai_anpr"])
@@ -828,10 +763,8 @@ async def _camera_loop(camera_id: str) -> None:
                         annotated_jpeg = await asyncio.to_thread(_encode_annotated, frame, last_detections)
                         if annotated_jpeg is not None:
                             LATEST_FRAMES[camera_id] = annotated_jpeg
-                    # Busiest commit in the pipeline, and the top source of
-                    # "database is locked" in real logs. Retried in place so a
-                    # transient lock doesn't reach the outer except and flip a
-                    # healthy camera to ERROR over a heartbeat write.
+                    # Retried in place so a transient lock doesn't flip a
+                    # healthy camera to ERROR.
                     heartbeat_last_frame_at = datetime.now(timezone.utc)
                     camera.last_frame_at = heartbeat_last_frame_at  # type: ignore[assignment]
                     # No _set_grid_state here: desired_state above already set
@@ -844,9 +777,8 @@ async def _camera_loop(camera_id: str) -> None:
                             setattr(camera, "status", heartbeat_status),
                         ))
                         last_heartbeat_commit_at = now_mono
-                    # With AI, no pacing: next_frame blocks until a newer frame
-                    # and inference sets the pace. Without AI, only a viewer
-                    # needs the preview rate; otherwise idle along.
+                    # With AI, inference sets the pace. Without it, only a viewer
+                    # needs the preview rate.
                     if ai_currently_enabled:
                         loop_sleep_s = 0.0
                     else:
@@ -887,25 +819,20 @@ async def _camera_loop(camera_id: str) -> None:
         pass
     finally:
         if reader is not None:
-            # Reader owns `source` and releases it on its own thread. Wait a
-            # bit so a normal stop really frees the capture; a read stuck on a
-            # dead stream finishes and releases after we return.
+            # The reader releases the source on its own thread; wait briefly so
+            # a normal stop frees the capture.
             reader.stop()
             await asyncio.to_thread(reader.join, 2.0)
         elif source is not None:
             source.release()
-        # Not db.close(): on cancel, a DB call already handed to a thread by
-        # to_thread keeps running, and close() raced it with
-        # IllegalStateChangeError. From a finally that escaped to the
-        # supervisor and marked a healthy camera OFFLINE on a normal stop.
-        # close_session waits for the thread and never raises.
+        # close_session waits for any DB call still running in a thread; a bare
+        # close() can race it on cancellation.
         close_session(db)
 
 
 async def _camera_loop_supervised(camera_id: str) -> None:
-    """Last safety net around _camera_loop. If anything still escapes, log it
-    with a traceback and mark the camera offline instead of letting the task
-    vanish."""
+    """Safety net around _camera_loop: log anything that escapes and mark the
+    camera offline."""
     try:
         await _camera_loop(camera_id)
     except Exception as exc:
@@ -941,10 +868,8 @@ async def _camera_loop_supervised(camera_id: str) -> None:
         except Exception:
             logger.exception("camera %s: could not mark offline after top-level crash", camera_id)
     finally:
-        # A worker that ends on its own must free its AI slot, or AI stays
-        # blocked everywhere (seen live: a camera that failed to open kept the
-        # only slot). Skip if a newer worker for this camera already started,
-        # a restart cancels us after the new task may hold the slot.
+        # Free the AI slot when the worker ends on its own, unless a newer worker
+        # for this camera already holds it.
         if RUNNING.get(camera_id) in (None, asyncio.current_task()):
             ai_capacity.release(camera_id)
 
@@ -957,12 +882,10 @@ def start_worker(camera_id: str) -> None:
 
 
 def stop_worker(camera_id: str) -> "asyncio.Task[None] | None":
-    """Cancel the camera's task and release its per-camera resources.
+    """Cancel the camera's task and release its resources.
 
-    Returns the cancelled task (None if not running) so shutdown can await it.
-    cancel() only requests cancellation; the task's finally (source release)
-    runs when it's next scheduled, which may never happen if the loop is torn
-    down first, leaving a VideoCapture orphaned."""
+    Returns the cancelled task (or None) so shutdown can await its cleanup.
+    """
     task = RUNNING.pop(camera_id, None)
     if task:
         task.cancel()
@@ -972,9 +895,7 @@ def stop_worker(camera_id: str) -> "asyncio.Task[None] | None":
     clips.release_camera(camera_id)
     plate_tracker.release_camera(camera_id)
     recorder.request_stop(camera_id, "camera stopped")  # the file is finished and kept
-    # the loop's cancel path never touches grid_state, so a stopped camera
-    # kept showing CONNECTED/PROCESSING in the grid. Only this call knows the
-    # operator asked to stop.
+    # Only an operator stop resets grid_state; the cancel path doesn't.
     if camera_id in CAMERA_STATS:
         _set_grid_state(camera_id, "DISCONNECTED")
     return task

@@ -24,15 +24,10 @@ def list_alerts(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Most recent alerts, filtered by any mix of the params.
+    """Most recent alerts, filtered by any combination of the parameters.
 
-    limit defaults to 200 (what the Alert Center always showed) but is now
-    settable, bounded like the other lists: ge=1 because SQLite reads
-    LIMIT -1 as no limit, le=500 so one request can't scan the table.
-
-    camera_id filters server side. The per-camera view used to filter the
-    200 most recent system-wide on the client, so a camera with older alerts
-    showed an empty list, same as one with none.
+    limit is bounded (ge=1 because SQLite treats LIMIT -1 as unlimited; le=500).
+    camera_id filters server side.
     """
     q = db.query(models.Alert)
     if severity:

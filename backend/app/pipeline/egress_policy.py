@@ -1,27 +1,14 @@
 """Optional egress policy for operator-supplied camera sources.
 
-docs/THREAT_MODEL.md had camera SSRF mitigated by role only: an authorized
-operator could still point the backend at any internal host. Probing showed
-nothing leaks (loopback, 0.0.0.0, link-local, ::1 and junk URIs all fail the
-same way after the same timeout) but reach itself wasn't limited.
+When camera_source_block_private_networks is on, sources resolving to
+loopback, private, link-local, reserved or multicast addresses are refused.
+Off by default because camera networks live on those ranges and the endpoints
+already require an authorized role.
 
-Opt-in via camera_source_block_private_networks, off by default: real
-camera networks live on the private ranges this blocks, and the user is
-already authorized. Turn it on where the backend must never reach internal
-infrastructure.
-
-Limits:
-- DNS rebinding isn't prevented. We resolve here and FFmpeg resolves again
-  when opening; a name that flips from public to private in between gets
-  through. Fixing that needs pinning the address at connect time and
-  OpenCV has no hook for it.
-- Only network source types are checked (webcam, video_file and mock_vms
-  don't touch the network).
-- A URI with no parseable host isn't blocked; there's nothing to connect to
-  and the open timeout handles it.
-
-Defence in depth on top of the role check, not a replacement for real
-egress filtering on the host.
+Limits: DNS rebinding isn't prevented (FFmpeg resolves the name again when
+opening); only network source types are checked; a URI without a parseable
+host isn't blocked. Defence in depth, not a substitute for host egress
+filtering.
 """
 from __future__ import annotations
 
@@ -36,7 +23,7 @@ NETWORK_SOURCE_TYPES = {"rtsp", "onvif", "http", "https", "sentinel_grid"}
 
 
 def _candidate_host(source_uri: str) -> str | None:
-    """Best-effort host. None when the URI has no network host (file path,
+    """Best-effort host, or None for a URI with no network host (file path,
     webcam index, bare grid id)."""
     if not source_uri:
         return None
@@ -49,8 +36,8 @@ def _candidate_host(source_uri: str) -> str | None:
 
 
 def _resolved_addresses(host: str) -> list[ipaddress._BaseAddress]:
-    """All addresses the host resolves to (a literal IP is itself). Failure
-    gives [], nothing to judge."""
+    """All addresses the host resolves to (a literal IP resolves to itself);
+    [] if resolution fails."""
     try:
         ipaddress.ip_address(host)
         return [ipaddress.ip_address(host)]
@@ -83,11 +70,10 @@ def _classify(address) -> str | None:
 
 
 def blocked_reason(source_type: str, source_uri: str) -> str | None:
-    """Why this source must not be opened, or None.
+    """Reason this source must not be opened, or None.
 
-    None when the policy is off, the type has no network, there's no host,
-    or every address is public. Any off-limits address refuses it; a name
-    resolving to both public and private is what rebinding looks like.
+    Any off-limits address refuses the source, including a name that resolves
+    to both public and private addresses.
     """
     if not settings.camera_source_block_private_networks:
         return None

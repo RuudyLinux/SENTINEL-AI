@@ -70,9 +70,8 @@ class NearbyCameraOut(BaseModel):
 
 
 class CameraUpdate(BaseModel):
-    """PATCH payload. Only fields present in the request get applied
-    (exclude_unset). No source_type/source_uri: changing the source is a
-    reconnect, not an edit."""
+    """PATCH payload; only fields present are applied. The source can't be
+    edited: changing it is a reconnect."""
     name: Optional[str] = None
     location: Optional[str] = None
     camera_group: Optional[str] = None
@@ -107,9 +106,8 @@ class CameraOut(BaseModel):
     # REC button running for this camera (pipeline/recorder.py)
     recording: bool = False
     last_frame_at: Optional[datetime] = None
-    # In-memory lifecycle state from CAMERA_STATS, attached by the camera
-    # routes. Null if the worker never ran in this process. Not the same as
-    # `status`, the DB column (online/offline/degraded only).
+    # In-memory lifecycle state (CAMERA_STATS), null if the worker never ran.
+    # Distinct from `status`, the DB column (online/offline/degraded).
     grid_state: Optional[str] = None
     reconnect_count: Optional[int] = None
     last_error: Optional[str] = None
@@ -164,9 +162,7 @@ class PlateOut(BaseModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     corrected_text: Optional[str] = None
-    # ANPR explainability, kept apart from `confidence`: winning variant,
-    # variants agreeing, corroborated across frames, the crop OCR read.
-    # Null on rows from before these existed.
+    # ANPR explainability, separate from `confidence`. Null on older rows.
     ocr_variant: Optional[str] = None
     variants_agreeing: Optional[int] = None
     corroborated: Optional[bool] = None
@@ -197,11 +193,9 @@ class VehicleOut(BaseModel):
 
 
 class SightingOut(BaseModel):
-    """One hop in a vehicle's journey across cameras.
-
-    Only observations at cameras. No interpolated position, heading or speed;
-    we know where cameras saw it and when, nothing in between. It's a
-    camera-to-camera path, not a GPS track.
+    """One hop in a vehicle's journey across cameras: where and when a camera saw
+    it. A camera-to-camera path, not a GPS track (no interpolated position,
+    heading or speed).
     """
     camera_id: str
     camera_code: str
@@ -320,9 +314,8 @@ class AlertOut(BaseModel):
     # the detection that fired the rule
     detection_id: Optional[str] = None
     confidence: float
-    # Coerced, not just typed. These are nullable JSON columns and one NULL
-    # row failed response validation for the whole list, blanking the Alert
-    # Center. No reasons recorded = empty list.
+    # Coerced so a NULL in these nullable JSON columns becomes an empty list
+    # instead of failing validation for the whole response.
     reasons: List[str] = []
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
@@ -379,9 +372,7 @@ class IncidentOut(BaseModel):
 
 
 class IncidentNoteCreate(BaseModel):
-    # A plain str took a 2,000,000-char note (200 OK) that any logged-in user
-    # could store over and over and the timeline had to render. 5000 is plenty
-    # for a real case note.
+    # Bounded so a single note can't be arbitrarily large.
     text: str = Field(min_length=1, max_length=5000)
 
 

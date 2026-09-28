@@ -22,8 +22,8 @@ router = APIRouter(prefix="/api/streams", tags=["streams"])
 
 @router.get("/{camera_id}/stream-token")
 def get_stream_token(camera_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Hands out a signed token for the mjpeg/snapshot endpoints below, which
-    browsers load via <img src> without a bearer header (same as evidence)."""
+    """Issue a signed token for the MJPEG/snapshot endpoints, which browsers load
+    via <img src> without a bearer header."""
     camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -31,22 +31,15 @@ def get_stream_token(camera_id: str, db: Session = Depends(get_db), user: models
 
 
 def _stream_deadline(token: str) -> datetime:
-    """When this stream has to stop, always a real deadline.
-
-    resource_token_expiry gives None for anything it can't decode, expired
-    tokens included since decoding checks exp. None as "no deadline" would
-    fail open on exactly that, so fall back to the configured TTL from now.
+    """Deadline for this stream. Falls back to the configured TTL when the token
+    can't be decoded, so it never fails open.
     """
     return resource_token_expiry(token) or (datetime.utcnow() + timedelta(seconds=settings.stream_token_ttl_seconds))
 
 
 async def _mjpeg_generator(camera_id: str, deadline: datetime):
-    """Frames until the authorizing token expires.
-
-    The token is checked once when the stream opens and MJPEG never ends on
-    its own, so a one-hour token kept streaming for days in an open tab, even
-    after the account was disabled. Ending the stream is the enforcement: the
-    client has to fetch a new token, which reruns the RBAC check.
+    """Stream frames until the authorising token expires. Ending the stream
+    forces the client to fetch a new token, which re-runs the RBAC check.
     """
     boundary = b"--frame"
     # counted so the camera loop encodes the preview at full rate only while
@@ -69,12 +62,9 @@ async def _mjpeg_generator(camera_id: str, deadline: datetime):
 
 
 def _authorize_stream(camera_id: str, token: str, require_camera: bool) -> None:
-    """Check the token on a short-lived session and let it go.
-
-    Not Depends(get_db): FastAPI keeps a dependency open until the response
-    completes, and these run for hours. Each viewer pinned a pool connection
-    for its whole stream, so a wall of tiles could drain the pool and stall
-    the whole API while only reading JPEG bytes from a dict.
+    """Check the token on a short-lived session and release it. Not
+    Depends(get_db): a dependency's session stays open for the whole response,
+    and a long stream would pin a pool connection.
     """
     db = SessionLocal()
     try:

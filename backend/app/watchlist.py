@@ -1,14 +1,9 @@
-"""Is a watchlist entry in force right now. Asked here and nowhere else.
+"""Whether a watchlist entry is in force right now; the single place this is
+decided (active and within its validity window).
 
-The four places that asked (rules_engine, correlate twice, incident summary)
-each checked `active == True` and ignored valid_until, so an entry with an
-end date kept matching forever.
-
-Vehicle.watchlist_flag is a cache of the answer: set when the vehicle is
-first seen and refreshed when its plate's entries change, so the UI and
-snapshot capture can check a bool instead of querying per frame. Anything
-that accuses (fires a watchlist alert, tells an investigator there's a
-match) must ask the entry through this module; a cache can be stale.
+Vehicle.watchlist_flag caches the answer for cheap UI and snapshot checks.
+Anything that accuses (raises a watchlist alert, reports a match to an
+investigator) must ask through this module, since a cache can be stale.
 """
 from datetime import datetime
 
@@ -28,9 +23,8 @@ def entries_in_force(db: Session, now: datetime | None = None) -> Query:
 
 
 def plate_entry_in_force(db: Session, plate_text: str | None, now: datetime | None = None):
-    """In-force plate entry for plate_text, or None. Identifiers are stored
-    normalized and callers pass normalized plates, so this compares like
-    with like.
+    """In-force plate entry for plate_text, or None. Both sides are normalized
+    plates.
     """
     if not plate_text:
         return None
@@ -42,9 +36,7 @@ def plate_entry_in_force(db: Session, plate_text: str | None, now: datetime | No
 
 def refresh_vehicle_flag(db: Session, vehicle, now: datetime | None = None) -> bool:
     """Recompute a vehicle's cached flag from the entries in force. Call it
-    whenever a plate's entries change; deactivation used to leave the flag
-    on forever (still "⚠ WATCHLIST", still prioritised, still snapshotted).
-    Doesn't commit.
+    whenever a plate's entries change. Doesn't commit.
     """
     if vehicle is None:
         return False

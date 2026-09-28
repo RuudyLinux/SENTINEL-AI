@@ -1,18 +1,14 @@
 """Per-track plate identity: votes across frames, and when to run OCR.
 
-Ties a ByteTrack track to the plate read off it, so one bad frame can't
-overwrite a good result, and so a car sitting at a signal updates one Plate
-row instead of adding one per cycle (get_route() builds journeys from those
-rows, so that used to mean dozens of fake hops).
-
-One accumulator per (camera_id, track_id). Reads vote by summed confidence,
-so four steady mid-confidence reads beat one lucky outlier. Reported
-confidence is the winner's peak:
+Each ByteTrack track accumulates its plate reads, so one bad frame can't
+overwrite a good result and a stationary car updates one Plate row instead of
+adding one per cycle. Reads vote by summed confidence; the reported confidence
+is the winner's peak:
 
     GJ05AB1234 @ 0.72, 0.91, 0.94, 0.89  ->  GJ05AB1234 @ 0.94, 4 reads
 
-In-memory and per-process, pruned like rules_engine._zone_presence. It's a
-cache; the Plate/Vehicle rows are the record, so a restart only costs re-OCR.
+In memory and per process: a cache in front of the Plate/Vehicle rows, so a
+restart only costs re-reading.
 """
 import time
 from dataclasses import dataclass, field
@@ -84,16 +80,12 @@ class TrackPlateState:
         return text, vote.peak_confidence, vote.reads
 
     def consensus(self) -> "Consensus | None":
-        """Winning text plus the signals behind it, or None if nothing read.
+        """Winning text and the signals behind it, or None if nothing was read.
 
-        peak_confidence: best OCR confidence ever seen for the text.
-        observations / total_observations: agreeing passing reads vs all.
-        agreement: their ratio; 4 of 4 is stronger than 2 of 4 at the same
-        confidence. competing_*: the runner-up, so an operator can see what
-        the track was torn between.
-
-        Not multiplied into a made-up probability; has_consensus looks at the
-        fields directly.
+        peak_confidence is the best OCR confidence seen for the text;
+        observations / total_observations count agreeing vs all passing reads
+        (agreement is their ratio); competing_* is the runner-up. The signals
+        are reported separately, not combined into one score.
         """
         best = self.best()
         if best is None:
@@ -118,8 +110,8 @@ class TrackPlateState:
         return sum(v.reads for v in self.votes.values())
 
     def is_stable(self) -> bool:
-        """Enough agreeing reads AND a high enough peak to stop re-OCRing
-        every cycle. Four reads at 0.36 are consistent but not trustworthy."""
+        """Enough agreeing reads and a high enough peak to stop re-reading every
+        cycle."""
         best = self.best()
         if best is None:
             return False
@@ -156,9 +148,8 @@ def touch(camera_id: str, track_id: str) -> TrackPlateState:
 
 
 def should_ocr(camera_id: str, track_id: str) -> bool:
-    """Whether to spend an OCR pass on this track this frame. Main CPU saving
-    in the pipeline: unsettled tracks get read every cycle, stable ones only
-    every plate_reverify_seconds (still catches a mid-track correction)."""
+    """Whether to spend an OCR pass on this track this frame. Unsettled tracks
+    are read every cycle, stable ones every plate_reverify_seconds."""
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is None or not state.is_stable():
         return True
@@ -177,9 +168,7 @@ def record_read(
     plate_crop=None,
 ) -> TrackPlateState:
     """Add one gate-passing read to the track's votes. Only gate-passing reads
-    belong here, or a steady misread of a bumper sticker could out-vote the
-    plate. variant/variants_agreeing are provenance and don't weight the vote
-    (that would count the same corroboration twice).
+    belong here. variant provenance doesn't weight the vote.
     """
     state = touch(camera_id, track_id)
     state.last_ocr_mono = time.monotonic()
@@ -205,27 +194,21 @@ def consensus(camera_id: str, track_id: str) -> "Consensus | None":
 
 
 def has_consensus(camera_id: str, track_id: str) -> bool:
-    """Whether the plate has enough frames behind it to be a trusted sighting.
+    """Whether the plate has enough agreeing frames to be a trusted sighting.
 
-    One plate-shaped but wrong read clearing the confidence floor used to
-    become a durable vehicle identity, and on the labelled corpus those reads
-    outnumber correct ones.
-
-    Not enough evidence doesn't mean throw it away: a car crossing in one
-    cycle only ever gets one read. It's persisted as untrusted and
-    review_status_for marks it pending_review however confident it was.
-    plate_require_consensus makes this a hard gate instead (off by default,
-    losing real sightings is worse). plate_min_observations=1 turns it off.
+    Without consensus the sighting is still persisted but marked
+    pending_review, since a car crossing in one cycle only gets one read.
+    plate_require_consensus makes this a hard gate; plate_min_observations=1
+    disables it.
     """
     result = consensus(camera_id, track_id)
     return result is not None and result.is_corroborated
 
 
 def should_persist(camera_id: str, track_id: str, new_read: bool) -> bool:
-    """Whether the sighting row needs a write this frame, instead of every
-    frame while the car is in view. Yes if: no row yet, a new read landed, the
-    vote winner changed, or the refresh interval passed (keeps last_seen and
-    dwell honest for a parked car).
+    """Whether the sighting row needs a write this frame: no row yet, a new read,
+    a changed vote winner, or the refresh interval elapsed (keeps last_seen
+    current for a parked car).
     """
     state = _TRACKS.get(_key(camera_id, track_id))
     if state is None:
@@ -241,9 +224,8 @@ def should_persist(camera_id: str, track_id: str, new_read: bool) -> bool:
 
 
 def mark_ocr_attempt(camera_id: str, track_id: str) -> None:
-    """OCR ran and got nothing usable. An unreadable track (truck rear, plate
-    out of frame, blur) never gets stable, so without the timestamp it'd be
-    re-OCR'd every cycle forever; this lets the reverify interval throttle it."""
+    """Record an OCR attempt that produced nothing usable, so an unreadable track
+    is re-read only at the reverify interval."""
     state = touch(camera_id, track_id)
     state.last_ocr_mono = time.monotonic()
 

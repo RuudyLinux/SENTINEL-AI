@@ -1,9 +1,8 @@
 """SHA-256 for evidence files.
 
-Taken at capture by the pipeline and compared later by the evidence API, so
-both have to use the same logic. Capture time because a digest only proves
-integrity if it was recorded before anyone could change the file; hashing on
-first inspection (what we used to do) proves nothing.
+Computed at capture by the pipeline and compared later by the evidence API, so
+both share this logic. A digest only proves integrity if it was recorded before
+anyone could change the file.
 """
 import hashlib
 import logging

@@ -1,12 +1,8 @@
 """Prometheus metrics for the pipeline and platform.
 
-Counters/histograms are bumped where the thing happens (an OCR pass, a DB
-write). Gauges are sampled at scrape time from state that already exists
-(worker.CAMERA_STATS, worker.RUNNING, ws clients, psutil), so there's no
-second measurement path.
-
-Module-level registration, process-global, which is how prometheus_client
-expects it.
+Counters and histograms are updated where events happen; gauges are sampled at
+scrape time from existing state (CAMERA_STATS, RUNNING, WebSocket clients,
+psutil).
 """
 import logging
 
@@ -98,10 +94,8 @@ PLATE_DETECT_SECONDS = Histogram(
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
 )
 
-# ANPR quality. Separate series on purpose: OCR confidence, plate-detect
-# confidence and variant agreement are different things, and one blended
-# score would hide a confident read nothing backs up. None of these is
-# accuracy; that needs ground truth (tools/anpr_bench.py).
+# ANPR signals are separate series (OCR confidence, plate-detect confidence,
+# variant agreement); none of them is accuracy, which needs ground truth.
 OCR_CONFIDENCE = Histogram(
     "sentinel_ocr_confidence",
     "OCR confidence of gate-passing reads, as reported by the engine. NOT accuracy.",

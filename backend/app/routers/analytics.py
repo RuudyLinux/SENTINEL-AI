@@ -36,16 +36,8 @@ def overview(db: Session = Depends(get_db), user: models.User = Depends(get_curr
 
 @router.get("/events-by-hour")
 def events_by_hour(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Detections per hour over the last 24 hours.
-
-    extract(), not strftime(): SQLAlchemy passes unknown functions straight
-    through and strftime is SQLite only. On a real PostgreSQL server:
-
-        (psycopg.errors.UndefinedFunction) function strftime(unknown,
-        timestamp without time zone) does not exist
-
-    so the 24h chart 500'd in production and passed every SQLite test.
-    extract() is translated per dialect; the label is formatted in Python.
+    """Detections per hour over the last 24 hours. Uses extract() rather than
+    strftime(), which exists only on SQLite; the label is formatted in Python.
     """
     since = datetime.utcnow() - timedelta(hours=24)
     parts = (
@@ -81,8 +73,8 @@ def camera_uptime(db: Session = Depends(get_db), user: models.User = Depends(get
 
 @router.get("/ai-performance")
 def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Measured detection volume and ANPR read rate. No accuracy numbers;
-    precision/recall need labelled ground truth we don't have here (doc §65).
+    """Detection volume and ANPR read rate. No accuracy figures: precision and
+    recall need labelled ground truth.
     """
     total_detections = db.query(models.Detection).count()
     person_detections = db.query(models.Detection).filter(models.Detection.cls == "person").count()
@@ -108,11 +100,8 @@ MIN_FEEDBACK_SAMPLE_SIZE = 20
 
 @router.get("/alert-precision")
 def alert_precision(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Alert quality from operator feedback.
-
-    Only from Alert.feedback (routers/alerts.py submit_feedback), never from
-    status, which is workflow, not accuracy. Under MIN_FEEDBACK_SAMPLE_SIZE
-    it reports insufficient_sample instead of a rate.
+    """Alert quality from operator feedback (Alert.feedback), not from workflow
+    status. Below MIN_FEEDBACK_SAMPLE_SIZE it reports insufficient_sample.
     """
     total_alerts = db.query(models.Alert).count()
     confirmed = db.query(models.Alert).filter(models.Alert.feedback == "confirmed").count()

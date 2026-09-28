@@ -1,22 +1,15 @@
-"""Runtime state that has to be shared between processes.
+"""Runtime state shared between backend processes.
 
-The alert cooldown and self-heal duplicate window (ExpiringClaims) and the
-login rate limiter (SlidingWindow) live here, in-process by default and in
-Redis when REDIS_URL is set. As plain module dicts they were right for one
-process only: a second worker doubles every alert and an attacker clears a
-login lockout by landing on the other process.
+Alert cooldowns and the self-heal duplicate window (ExpiringClaims) and the
+login rate limiter (SlidingWindow). In-process by default, Redis-backed when
+REDIS_URL is set, so a second process can't double alerts or bypass a lockout.
 
-Not everything belongs here. plate_tracker._TRACKS, rules_engine._zone_presence
-and the clips ring buffers are keyed by camera or track, and one camera is
-processed by one worker, so they're per-owner state. Putting them in Redis
-would add a round trip per frame for nothing. They do rely on camera
-ownership being exclusive, which is the camera-lease work, not this.
+Per-camera state (plate tracks, zone presence, clip buffers) stays in process:
+each camera is processed by exactly one worker.
 
-Wall clock, not time.monotonic(): monotonic time has a per-process origin, so
-it can't be shared, and a restart resets it and re-fires every suppressed
-alert. Wall clock can jump backwards (NTP, manual change), so a negative
-elapsed time counts as expired instead of suppressing alerts until the clock
-catches up.
+Uses wall-clock time so state survives restarts and is comparable across
+processes. A backwards clock step counts as expired rather than extending a
+claim.
 """
 from __future__ import annotations
 
@@ -31,29 +24,20 @@ Clock = Callable[[], float]
 
 
 def _elapsed(now: float, then: float) -> float:
-    # a backwards clock step would read as "no time passed" and hold a claim
-    # open forever. treat it as fully elapsed: better a possible duplicate
-    # alert than a swallowed real one
+    # A backwards clock step counts as fully elapsed: a possible duplicate alert
+    # is better than a swallowed one.
     delta = now - then
     return delta if delta >= 0 else float("inf")
 
 
 class ExpiringClaims:
-    """Claim a key for a while; say whether it was already claimed.
+    """Claim a key for `ttl` seconds; return whether it was already claimed.
 
-    Check and record have to be one step, or a second caller can see the key
-    free in between. In Redis that's SET key NX EX ttl, hence one call
-    returning a bool instead of get/set.
-
-    max_keys bounds the table. Keys come from camera ids, track ids and plate
-    text, not attacker input, but a busy camera makes a new track id every
-    few seconds forever. Expired entries are dropped on write; the bound is
-    the backstop.
+    Check and record are one atomic step (SET NX EX in Redis). max_keys bounds
+    the in-process table; expired entries are dropped on write.
     """
 
-    # False on the Redis version. Hot paths (camera loop) use it to decide
-    # whether a claim needs a thread: local is a dict op, Redis is a round
-    # trip that must not run on the event loop.
+    # False for Redis. Hot paths use it to decide whether a claim needs a thread.
     is_local = True
 
     def __init__(self, *, max_keys: int = 10_000, clock: Clock = time.time) -> None:
@@ -101,14 +85,10 @@ class ExpiringClaims:
 
 
 class SlidingWindow:
-    """Count recent events per key in a rolling window.
+    """Count recent events per key in a rolling window (login limiter).
 
-    For the login limiter, where the count is the decision ("5 failures in
-    60s"). Redis version is a sorted set trimmed by score.
-
-    Keys are attacker-controlled there, so the table must be bounded, and the
-    bound must never clear a real lockout: an entry at the limit is never
-    evicted.
+    Keys are attacker-controlled, so the table is bounded, but an entry at the
+    limit is never evicted, so eviction can't clear a real lockout.
     """
 
     is_local = True  # see ExpiringClaims.is_local
@@ -119,8 +99,8 @@ class SlidingWindow:
         self._clock = clock
 
     def record(self, key: Hashable, window_seconds: float, *, limit: int) -> int:
-        """Record one event, return how many are in the window now. limit
-        isn't enforced here, eviction uses it to keep entries at the limit."""
+        """Record one event and return the count in the window. `limit` is used
+        only to protect entries at the limit from eviction."""
         now = self._clock()
         events = [t for t in self._events.get(key, []) if _elapsed(now, t) < window_seconds]
         events.append(now)
@@ -168,14 +148,10 @@ class SlidingWindow:
             self._events.pop(key, None)
 
 
-# Redis versions. Same interfaces, a round trip instead of a dict lookup.
-# redis is imported lazily in build_*(): most deployments leave REDIS_URL
-# empty and this module has to import without the package installed.
-#
-# Failure policy: log once per process (an outage would flood the log
-# otherwise) and fail open. claim() returns True so the alert fires, count()/
-# record() return 0 so nobody gets rate-limited. Redis being down must never
-# swallow a real alert or lock an operator out.
+# Redis implementations. redis is imported lazily so the module works without
+# the package. Failures are logged once per process and fail open: claim()
+# returns True (the alert fires) and count()/record() return 0 (nobody is
+# rate-limited). A Redis outage must never swallow an alert or lock users out.
 
 
 def _redis_key(prefix: str, key: Hashable) -> str:
@@ -185,9 +161,8 @@ def _redis_key(prefix: str, key: Hashable) -> str:
 
 
 class RedisExpiringClaims:
-    """ExpiringClaims shared by every process on the same Redis. It's just
-    SET key 1 NX EX ttl; NX makes check-and-claim one atomic call, closing
-    the race a GET then SET would have."""
+    """ExpiringClaims shared through Redis: SET key 1 NX EX ttl, atomic
+    check-and-claim."""
 
     is_local = False
 
@@ -241,12 +216,9 @@ class RedisExpiringClaims:
 
 
 class RedisSlidingWindow:
-    """SlidingWindow shared across processes. Each key is a sorted set scored
-    by event time: ZREMRANGEBYSCORE prunes outside the window and ZCARD
-    counts, same prune-then-count as the local version but server side.
-
-    Members must be unique, and a bare timestamp isn't on a fast machine, so
-    a short random suffix is added so two events in one millisecond both count.
+    """SlidingWindow shared through Redis: one sorted set per key scored by
+    event time, pruned with ZREMRANGEBYSCORE and counted with ZCARD. Members
+    get a random suffix so events in the same millisecond all count.
     """
 
     is_local = False
@@ -320,8 +292,8 @@ class RedisSlidingWindow:
 
 
 def _try_connect(redis_url: str, connect_timeout: float):
-    """One ping at startup. Slow counts as absent since this blocks startup;
-    later degradation is handled by each store's fail-open."""
+    """One ping at startup; a slow Redis counts as absent. Later outages are
+    handled by each store failing open."""
     try:
         import redis as redis_module
     except ImportError:
@@ -349,8 +321,8 @@ _redis_client = "unattempted"
 
 
 def get_redis_client(settings):
-    """Shared client, or None if REDIS_URL is unset or unreachable. Decided
-    once per process; a process that started without Redis stays that way."""
+    """Shared client, or None if REDIS_URL is unset or unreachable. Decided once
+    per process."""
     global _redis_client
     if _redis_client == "unattempted":
         if settings.redis_url:

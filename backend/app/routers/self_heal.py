@@ -1,9 +1,6 @@
-"""Self-Heal read API: the recovery event log plus derived system/camera
-health. The events are written by app/self_heal/engine.py from the real
-recovery code; this router only reads and aggregates.
-
-Any logged-in user can read it. Viewing isn't a control action; the control
-actions (bulk camera ops) need Administrator or Control Room Operator.
+"""Self-Heal read API: the recovery event log and derived system/camera health.
+Events are written by self_heal/engine.py; this router only reads. Any logged-in
+user may read it.
 """
 from datetime import datetime, timedelta
 
@@ -151,9 +148,8 @@ def self_heal_events(
 
 @router.get("/events/{event_id}")
 def self_heal_event_detail(event_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Problem details. The UI's timeline is derived from this one row
-    (detected = timestamp - duration, attempts, recovered/failed = timestamp)
-    instead of per-retry rows we never stored."""
+    """Problem details. The UI derives its timeline from this one row (detected =
+    timestamp - duration)."""
     row = db.query(models.SelfHealEvent).filter(models.SelfHealEvent.id == event_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Self-heal event not found")

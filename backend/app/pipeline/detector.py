@@ -1,11 +1,8 @@
 """YOLO detection with a ByteTrack tracker per camera.
 
-One YOLO model is shared by every camera; only the tracker state (next id,
-active tracklets) is per camera. A model per camera (the old way, via
-ultralytics' persist=True tracking) cost GPU memory per camera, so a 4 GB card
-fit two AI cameras; now every connected camera can run AI and they share the
-GPU's throughput. Inference is serialized on a lock: the ultralytics
-predictor isn't thread-safe, and the GPU runs one batch at a time anyway.
+One YOLO model is shared by every camera; only tracker state is per camera, so
+GPU memory doesn't limit how many cameras can run AI. Inference is serialised on
+a lock because the ultralytics predictor isn't thread-safe.
 """
 import threading
 from typing import Any
@@ -27,11 +24,9 @@ _MODEL_LOCK = threading.Lock()   # guards loading and every predict call
 _TRACKERS: dict[str, BYTETracker] = {}
 _TRACKER_CFG: "IterableSimpleNamespace | None" = None
 
-# ByteTrack matches boxes by position only, any class. On real night footage
-# (docs/AI_ACCURACY.md) a lost car's id went to a motorbike rider seconds
-# later, and back. One id over two objects mixes their plate votes and dwell
-# time, so an id whose object changes kind gets a fresh one. person <->
-# motorbike is allowed; rider and bike swap constantly and are one object.
+# ByteTrack matches boxes by position regardless of class, so an id can jump
+# from a car to a nearby motorbike. An id whose object changes kind gets a fresh
+# id, except person <-> motorbike (a rider and bike are one object).
 _KIND = {"person": "rider", "motorbike": "rider", "car": "4w", "bus": "4w", "truck": "4w"}
 _SPLIT_ID_BASE = 1_000_000  # above anything the tracker hands out in a session
 # camera_id -> tracker id -> (kind, published id)
@@ -49,8 +44,8 @@ def get_model() -> YOLO:
 
 
 def warmup() -> None:
-    """Load the model and run one frame so the first camera doesn't wait for
-    CUDA init (a first inference took 67s on a CPU busy with 30 streams)."""
+    """Load the model and run one frame so the first camera doesn't pay for model
+    and CUDA initialisation."""
     model = get_model()
     blank = np.zeros((settings.detector_imgsz, settings.detector_imgsz, 3), dtype=np.uint8)
     with _MODEL_LOCK:
