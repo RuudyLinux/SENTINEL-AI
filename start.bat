@@ -40,8 +40,22 @@ if not exist "%ROOT%backend\.env" (
     echo.
 )
 
+rem GPU runtime when it is installed and CUDA actually works, CPU otherwise.
+rem Measured live on GRID-cam02: CPU 1.6 AI frames/s at ~58%% system CPU, the
+rem RTX 3050 Ti 5.8 at ~11%%. The CPU environment stays as the fallback.
+set BACKEND_VENV=.venv
+if exist "%ROOT%backend\.venv-gpu\Scripts\python.exe" (
+    "%ROOT%backend\.venv-gpu\Scripts\python.exe" -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
+    if !errorlevel! == 0 set BACKEND_VENV=.venv-gpu
+)
+if "!BACKEND_VENV!" == ".venv-gpu" (
+    echo AI runtime: GPU ^(CUDA^)
+) else (
+    echo AI runtime: CPU ^(no working CUDA environment at backend\.venv-gpu^)
+)
+
 echo Starting SENTINEL VISION backend on :8000 ...
-start "SENTINEL-Backend" cmd /k "cd /d "%ROOT%backend" && .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000"
+start "SENTINEL-Backend" cmd /k "cd /d "%ROOT%backend" && !BACKEND_VENV!\Scripts\python.exe -m uvicorn app.main:app --port 8000"
 
 echo Waiting for the backend to come up...
 set BACKEND_READY=0
@@ -65,8 +79,11 @@ if !BACKEND_READY! == 0 (
     echo Backend is up.
 )
 
-echo Starting SENTINEL VISION frontend on :3000 ...
-start "SENTINEL-Frontend" cmd /k "cd /d "%ROOT%frontend" && npm run dev"
+rem Production build, not `npm run dev`: the dev server compiles each page on
+rem first visit and ships unminified development React. The build takes about
+rem 10 seconds here. For live code editing run `npm run dev` by hand instead.
+echo Building and starting SENTINEL VISION frontend on :3000 ...
+start "SENTINEL-Frontend" cmd /k "cd /d "%ROOT%frontend" && npm run build && npm run start"
 
 echo.
 echo ----------------------------------------

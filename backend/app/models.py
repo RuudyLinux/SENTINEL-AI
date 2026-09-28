@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, ForeignKey, JSON
+    Column, String, Float, Integer, Boolean, DateTime, ForeignKey, Index, JSON
 )
 from sqlalchemy import false as sa_false
 from sqlalchemy.orm import relationship
@@ -91,6 +91,11 @@ class Camera(Base):
 
 class Detection(Base):
     __tablename__ = "detections"
+    # The live camera page asks for one camera's newest detections every few
+    # seconds. With only the single-column camera_id index SQLite read every
+    # detection that camera ever produced and sorted them: 27 ms on 22k rows,
+    # growing without bound. With this it reads 50 rows: 0.12 ms.
+    __table_args__ = (Index("ix_detections_camera_id_timestamp", "camera_id", "timestamp"),)
     id = Column(String, primary_key=True, default=lambda: uid("det"))
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time: when SENTINEL wrote this row
@@ -337,7 +342,7 @@ class Alert(Base):
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
     confidence = Column(Float, default=0.0)
     reasons = Column(JSON, default=list)  # explainability list
-    timestamp = Column(DateTime, default=datetime.utcnow)  # PROCESSING time
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)  # PROCESSING time; the alert list's sort key
     source_timestamp = Column(DateTime, nullable=True)  # SOURCE time of the triggering detection
     acknowledged_by = Column(String, ForeignKey("users.id"), nullable=True)
     snapshot_path = Column(String, nullable=True)
@@ -387,9 +392,11 @@ class Incident(Base):
     description = Column(String, default="")
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=True)
     alert_id = Column(String, ForeignKey("alerts.id"), nullable=True)
-    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True)
+    # Indexed with created_at: every CRITICAL alert looks for an open incident
+    # on the same vehicle inside the correlation window (rules_engine.py).
+    vehicle_id = Column(String, ForeignKey("vehicles.id"), nullable=True, index=True)
     assigned_to = Column(String, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -405,14 +412,14 @@ class IncidentNote(Base):
 class Evidence(Base):
     __tablename__ = "evidence"
     id = Column(String, primary_key=True, default=lambda: uid("evd"))
-    incident_id = Column(String, ForeignKey("incidents.id"), nullable=True)
+    incident_id = Column(String, ForeignKey("incidents.id"), nullable=True, index=True)
     evidence_type = Column(String, default="snapshot")  # snapshot | clip | report
     camera_id = Column(String, ForeignKey("cameras.id"), nullable=True)
     file_path = Column(String, nullable=True)
     sha256 = Column(String, nullable=True)
     uploaded_by = Column(String, ForeignKey("users.id"), nullable=True)
     verification_status = Column(String, default="unverified")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     # Event-clip linkage (Phase 3). Null for pre-existing snapshot/report rows.
     alert_id = Column(String, ForeignKey("alerts.id"), nullable=True)
     detection_id = Column(String, ForeignKey("detections.id"), nullable=True)
@@ -437,7 +444,7 @@ class AuditLog(Base):
     resource = Column(String, default="")
     result = Column(String, default="SUCCESS")
     ip = Column(String, default="")
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
     # --- Tamper-evident audit chain (10/10 roadmap P9) ---
     # `id` is a random uid, not insertion-ordered, so the chain needs its own
     # monotonic position. Assigned in app/audit.py (max(chain_seq)+1), unique

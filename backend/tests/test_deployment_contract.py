@@ -69,6 +69,13 @@ class TestFilesReferencedByTheBuildExist:
         model weights the backend Dockerfile documents as deliberately absent."""
         assert (_REPO_ROOT / relative).is_file()
 
+    @pytest.mark.parametrize("pattern", [".venv-gpu/", ".env", ".env.*", "*.db"])
+    def test_backend_image_excludes_local_environments_and_secrets(self, pattern):
+        """The CUDA environment is several GB, and `.env.*` copies have held the
+        live grid password; `COPY . .` must not carry either into an image."""
+        lines = (_REPO_ROOT / "backend/.dockerignore").read_text(encoding="utf-8").splitlines()
+        assert pattern in lines
+
     def test_every_file_the_frontend_image_copies_exists(self, frontend_dockerfile):
         """`COPY --from=builder /app/next.config.js` fails the build outright if
         the config is renamed to .ts or .mjs — a rename that is invisible to

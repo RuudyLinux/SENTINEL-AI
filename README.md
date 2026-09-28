@@ -4,15 +4,82 @@ Unified CCTV Intelligence & Real-Time Smart Policing Platform — built from
 `SENTINEL_VISION_Master_Project_Documentation_Gujarat_Police_Innovation_Challenge_2026.docx`
 for the Gujarat Police Innovation Challenge 2026.
 
-Real, running system: a FastAPI backend runs actual YOLOv8 detection + ByteTrack tracking + 
-EasyOCR ANPR against a webcam or an uploaded video file, persists everything to SQLite, and
-evaluates a real rules engine that produces explainable alerts and auto-created incidents.
-A Next.js dashboard covers the full site map from the doc against that live backend — no
-mocked data.
+Real, running system: a FastAPI backend runs actual YOLO11 detection + ByteTrack tracking +
+EasyOCR ANPR against live RTSP cameras, a webcam or an uploaded video file, persists
+everything to PostgreSQL + PostGIS (docker compose) or SQLite (single-machine development),
+and evaluates a real rules engine that produces explainable alerts and auto-created
+incidents. A Next.js dashboard covers the full site map from the doc against that live
+backend — no mocked data. Every component is open source (next section).
+
+## Built on open source
+
+Every runtime component is under an OSI-approved open-source licence. Verified on
+2026-09-28 by reading the installed package metadata: every Python distribution, and
+every npm package the frontend ships at runtime (`npm ls --omit=dev`).
+
+| Layer | Technology | Licence | Where |
+|---|---|---|---|
+| Dashboard | React 18, Next.js 16, Tailwind | MIT | `frontend/` |
+| Maps, GIS, route display | Leaflet 1.9 + OpenStreetMap tiles | BSD-2-Clause (data ODbL) | `frontend/components/CameraMap.tsx` |
+| Live video, low latency | WebRTC via WHEP (browser `RTCPeerConnection`) | W3C/IETF standard | `frontend/lib/whep.ts`, `components/WhepVideo.tsx` |
+| Live video with AI overlay | MJPEG over HTTP | standard | `backend/app/routers/streams.py` |
+| API and AI backend | Python 3.11, FastAPI, Uvicorn, SQLAlchemy, Alembic | MIT / BSD | `backend/app/` |
+| Camera input | RTSP over TCP, decoded by FFmpeg (through OpenCV) | LGPL / Apache-2.0 | `backend/app/pipeline/adapters.py` |
+| Evidence clips | FFmpeg (libx264) | LGPL / GPL | `backend/app/pipeline/clips.py` |
+| Detection and tracking | PyTorch, Ultralytics YOLO11s, ByteTrack | BSD / AGPL-3.0 | `backend/app/pipeline/detector.py` |
+| Plate detection | YOLOv11 licence-plate model (morsetechlab) | AGPL-3.0 | `backend/app/pipeline/plate_detector.py` |
+| OCR | EasyOCR | Apache-2.0 | `backend/app/pipeline/anpr.py` |
+| Database | PostgreSQL 16 + PostGIS 3.5 | PostgreSQL / GPL-2.0 | `docker-compose.yml`, `backend/app/geo.py` |
+| Shared runtime state | Valkey 8 (Redis protocol) | BSD-3-Clause | `docker-compose.yml`, `backend/app/runtime_state.py` |
+| Metrics | Prometheus client | Apache-2.0 | `backend/app/metrics.py` |
+| Evidence PDF | ReportLab | BSD | `backend/app/routers/evidence.py` |
+
+Two things were not open source until 2026-09-28 and were replaced:
+
+- **react-leaflet** (the React wrapper around Leaflet) is under the Hippocratic 2.1
+  licence, which restricts use and is not OSI-approved. The map now uses Leaflet
+  directly; behaviour is unchanged.
+- **`redis:7-alpine`** in compose had become Redis 7.4, licensed RSALv2/SSPL, neither
+  OSI-approved. Compose now runs Valkey, the Linux Foundation's BSD-licensed fork. The
+  app speaks the same protocol through the MIT `redis` Python client and needed no
+  change. The Redis-backed test suite (18 tests, always skipped before for want of a
+  server) passes against Valkey 8.1.
+
+Ultralytics YOLO and the plate model are AGPL-3.0, a copyleft licence: distributing
+this system, or offering it as a network service, carries AGPL obligations. The
+repository does not yet declare its own licence; that is the owners' decision.
+
+**What each listed technology does here, and what was deliberately not added.**
+
+- **PostgreSQL + PostGIS** is the deployment database. PostGIS answers
+  `GET /api/cameras/nearby` (cameras within a radius, nearest first) with one
+  GiST-indexed `ST_DWithin` query over a generated `cameras.geog` column (migration
+  `20260928_0700`); the incident page uses it to list the cameras within 1 km of the
+  incident. `backend/tools/postgis_verify.py` proves this against a real PostGIS 3.5
+  server: the index is used, and the results match the haversine fallback that SQLite
+  and PostGIS-less PostgreSQL use. SQLite remains only for zero-install development
+  and the test suite.
+- **RTSP** is how every real camera is read (the government camera grid included).
+- **FFmpeg** decodes every RTSP stream and encodes every evidence clip. **GStreamer**
+  would duplicate it and was not added.
+- **WebRTC**: the official camera catalogue gives each camera a WHEP URL next to its
+  RTSP one. The live camera page plays it directly in the browser (low latency, no
+  backend load) with **LOW LATENCY (WEBRTC)**, and falls back to MJPEG if it fails.
+  MJPEG stays the default because only it carries the AI boxes. Tested in Chromium
+  with real grid footage re-streamed by MediaMTX (MIT): 1080p, first frame in 840 ms.
+  The Sentinel Grid gives no WHEP URLs, so its cameras show MJPEG only.
+- **Kafka / RabbitMQ were not added.** Detections go from the camera loop to the
+  rules engine in-process, and to dashboards over one WebSocket with batching. At
+  this deployment's scale (one backend, at most 2 AI cameras per GPU), a broker would
+  add a service to run and a network hop per detection and solve no measured
+  problem. It belongs in the multi-site design, between edge inference nodes and the
+  central platform, where producers and consumers are different machines.
+- **TensorFlow** is not used; the models are PyTorch. **OpenLayers** would duplicate
+  Leaflet. **Node.js** runs the Next.js server.
 
 ## Run order
 
-### Docker (reproducible full stack: PostgreSQL + backend + dashboard)
+### Docker (reproducible full stack: PostgreSQL + PostGIS, Valkey, backend, dashboard)
 
 ```
 cp .env.example .env      # then fill in POSTGRES_PASSWORD and JWT_SECRET
@@ -73,6 +140,8 @@ claim from going stale between real runs — it is not a substitute for one.
    cd frontend
    npm run dev
    ```
+   For live code editing only. `start.bat` serves the production build
+   (`npm run build && npm run start`), which is what a demo should use.
 
 3. Open http://localhost:3000 → log in (`admin` / `sentinel123`) → **Cameras → Add Camera**
    → upload a short clip of **real traffic footage** (or use a webcam; the bundled demo clip is
@@ -84,18 +153,23 @@ claim from going stale between real runs — it is not a substitute for one.
 **Demo procedure (real grid cameras).**
 
 1. Keep `SENTINEL_GRID_AUTOCONNECT=false` so no camera connects by itself.
-2. Start the backend (CPU: `.venv`, `MAX_AI_CAMERAS=1`; GPU: `.venv-gpu`,
-   `MAX_AI_CAMERAS=2`) and the frontend, then log in.
+2. Run `start.bat`. It starts the backend on the GPU environment
+   (`backend/.venv-gpu`) when CUDA works there and on the CPU environment
+   (`backend/.venv`) otherwise, and prints which. It builds and serves the
+   production frontend. The AI rate and AI-camera limit follow the hardware:
+   2 AI cameras at every frame with CUDA, 1 at every 3rd frame on CPU.
 3. **Camera Control** → connect one camera (GRID-cam02 was the stable test camera)
    and check the live view is moving and the card shows **AI RUNNING**.
 4. Draw a **small** restricted zone over one lane. A zone covering a busy junction
-   raises an alert for every vehicle (48 in 2 minutes in the final test).
+   raises an alert for every vehicle: 320 CRITICAL alerts in 10 minutes on cam02
+   in the 2026-09-28 run, each with its own snapshot and clip.
 5. Wait for the alert. CRITICAL alerts open an incident. Open it and check the
    snapshot and clip, press **Verify** (SHA-256), then check **Admin → Audit**.
 6. ANPR only reads plates that are large and sharp in the frame. On this grid, most
    plates are not readable at source resolution (see `docs/AI_ACCURACY.md`), so a
    plate result is not guaranteed. Low-confidence or uncorroborated reads show as
-   *pending review*.
+   *pending review*. GRID-cam06 (daytime, riders close to the lens) is the only
+   grid camera where a plate was read correctly in the 2026-09-28 check.
 7. Never run **Demo reset** on a database with real footage.
 
 **If port 8000 is taken.** It is a popular default, and an unrelated local
@@ -295,7 +369,9 @@ for the full list of what's real vs. explicitly out of scope.
 
 - `backend/` — FastAPI app, detection pipeline (`app/pipeline/`), Self-Heal recovery engine
   (`app/self_heal/`), Prometheus metrics (`app/metrics.py`), Alembic migrations
-  (`alembic/`), SQLite (dev) or PostgreSQL (production) datastore.
+  (`alembic/`), PostgreSQL + PostGIS (docker compose) or SQLite (development) datastore,
+  GIS queries (`app/geo.py`).
+- `backend/tools/postgis_verify.py` — proves the PostGIS path on a real server.
 - `backend/tools/anpr_bench.py` — ANPR benchmark harness. Compares whole-crop vs localized
   OCR, and EasyOCR vs a candidate engine, on a directory of labelled real plate images.
   It reports numbers and deliberately draws no conclusion: a 3% accuracy gain that costs 4x
@@ -494,7 +570,9 @@ Superseded by **`docs/AI_ACCURACY.md`** (2026-09-28): a reproducible benchmark o
 
 ### AI capacity guard
 
-`MAX_AI_CAMERAS` (default 1) caps how many cameras run AI at once. Connecting
+`MAX_AI_CAMERAS` caps how many cameras run AI at once. Unset, it is 1 on CPU
+and 2 when CUDA is available; `DETECT_EVERY_N_FRAMES` likewise defaults to 3 on
+CPU and 1 with CUDA. An explicit value in the environment always wins. Connecting
 more cameras is allowed. They stream live video without AI, and the camera card
 shows **AI WAITING**. Starting AI beyond the limit is refused with *"AI capacity
 limit reached (N AI camera(s) on this machine). Stop AI on another camera
@@ -519,9 +597,25 @@ uv pip install --python .venv-gpu/Scripts/python.exe torch torchvision --index-u
 uv pip install --python .venv-gpu/Scripts/python.exe -r requirements.txt
 ```
 
-Then start the backend with `.venv-gpu/Scripts/python.exe` and `MAX_AI_CAMERAS=2`.
-YOLO and EasyOCR select CUDA automatically; nothing else changes. With the
-CPU environment the same command falls back to CPU.
+`start.bat` uses this environment automatically when CUDA works in it, and falls
+back to `.venv` otherwise. YOLO and EasyOCR select CUDA automatically, and the
+AI rate and camera limit follow (see *AI capacity guard*).
+
+Re-measured live on GRID-cam02, 2026-09-28, after the event-loop fix below (no
+alert rule active):
+
+| GRID-cam02, live | AI fps | YOLO inference | System CPU | Errors |
+|---|---|---|---|---|
+| CPU (`.venv`), every 3rd frame, 3 min | 1.6 | 121 ms | ~58% median, peaks 99% | 0 |
+| GPU (`.venv-gpu`), every 3rd frame, 3 min | 3.5 | 36 ms | ~7% | 0 |
+| GPU, every frame, 2.5 min | 5.8 | 25 ms | ~11% | 0 |
+| GPU, every frame, cam02 + cam06, 3 min | 6.6 (cam02) / 3-9 (cam06) | 23 ms | ~18% | 0 |
+
+With a full-frame CRITICAL zone on cam02 (an alert about every 2 seconds, each
+encoding a clip) the GPU run fell to ~2 AI fps over 10 minutes. See
+*Performance and runtime pass* below.
+
+Earlier measurement (before that fix):
 
 | Real grid camera(s), `DETECT_EVERY_N_FRAMES=1` | AI fps / camera | Inference | App CPU | GPU util | Frame age |
 |---|---|---|---|---|---|
@@ -548,6 +642,68 @@ Without it the app logs a warning and uses the classical plate localizer.
 `DETECT_EVERY_N_FRAMES=3` and ~780 MB/day at 1. `DETECTION_RETENTION_DAYS` plus
 `POST /api/governance/purge-detections` (Administrator, dry-run by default, audited) removes old
 detections that no alert, plate read or evidence item references. It is off by default.
+
+## Performance and runtime pass (2026-09-28)
+
+Every number here was measured on this machine against a copy of the real
+database and live grid cameras; `backend/sentinel.db` itself was not used.
+
+- **The website was slow because the event loop was busy with JPEG work.** For
+  every source frame of every connected camera, the camera loop copied the
+  frame, drew boxes and JPEG-encoded it twice (MJPEG preview and clip buffer),
+  on the event loop. At 1080p that is ~30 ms per frame; grid cameras send 23-30
+  fps, so one connected camera used ~68% of the event loop, and every API call,
+  WebSocket push and live stream waited behind it. Both encodes now run in a
+  worker thread, at 10 frames/s, the rate the MJPEG stream and clips consume
+  (`pipeline/worker.py`). Measured with three 1080p/25 fps cameras connected:
+
+  | | Before | After |
+  |---|---|---|
+  | `GET /api/cameras` p50 (3 cameras, AI off) | 575 ms | 3.2 ms |
+  | `GET /api/alerts` p50 (3 cameras, AI off) | 675 ms | 3.6 ms |
+  | `GET /api/cameras` p50 (1 AI + 2 connected) | 747 ms | 6.2 ms |
+  | Frames the readers had to drop, 2 connected cameras, ~40 s | 527-534 each | 13-15 each |
+  | AI frames processed in the same window (1 AI camera) | 121 | 182 |
+
+- **Clip encoding is limited to 2 threads per encode** (`pipeline/clips.py`).
+  libx264 otherwise takes every core. In the 10-minute alert-flood run
+  above, system CPU sat at 90-100% most of the time; with the cap, the same
+  scenario ran at 21-61% until the grid stream itself stalled.
+- **Seven indexes** from the queries the app actually runs
+  (`alembic/versions/20260928_0600_list_and_lookup_indexes.py`). The live camera
+  page's newest detections for one camera went from 27 ms (sorting all 22k rows)
+  to 0.12 ms. The rest keep the list pages' sort from growing with the table.
+  `zones.camera_id` and `watchlist_entries.identifier` were measured and left
+  out: both tables hold a handful of rows.
+- **`rules_engine.evaluate`** runs 1 query per detection plus 1 per zone the box
+  is inside: 0.75 ms and 4 queries per detection with 3 active zones, against
+  ~25-120 ms of inference. Left as is.
+- **Frontend at rest was already fast** (production pages 14-31 ms to load,
+  APIs 3-29 ms). `start.bat` now serves the production build instead of
+  `next dev`. With the GPU runtime processing cam02, 15 screens × 6 widths
+  (320-1440 px) loaded with 0 console errors, 0 failed API calls, 0 horizontal
+  overflow and nothing stuck loading.
+- **JWT forgery in demo mode fixed.** With no `JWT_SECRET` set, demo mode signed
+  tokens with the secret committed in this repository, so anyone could mint an
+  Administrator token. It now signs with a random per-process secret
+  (restarting the backend logs everyone out). Set `JWT_SECRET` in
+  `backend/.env` to keep sessions across restarts.
+- **Map positions.** The grid catalogue gives no coordinates (its records carry
+  only `id` and `name`), so every grid camera is stored at 0,0. The map now
+  leaves 0,0 cameras and route hops off and says how many it left off, instead
+  of drawing them in the Gulf of Guinea. The Add Camera form no longer
+  pre-fills an Ahmedabad position that was saved for any camera whose operator
+  did not change it; the Edit form on the Cameras page can now set coordinates.
+- **Real end-to-end, 10 minutes on GRID-cam02 (GPU):** live frame → YOLO11s →
+  ByteTrack → CRITICAL zone rule → 320 alerts → 1 correlated incident → 90
+  snapshots + 110 clips → SHA-256 verified on both → alert acknowledged → audit
+  chain intact (699 rows). 1 worker throughout, 0 reconnects, 0 database locks,
+  0 HTTP 5xx. The one traceback in the log was Windows asyncio reporting a
+  browser closing an MJPEG socket; that exact case is now silenced
+  (`main.py`).
+- **Restart path:** camera stop → 0 workers; start → PROCESSING; restart and a
+  second start → still 1 worker; backend hard-killed → every camera boots
+  offline → cam02 reconnects on start → audit chain intact.
 
 ## 10/10 roadmap gap-closure (2026-09-10)
 

@@ -4,6 +4,9 @@
 # database and evidence store, which are real case data and must come from a
 # volume, never be baked into an image.
 .venv/
+# The CUDA environment (README, "GPU runtime") is several GB and never runs in
+# this CPU image; without this line COPY . . shipped it into every build.
+.venv-gpu/
 venv/
 __pycache__/
 **/__pycache__/
@@ -20,6 +23,15 @@ evidence_store/
 
 # Secrets never belong in an image layer.
 .env
+# Hand-made copies of .env (one holding the live grid password sat in this
+# directory) must never be baked into an image any more than .env itself.
+.env.*
+!.env.example
+# Local benchmark and scratch databases.
+*.db
+*.db-shm
+*.db-wal
+tools/anpr_corpus/
 
 # Model weights are downloaded/mounted, not baked in (and *.pt is gitignored,
 # so a build from a clean checkout would not have them anyway).

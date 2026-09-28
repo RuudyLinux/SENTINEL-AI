@@ -6,6 +6,7 @@ import { useApiData } from "@/lib/useApiData";
 import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge } from "@/components/ConnectionBadge";
 import ErrorState from "@/components/ErrorState";
+import WhepVideo from "@/components/WhepVideo";
 
 export default function SingleCameraPage() {
   const { cameraId } = useParams<{ cameraId: string }>();
@@ -25,6 +26,11 @@ export default function SingleCameraPage() {
     `/api/detections?camera_id=${cameraId}&limit=50`, { pollMs: 4000 }
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  // MJPEG from the backend carries the AI boxes and is the default. A camera
+  // whose catalogue entry has a WHEP URL can also be watched as raw WebRTC
+  // video, straight from its media server, at lower latency.
+  const [videoMode, setVideoMode] = useState<"mjpeg" | "webrtc">("mjpeg");
+  const [webrtcError, setWebrtcError] = useState<string | null>(null);
 
   const detectionRows = detections || [];
   const counts = detectionRows.reduce((acc: Record<string, number>, d) => {
@@ -67,9 +73,31 @@ export default function SingleCameraPage() {
         </div>
       </div>
 
+      {camera.whep_url && (
+        <div className="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="Video source">
+          <button
+            onClick={() => setVideoMode("mjpeg")}
+            aria-pressed={videoMode === "mjpeg"}
+            className={`rounded px-3 py-1.5 border ${videoMode === "mjpeg" ? "border-accent text-accent" : "border-border text-slate-400"}`}
+          >AI OVERLAY (MJPEG)</button>
+          <button
+            onClick={() => { setWebrtcError(null); setVideoMode("webrtc"); }}
+            aria-pressed={videoMode === "webrtc"}
+            className={`rounded px-3 py-1.5 border ${videoMode === "webrtc" ? "border-accent text-accent" : "border-border text-slate-400"}`}
+          >LOW LATENCY (WEBRTC)</button>
+          {webrtcError && <span className="text-critical">WebRTC unavailable ({webrtcError}); showing MJPEG.</span>}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
         <div className="bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
-          {camera.status === "online" && streamUrl ? (
+          {videoMode === "webrtc" && camera.whep_url ? (
+            <WhepVideo
+              url={camera.whep_url}
+              label={`${camera.name} (WebRTC)`}
+              onError={(message) => { setWebrtcError(message); setVideoMode("mjpeg"); }}
+            />
+          ) : camera.status === "online" && streamUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img src={streamUrl} alt={camera.name} className="w-full h-full object-contain" />
           ) : (

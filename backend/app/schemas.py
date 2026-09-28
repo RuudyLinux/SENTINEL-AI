@@ -58,6 +58,17 @@ class CameraCreate(BaseModel):
     camera_group: str = ""  # free-form grouping/tag, e.g. "North Zone" — client-side filterable
 
 
+class NearbyCameraOut(BaseModel):
+    id: str
+    camera_code: str
+    name: str
+    location: str
+    lat: float
+    lng: float
+    status: str
+    distance_m: float
+
+
 class CameraUpdate(BaseModel):
     """PATCH payload — every field optional, only fields actually present in the
     request are applied (see routers/cameras.py `model_dump(exclude_unset=True)`).

@@ -83,6 +83,20 @@ def _size_thread_pool(camera_count: int) -> int:
     return max(32, min(settings.worker_thread_pool_max, camera_count + settings.worker_thread_pool_headroom))
 
 
+def _ignore_client_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Drop the one asyncio error that is not an error.
+
+    On Windows the Proactor loop logs a full traceback when a client closes a
+    socket first (ConnectionResetError from `_call_connection_lost`) — every
+    time a browser navigates away from a live MJPEG stream. Nothing failed and
+    nothing can be done about it; everything else still goes to the default
+    handler."""
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError) and "_call_connection_lost" in str(context.get("handle", "")):
+        return
+    loop.default_exception_handler(context)
+
+
 async def _install_thread_pool() -> None:
     global _executor
     db = SessionLocal()
@@ -93,6 +107,7 @@ async def _install_thread_pool() -> None:
     size = _size_thread_pool(camera_count)
     _executor = ThreadPoolExecutor(max_workers=size, thread_name_prefix="sentinel-worker")
     asyncio.get_running_loop().set_default_executor(_executor)
+    asyncio.get_running_loop().set_exception_handler(_ignore_client_reset)
     logger.info(
         "shared thread pool: %d workers for %d registered camera(s)", size, camera_count,
     )
@@ -248,6 +263,13 @@ async def _on_startup():
     ensure_indexes("vehicles", ["plate_text", "last_seen"])
     ensure_indexes("alerts", ["risk_score", "vehicle_id"])
     ensure_indexes("incident_alerts", ["incident_id", "alert_id"])
+    # List sort keys and the per-alert correlation lookup; measured in
+    # alembic/versions/20260928_0600_list_and_lookup_indexes.py.
+    ensure_indexes("detections", [("camera_id", "timestamp")])
+    ensure_indexes("alerts", ["timestamp"])
+    ensure_indexes("audit_logs", ["timestamp"])
+    ensure_indexes("evidence", ["incident_id", "created_at"])
+    ensure_indexes("incidents", ["vehicle_id", "created_at"])
     db = SessionLocal()
     try:
         run_seed(db)

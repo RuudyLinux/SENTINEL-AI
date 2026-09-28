@@ -6,7 +6,12 @@ import { api } from "@/lib/api";
 export default function AddCameraPage() {
   const router = useRouter();
   const [form, setForm] = useState({
-    camera_code: "", name: "", department: "Police", location: "", camera_group: "", lat: 23.03, lng: 72.58,
+    camera_code: "", name: "", department: "Police", location: "", camera_group: "",
+    // Blank, not a city centre: a pre-filled position was saved for every
+    // camera whose operator did not change it, and the map then showed that
+    // camera somewhere it is not. Blank is stored as 0,0, which the map treats
+    // as "location unavailable".
+    lat: "", lng: "",
     source_type: "video_file", source_uri: "",
     ai_person: true, ai_vehicle: true, ai_anpr: true,
   });
@@ -53,7 +58,13 @@ export default function AddCameraPage() {
     setError(null);
     try {
       const uri = await uploadIfNeeded();
-      const camera = await api.post<any>("/api/cameras", { ...form, source_uri: uri });
+      const lat = form.lat.trim() === "" ? 0 : Number(form.lat);
+      const lng = form.lng.trim() === "" ? 0 : Number(form.lng);
+      if ((form.lat.trim() === "") !== (form.lng.trim() === "") || !Number.isFinite(lat) || !Number.isFinite(lng)
+          || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        throw new Error("Enter both latitude and longitude, or leave both blank if the location is unknown");
+      }
+      const camera = await api.post<any>("/api/cameras", { ...form, lat, lng, source_uri: uri });
       router.push(`/live/${camera.id}`);
     } catch (err: any) {
       setError(err.message || "Failed to save camera");
@@ -82,11 +93,11 @@ export default function AddCameraPage() {
           <Field label="Group (optional)">
             <input value={form.camera_group} onChange={(e) => set("camera_group", e.target.value)} placeholder="North Zone" className="input" />
           </Field>
-          <Field label="Latitude">
-            <input type="number" step="0.0001" value={form.lat} onChange={(e) => set("lat", parseFloat(e.target.value))} className="input" />
+          <Field label="Latitude (blank if unknown)">
+            <input type="number" step="0.0001" min={-90} max={90} value={form.lat} onChange={(e) => set("lat", e.target.value)} placeholder="e.g. 23.0225" className="input" />
           </Field>
-          <Field label="Longitude">
-            <input type="number" step="0.0001" value={form.lng} onChange={(e) => set("lng", parseFloat(e.target.value))} className="input" />
+          <Field label="Longitude (blank if unknown)">
+            <input type="number" step="0.0001" min={-180} max={180} value={form.lng} onChange={(e) => set("lng", e.target.value)} placeholder="e.g. 72.5714" className="input" />
           </Field>
         </div>
 

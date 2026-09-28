@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, getStoredUser, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
+import { hasLocation } from "@/lib/geo";
 import DataTable, { Column } from "@/components/DataTable";
 import ErrorState from "@/components/ErrorState";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "@/components/ConnectionBadge";
@@ -29,7 +30,7 @@ export default function CamerasPage() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [groupFilter, setGroupFilter] = useState<string>("");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
+  const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", lat: "", lng: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
   const [editBusy, setEditBusy] = useState(false);
   const [rowBusyId, setRowBusyId] = useState<string | null>(null);
 
@@ -53,6 +54,8 @@ export default function CamerasPage() {
     setEditingId(c.id);
     setEditForm({
       name: c.name, location: c.location, camera_group: c.camera_group || "",
+      // 0,0 is how the backend stores "unknown"; shown blank, not as a place.
+      lat: hasLocation(c) ? String(c.lat) : "", lng: hasLocation(c) ? String(c.lng) : "",
       ai_person: c.ai_person, ai_vehicle: c.ai_vehicle, ai_anpr: c.ai_anpr,
     });
   }
@@ -61,7 +64,15 @@ export default function CamerasPage() {
     setEditBusy(true);
     setActionError(null);
     try {
-      await api.patch(`/api/cameras/${id}`, editForm);
+      const blankLat = editForm.lat.trim() === "";
+      const blankLng = editForm.lng.trim() === "";
+      const lat = blankLat ? 0 : Number(editForm.lat);
+      const lng = blankLng ? 0 : Number(editForm.lng);
+      if (blankLat !== blankLng || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        setActionError("Enter both latitude and longitude, or leave both blank if the location is unknown");
+        return;
+      }
+      await api.patch(`/api/cameras/${id}`, { ...editForm, lat, lng });
       setEditingId(null);
       reload();
     } catch (err) {
@@ -380,6 +391,14 @@ export default function CamerasPage() {
           <label className="block text-xs text-slate-400">Location
             <input value={editForm.location} onChange={(e) => setEditForm({ ...editForm, location: e.target.value })} className="input" />
           </label>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs text-slate-400">Latitude (blank if unknown)
+              <input type="number" step="0.0001" min={-90} max={90} value={editForm.lat} onChange={(e) => setEditForm({ ...editForm, lat: e.target.value })} className="input" />
+            </label>
+            <label className="block text-xs text-slate-400">Longitude (blank if unknown)
+              <input type="number" step="0.0001" min={-180} max={180} value={editForm.lng} onChange={(e) => setEditForm({ ...editForm, lng: e.target.value })} className="input" />
+            </label>
+          </div>
           <label className="block text-xs text-slate-400">Group
             <input value={editForm.camera_group} onChange={(e) => setEditForm({ ...editForm, camera_group: e.target.value })} placeholder="North Zone" className="input" />
           </label>

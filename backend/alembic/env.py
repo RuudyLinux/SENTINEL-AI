@@ -21,6 +21,16 @@ config.set_main_option("sqlalchemy.url", database_url().replace("%", "%%"))
 
 target_metadata = Base.metadata
 
+# Objects that exist in a PostGIS database but are deliberately not on the ORM:
+# the extension's own `spatial_ref_sys` table, and the generated `cameras.geog`
+# column and its index (migration 20260928_0700, read only by app/geo.py).
+# Without this, `alembic check` would report them as drift to be dropped.
+_NOT_MODEL_OWNED = {("table", "spatial_ref_sys"), ("column", "geog"), ("index", "ix_cameras_geog")}
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    return (type_, name) not in _NOT_MODEL_OWNED
+
 
 def run_migrations_offline() -> None:
     context.configure(
@@ -32,6 +42,7 @@ def run_migrations_offline() -> None:
         # Alembic emit the create-copy-swap dance instead. Harmless on
         # PostgreSQL, and it means one migration script works on both.
         render_as_batch=True,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -44,6 +55,14 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
+        if connection.dialect.name == "postgresql":
+            # The PostGIS image also installs the topology and tiger-geocoder
+            # extensions and puts their schemas on the search path, so their
+            # tables would be reflected (and reported as drift) alongside
+            # ours. The application's tables and PostGIS itself live in
+            # `public`; migrations look only there.
+            connection.exec_driver_sql("SET search_path TO public")
+            connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -52,6 +71,7 @@ def run_migrations_online() -> None:
             # surfaces a real drift between models and schema rather than
             # silently leaving the database with the old column type.
             compare_type=True,
+            include_object=include_object,
         )
         with context.begin_transaction():
             context.run_migrations()

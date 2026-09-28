@@ -2,12 +2,18 @@
 #
 #   docker compose up --build
 #
-# Brings up PostgreSQL, Redis, the FastAPI backend (migrated to head on start)
+# Brings up PostgreSQL + PostGIS, Valkey, the FastAPI backend (migrated to head on start)
 # and the Next.js dashboard. No secret is hard-coded here: every credential
 # comes from the environment or .env (see .env.example), and compose
 # substitutes defaults only for values that are not secret.
 #
-# Redis backs distributed runtime state (app/runtime_state.py): the alert
+# Every image here is open source. Valkey (BSD-3-Clause, Linux Foundation) is
+# the Redis-protocol store: redis:7-alpine had moved to Redis 7.4, whose
+# RSALv2/SSPL licences are not OSI open-source licences. The app speaks the
+# Redis protocol (REDIS_URL, the MIT-licensed `redis` Python client) and needs
+# no change for Valkey.
+#
+# Redis-protocol state backs distributed runtime state (app/runtime_state.py): the alert
 # cooldown, the self-heal duplicate window and the login rate limiter, shared
 # across every backend process rather than held separately by each. It is
 # genuinely optional, not merely nominally so — the backend probes it once at
@@ -19,7 +25,10 @@
 
 services:
   db:
-    image: postgres:16-alpine
+    # PostgreSQL 16 with PostGIS 3.5 (GPL-2.0), same data format as the plain
+    # postgres:16 image this replaced. Migration 20260928_0700 adds the
+    # indexed camera geography that /api/cameras/nearby queries (app/geo.py).
+    image: postgis/postgis:16-3.5-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sentinel}
       # No default. Compose fails loudly if it is unset rather than starting a
@@ -43,7 +52,7 @@ services:
         # Waits for the database to actually accept connections, not merely for
         # the container to exist — otherwise the migration below races startup.
         condition: service_healthy
-      redis:
+      valkey:
         # service_started, not service_healthy: Redis is optional runtime
         # state, not a hard dependency, and the backend's own startup probe
         # (2s timeout, fails open) already handles Redis being slow or
@@ -61,7 +70,7 @@ services:
       # name below) — unlike POSTGRES_PASSWORD/JWT_SECRET, empty or absent is
       # a supported value too (in-process runtime state), so this never
       # blocks startup the way those two deliberately do.
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: ${REDIS_URL:-redis://valkey:6379/0}
       # Optional real-camera integration. Empty means "not configured", which
       # the app handles explicitly; it never fabricates cameras.
       SENTINEL_GRID_EMAIL: ${SENTINEL_GRID_EMAIL:-}
@@ -93,10 +102,10 @@ services:
       - "${FRONTEND_PORT:-3000}:3000"
     restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
+  valkey:
+    image: valkey/valkey:8-alpine
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5

@@ -25,7 +25,18 @@ def test_production_mode_accepts_a_real_generated_secret():
     assert s.jwt_secret == real_secret
 
 
-def test_demo_mode_still_allows_the_bundled_dev_secret():
-    # The whole point: this must NOT raise — demo/judge flow stays working.
-    s = Settings(demo_mode=True, jwt_secret="sentinel-vision-dev-secret-change-in-production")
+def test_demo_mode_starts_without_a_secret_but_never_signs_with_the_public_one():
+    # Demo mode must still start with no JWT_SECRET configured, but the
+    # bundled secret is in this repository, so signing with it would let
+    # anyone mint an Administrator token. A random per-process one replaces it.
+    bundled = "sentinel-vision-dev-secret-change-in-production"
+    s = Settings(demo_mode=True, jwt_secret=bundled)
     assert s.demo_mode is True
+    assert s.jwt_secret != bundled
+    assert len(s.jwt_secret) >= 32
+    assert Settings(demo_mode=True, jwt_secret=bundled).jwt_secret != s.jwt_secret
+
+
+def test_demo_mode_keeps_a_real_configured_secret():
+    real_secret = "x" * 40
+    assert Settings(demo_mode=True, jwt_secret=real_secret).jwt_secret == real_secret

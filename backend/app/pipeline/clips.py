@@ -42,6 +42,7 @@ _RING: dict[str, deque[tuple[float, bytes]]] = {}
 # already uses several cores; a busy zone raises many alerts in the same second,
 # and unbounded parallel encodes starved the camera loops and exhausted RAM.
 _ENCODE_SLOTS = threading.BoundedSemaphore(2)
+_ENCODE_THREADS = 2  # per encode, so clips use at most 4 threads in all
 _SUBSCRIBERS: dict[str, list[asyncio.Queue]] = {}
 
 
@@ -124,7 +125,10 @@ def _encode_clip_now(frames: list[bytes], path: str, fps: "float | None") -> boo
         imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps or settings.clip_fps:.3f}",
         "-i", "-",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        # -threads: libx264 otherwise takes every core for one clip. A busy
+        # zone raised an alert about every 2 s in a 10-minute live run, and
+        # the encodes held the machine at 90-100% CPU and halved the AI rate.
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-threads", str(_ENCODE_THREADS), "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(path),
     ]

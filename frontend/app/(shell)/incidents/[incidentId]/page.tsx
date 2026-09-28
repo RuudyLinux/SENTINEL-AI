@@ -6,6 +6,7 @@ import { useApiData } from "@/lib/useApiData";
 import SeverityBadge from "@/components/SeverityBadge";
 import ErrorState from "@/components/ErrorState";
 import EvidenceIntegrityBadge from "@/components/EvidenceIntegrityBadge";
+import { hasLocation } from "@/lib/geo";
 
 const TABS = ["Overview", "Timeline", "Evidence", "Notes"] as const;
 
@@ -19,6 +20,13 @@ export default function IncidentDetailPage() {
   const timeline = timelineData?.events || [];
   const evidence = evidenceData || [];
   const cameras = camerasData || [];
+  // Other cameras within 1 km of the incident's camera: where an investigator
+  // looks next. A PostGIS query on the PostgreSQL deployment (app/geo.py).
+  const incidentCamera = incident?.camera_id ? cameras.find((c) => c.id === incident.camera_id) : null;
+  const nearbyPath = incidentCamera && hasLocation(incidentCamera)
+    ? `/api/cameras/nearby?lat=${incidentCamera.lat}&lng=${incidentCamera.lng}&radius_m=1000&limit=10&exclude_id=${incidentCamera.id}`
+    : null;
+  const { data: nearby } = useApiData<any[]>(nearbyPath);
 
   const [tab, setTab] = useState<(typeof TABS)[number]>("Overview");
   const [note, setNote] = useState("");
@@ -180,6 +188,24 @@ export default function IncidentDetailPage() {
             <div><span className="text-slate-500">Description:</span> {incident.description || "—"}</div>
             <div><span className="text-slate-500">Camera:</span> {incident.camera_id ? (cameras.find((c) => c.id === incident.camera_id)?.camera_code || incident.camera_id) : "—"}</div>
             <div><span className="text-slate-500">Created:</span> {new Date(incident.created_at).toLocaleString()}</div>
+            {incidentCamera && (
+              <div>
+                <span className="text-slate-500">Cameras within 1 km:</span>{" "}
+                {!hasLocation(incidentCamera)
+                  ? "unknown (this camera's location is unavailable)"
+                  : !nearby
+                    ? "…"
+                    : nearby.length === 0
+                      ? "none"
+                      : nearby.map((c, i) => (
+                          <span key={c.id}>
+                            {i > 0 && ", "}
+                            <a href={`/live/${c.id}`} className="text-accent hover:underline">{c.camera_code}</a>{" "}
+                            <span className="text-slate-500">({Math.round(c.distance_m)} m)</span>
+                          </span>
+                        ))}
+              </div>
+            )}
             <div className="flex gap-2 pt-3">
               <button onClick={() => downloadPackage("json")} className="text-xs bg-accent text-ink font-medium rounded px-3 py-1.5">GENERATE EVIDENCE PACKAGE (JSON)</button>
               <button onClick={() => downloadPackage("pdf")} className="text-xs border border-border rounded px-3 py-1.5 hover:border-accent">EXPORT PDF</button>

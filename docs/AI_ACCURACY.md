@@ -167,9 +167,41 @@ intended behaviour: an uncertain read goes to an operator and never becomes a
 settled identity. On night cam02 no plate was read in 12 minutes: **ANPR not
 validated on that camera source.**
 
-**Watchlist → alert on a real plate: NOT TESTABLE.** No real plate was read
-correctly, so a real watchlist match could not be produced, and none was
-injected.
+**Second sequence check (2026-09-28, later).** Two fresh real sequences were
+replayed through the same plate path (`tools/anpr_seq_bench.py run`, selected
+config B, CUDA). Ground truth read by eye from the source pixels.
+
+| Sequence | Tracks | Plates readable by eye | Published | Correct | Wrong published |
+|---|---|---|---|---|---|
+| GRID-cam02, night, 614 frames at 8 fps | 99 | 0 (glare and motion blur; **source not readable**) | 0 | — | 0 |
+| GRID-cam06, day, 261 frames at 8 fps | 24 | 3: `GJ32AG2883` (green EV plate, ~90×26 px), `GJ11CJ7578` (~97×24 px), two-line `GJ11C/K1044` (~64×46 px) | 1 | 1: `GJ32AG2883`, 10/10 characters, confidence 0.51 | 0 |
+| GRID-cam15, night RLVD, 65 frames | 8 | 0 | 0 | — | 0 |
+
+On cam06 the gate passed five reads of the green plate, two of them wrong
+(`GJ32IG2887`, `GJ32A6288`); temporal voting published the correct one. The two
+other readable plates are about 24 px tall and were not read at all, so
+nothing wrong was published for them. Complete-plate accuracy on readable
+plates in this check: **1/3**. False plates published: **0**. This is three
+plates; it shows the path can produce a correct plate and holds back wrong
+ones, not a rate.
+
+Rejected in the same check: `PLATE_PREPROCESS_VARIANTS=original,sharpen,adaptive`
+on the cam06 sequence published nothing (the correct plate was lost to the
+variant-agreement rule) at 2.2× the OCR time.
+
+**Detection benchmark not re-run.** The 24 labelled frames above lived outside
+git in a session scratch directory that no longer exists, so the detection
+figures in this document were not re-measured on 2026-09-28. No detection
+setting changed that day.
+
+**Watchlist → alert on a real plate: NOT VALIDATED.** A live 12-minute GPU run
+on GRID-cam06 (2,877 frames inferred) with an operator watchlist entry for
+`GJ32AG2883` — a plate seen in that camera's own recorded footage — produced
+one plate read, `GJ32A4286` (confidence 0.54-0.56, one read, almost certainly
+the same green plate misread). It was held as *pending review*, was not
+auto-accepted, and did not match the watchlist. No match fired and none was
+injected. The path from a correct live read to an alert is covered by the test
+suite but has not been shown on a live grid camera.
 
 ## Performance (live app, real grid cameras, CPU, DETECT_EVERY_N_FRAMES=1)
 

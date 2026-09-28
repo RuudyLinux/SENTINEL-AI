@@ -1,4 +1,5 @@
 """Central settings. Dev-mode secrets via .env — documented non-goal: no Vault/KMS in this build."""
+import secrets
 from pathlib import Path
 
 import cv2
@@ -72,7 +73,9 @@ class Settings(BaseSettings):
     # custom-trained model's own version string.
     model_version: str = ""
     rule_version: str = "rules-1.0"
-    detect_every_n_frames: int = 3  # throttle inference for CPU
+    # Inference runs on every Nth frame the camera loop takes. None (the
+    # default) resolves by hardware below: 3 on CPU, 1 with CUDA.
+    detect_every_n_frames: "int | None" = None
     confidence_threshold: float = 0.30
     # YOLO input size and NMS IoU (see model_name for the measurement).
     detector_imgsz: int = 960
@@ -84,8 +87,9 @@ class Settings(BaseSettings):
     tracker_feed_confidence: float = 0.10
     # Cameras that may run AI at the same time (pipeline/ai_capacity.py).
     # Measured on the demo machine: 1 AI camera on CPU holds ~92% CPU and a
-    # second saturates it. Raise only with the GPU runtime, after measuring.
-    max_ai_cameras: int = 1
+    # second saturates it. None (the default) resolves by hardware below:
+    # 1 on CPU, 2 with CUDA. Raise past that only after measuring.
+    max_ai_cameras: "int | None" = None
     tracker_config: str = str(Path(__file__).resolve().parent / "pipeline" / "bytetrack_sentinel.yaml")
 
     # ANPR quality gate: a normalized OCR read only becomes a Vehicle/Plate
@@ -492,6 +496,25 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _resolve_ai_rate_for_hardware(self) -> "Settings":
+        # Measured live on GRID-cam02, 2026-09-28 (docs/AI_ACCURACY.md):
+        # CPU at every 3rd frame gave 1.6 AI frames/s at ~58% system CPU, and
+        # every frame does not raise that because inference already saturates
+        # the CPU. The RTX 3050 Ti gave 3.5 at every 3rd frame and 5.8 at
+        # every frame, at ~11% system CPU, so with CUDA every frame is run.
+        if self.detect_every_n_frames is None or self.max_ai_cameras is None:
+            try:
+                import torch
+                cuda = bool(torch.cuda.is_available())
+            except Exception:
+                cuda = False
+            if self.detect_every_n_frames is None:
+                self.detect_every_n_frames = 1 if cuda else 3
+            if self.max_ai_cameras is None:
+                self.max_ai_cameras = 2 if cuda else 1
+        return self
+
+    @model_validator(mode="after")
     def _enforce_production_jwt_secret(self) -> "Settings":
         # Hardening-pass finding: nothing previously stopped DEMO_MODE=false
         # (the documented "this is a production deploy" signal — see seed.py,
@@ -501,14 +524,22 @@ class Settings(BaseSettings):
         # DEMO_MODE=false is set, which is exactly the signal that a real
         # deploy is intended. Fails loudly at startup (import time), not
         # silently, and never once the app is already serving requests.
-        if not self.demo_mode:
-            if self.jwt_secret in _INSECURE_JWT_SECRETS or len(self.jwt_secret) < _MIN_PRODUCTION_JWT_SECRET_LENGTH:
-                raise RuntimeError(
-                    "DEMO_MODE=false (production mode) requires a real JWT_SECRET — at least "
-                    f"{_MIN_PRODUCTION_JWT_SECRET_LENGTH} characters, not the bundled dev default "
-                    "or a placeholder. Set JWT_SECRET in the environment/.env, e.g.:\n"
-                    '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
-                )
+        insecure = self.jwt_secret in _INSECURE_JWT_SECRETS or len(self.jwt_secret) < _MIN_PRODUCTION_JWT_SECRET_LENGTH
+        if self.demo_mode:
+            # Demo mode used to sign with the bundled secret, which is public in
+            # this repository: anyone could mint a valid Administrator token.
+            # With no real secret configured, sign with a random one instead.
+            # It lives only as long as this process, so a backend restart logs
+            # everyone out — a demo can afford that, a forgeable token it can't.
+            if insecure:
+                self.jwt_secret = secrets.token_urlsafe(48)
+        elif insecure:
+            raise RuntimeError(
+                "DEMO_MODE=false (production mode) requires a real JWT_SECRET — at least "
+                f"{_MIN_PRODUCTION_JWT_SECRET_LENGTH} characters, not the bundled dev default "
+                "or a placeholder. Set JWT_SECRET in the environment/.env, e.g.:\n"
+                '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
         return self
 
 

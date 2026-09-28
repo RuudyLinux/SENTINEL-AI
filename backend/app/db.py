@@ -249,13 +249,13 @@ def ensure_columns(table: str, columns: dict[str, str], backfill_defaults: dict[
     return added
 
 
-def ensure_indexes(table: str, index_columns: list[str]) -> list[str]:
+def ensure_indexes(table: str, index_columns: "list[str | tuple[str, ...]]") -> list[str]:
     """Additive-only index migration, parallel to `ensure_columns` above.
     `Column(..., index=True)` in models.py only takes effect for tables
     `create_all()` creates fresh — it never alters an existing table — so an
     already-existing DB needs these created explicitly. One single-column index
     per name, `ix_{table}_{column}`, `CREATE INDEX IF NOT EXISTS` so it's safe to
-    call every startup."""
+    call every startup. A tuple is one composite index, `ix_{table}_{a}_{b}`."""
     if not IS_SQLITE:
         logger.debug("ensure_indexes(%s) skipped — Alembic owns the schema on %s", table, engine.dialect.name)
         return []
@@ -265,7 +265,9 @@ def ensure_indexes(table: str, index_columns: list[str]) -> list[str]:
         return created  # table doesn't exist yet — create_all() will create the index too
     with engine.begin() as conn:
         for column in index_columns:
-            name = f"ix_{table}_{column}"
+            columns = (column,) if isinstance(column, str) else tuple(column)
+            name = f"ix_{table}_{'_'.join(columns)}"
+            column = ", ".join(columns)
             # bandit B608: same as ensure_columns above — `table`/`column`
             # are always hardcoded literals from main.py startup, never
             # external input, and there are no values here to bind.

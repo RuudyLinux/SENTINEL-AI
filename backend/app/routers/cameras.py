@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -18,6 +18,7 @@ from ..pipeline.catalog import fetch_catalog, upsert_from_catalog, CatalogError
 from ..pipeline.sentinel_grid import fetch_grid_cameras, upsert_grid_cameras, SentinelGridError
 from ..pipeline import supervisor, ai_capacity
 from ..self_heal import engine as self_heal
+from .. import geo
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -80,6 +81,30 @@ def list_cameras(
         camera.last_error = stats.get("last_error")  # type: ignore[attr-defined]
         camera.ai_blocked = bool(stats.get("ai_blocked"))  # type: ignore[attr-defined]
     return cameras
+
+
+@router.get("/nearby", response_model=list[schemas.NearbyCameraOut])
+def nearby_cameras(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: float = Query(1000, gt=0, le=50_000),
+    limit: int = Query(20, ge=1, le=200),
+    exclude_id: str | None = None,
+    db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
+):
+    """Active cameras within `radius_m` metres, nearest first — which other
+    cameras could have seen what one camera saw. PostGIS on the PostgreSQL
+    deployment, a haversine fallback elsewhere (app/geo.py). Cameras whose
+    position is unknown (stored as 0,0) are never returned."""
+    if lat == 0 and lng == 0:
+        raise HTTPException(status_code=400, detail="0,0 is the stored form of an unknown position, not a place")
+    return [
+        schemas.NearbyCameraOut(
+            id=c.id, camera_code=c.camera_code, name=c.name, location=c.location or "",
+            lat=c.lat, lng=c.lng, status=c.status, distance_m=round(d, 1),
+        )
+        for c, d in geo.nearby_cameras(db, lat, lng, radius_m, limit, exclude_id)
+    ]
 
 
 @router.post("/catalog/sync")

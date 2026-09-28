@@ -80,6 +80,24 @@ from .frame_utils import _draw_boxes, _restore_row, _save_snapshot, _snapshot_at
 LATEST_FRAMES: dict[str, bytes] = {}
 RUNNING: dict[str, "asyncio.Task[None]"] = {}
 
+# Both JPEGs made from a frame are consumed at no more than this rate: the MJPEG
+# stream sends at most 10 frames/s (routers/streams.py) and clips are encoded at
+# whatever rate their frames were captured (clips._playback_fps). Encoding every
+# source frame, on the event loop, cost ~30 ms per 1080p frame — at 23 fps that
+# was ~68% of the event loop for ONE connected camera, and every API request,
+# WebSocket push and live stream waited behind it. Measured 2026-09-28.
+_PREVIEW_INTERVAL_S = 0.1
+_JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+
+
+def _encode_jpeg(frame: np.ndarray) -> "bytes | None":
+    ok, buf = cv2.imencode(".jpg", frame, _JPEG_PARAMS)
+    return buf.tobytes() if ok else None
+
+
+def _encode_annotated(frame: np.ndarray, detections: list[dict[str, Any]]) -> "bytes | None":
+    return _encode_jpeg(_draw_boxes(frame.copy(), detections))
+
 
 
 VEHICLE_CLASSES = ("car", "truck", "bus", "motorbike")
@@ -381,10 +399,10 @@ async def _process_frame(
     frame_source_ts: datetime | None, last_detections: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Runs inference (throttled) + ANPR + persistence + alerting for one
-    already-successfully-read frame, and refreshes the annotated MJPEG
-    snapshot. Returns the (possibly updated) `last_detections` list the
-    caller should pass back in next iteration — the annotated overlay is
-    redrawn every frame, but inference only runs every `detect_every_n_frames`."""
+    already-successfully-read frame. Returns the (possibly updated)
+    `last_detections` list the caller should pass back in next iteration and
+    draws on the annotated MJPEG frame — inference only runs every
+    `detect_every_n_frames`."""
     # SQLAlchemy's legacy Column()-style declarative model (models.py) types
     # every attribute as Column[T] rather than T for a static checker; at
     # runtime, an attribute read on an instance always returns the plain
@@ -668,11 +686,6 @@ async def _process_frame(
         # on an otherwise-live connect-only feed indefinitely.
         last_detections = []
 
-    annotated = _draw_boxes(frame.copy(), last_detections)
-    ok2, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-    if ok2:
-        LATEST_FRAMES[camera_id] = buf.tobytes()
-
     return last_detections
 
 
@@ -784,6 +797,7 @@ async def _camera_loop(camera_id: str) -> None:
         # heartbeat commit (see below) so Start AI/Stop AI take effect within
         # about a second, not never.
         last_ai_refresh_at = 0.0
+        last_preview_at = 0.0
 
         frame_idx = 0
         consecutive_failures = 0
@@ -904,12 +918,15 @@ async def _camera_loop(camera_id: str) -> None:
                     last_loop_end = now_mono
                     st["last_loop_at"] = datetime.now(timezone.utc).isoformat()
 
-                    # Bounded event-clip ring buffer — every frame, raw
-                    # (unannotated), independent of the AI-inference
-                    # throttle below so clips stay smooth.
-                    ok_raw, raw_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                    if ok_raw:
-                        clips.push_frame(str(camera.id), raw_buf.tobytes())
+                    # Bounded event-clip ring buffer — raw (unannotated),
+                    # independent of the AI-inference throttle below, at the
+                    # preview rate rather than every source frame.
+                    preview_due = now_mono - last_preview_at >= _PREVIEW_INTERVAL_S
+                    if preview_due:
+                        last_preview_at = now_mono
+                        raw_jpeg = await asyncio.to_thread(_encode_jpeg, frame)
+                        if raw_jpeg is not None:
+                            clips.push_frame(str(camera.id), raw_jpeg)
 
                     pos_msec = got.pos_msec
                     frame_source_ts = compute_source_timestamp(camera_source_type_cached, session_opened_at, pos_msec, last_pos_msec)
@@ -917,6 +934,10 @@ async def _camera_loop(camera_id: str) -> None:
                         last_pos_msec = pos_msec
 
                     last_detections = await _process_frame(db, camera, frame, frame_idx, w, h, frame_source_ts, last_detections)
+                    if preview_due:
+                        annotated_jpeg = await asyncio.to_thread(_encode_annotated, frame, last_detections)
+                        if annotated_jpeg is not None:
+                            LATEST_FRAMES[camera_id] = annotated_jpeg
                     # Highest-frequency commit in the whole pipeline (up to
                     # once/sec per camera, so N concurrent cameras = N/sec
                     # writers to the same SQLite file) — real production logs
