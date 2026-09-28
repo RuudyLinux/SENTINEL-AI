@@ -154,6 +154,7 @@ class RTSPAdapter(_GrabMixin, CameraAdapter):
             self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, _OPEN_TIMEOUT_MS)
             self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, _READ_TIMEOUT_MS)
         except Exception:
+            # Not every OpenCV build supports these; the asyncio open timeout still applies.
             pass
         return self.cap.isOpened()
 

@@ -85,7 +85,7 @@ def record_event_sync(
         try:
             db.rollback()
         except Exception:
-            pass
+            pass  # best effort; the failure is already logged above
         return None
     finally:
         db.close()
