@@ -1,5 +1,5 @@
 "use client";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket } from "@/lib/useLiveSocket";
@@ -25,9 +25,8 @@ export default function SelfHealProblemsPage() {
   ].filter(Boolean).join("&")}`;
   const { data, error, reload } = useApiData<ProblemEvent[]>(path, { pollMs: 6000 });
 
-  // Live-updates the moment a new self-heal event lands (see self_heal/
-  // engine.py's WebSocket broadcast) — reload rather than append, since a
-  // problem's OWN latest event replaces its row rather than adding a new one.
+  // refresh when a self-heal event arrives over the websocket; reload rather
+  // than append since a problem's latest event replaces its row
   useLiveSocket((e) => {
     if (e.type === "self_heal_event") reload();
   });

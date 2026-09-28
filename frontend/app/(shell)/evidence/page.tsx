@@ -7,7 +7,7 @@ import ErrorState from "@/components/ErrorState";
 export default function EvidenceLibraryPage() {
   const router = useRouter();
   const { data: evidence, error, reload } = useApiData<any[]>("/api/evidence");
-  const { data: camerasData } = useApiData<any[]>("/api/cameras");
+  const { data: camerasData } = useApiData<any[]>("/api/cameras?include_retired=true");
   const cameras = camerasData || [];
 
   const columns: Column<any>[] = [

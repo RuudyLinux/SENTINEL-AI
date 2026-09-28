@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SENTINEL VISION – High-Level Design</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 18mm 16mm; }
+  :root { --navy:#0B1628; --ink:#14223A; --text:#1B2536; --muted:#5A6B82; --line:#D5DEEA; --cyan:#0891B2; --teal:#0F9F8F; --orange:#EA6A10; --red:#D63B3B; --amber:#C98106; --soft:#F2F6FB; }
+  * { box-sizing: border-box; }
+  body { font-family: Inter, "Segoe UI", Arial, sans-serif; color: var(--text); font-size: 10.2pt; line-height: 1.5; margin: 0; }
+  h1 { font-size: 20pt; margin: 0 0 4mm; color: var(--ink); }
+  h2 { font-size: 14pt; color: var(--ink); margin: 9mm 0 2.5mm; padding-bottom: 1.5mm; border-bottom: 2px solid var(--cyan); break-after: avoid; }
+  h3 { font-size: 11pt; color: var(--ink); margin: 5mm 0 1.5mm; break-after: avoid; }
+  p { margin: 0 0 2.6mm; }
+  ul { margin: 0 0 3mm 5mm; padding-left: 3mm; }
+  li { margin-bottom: 1mm; }
+  code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 9pt; background: var(--soft); padding: 0 1.2mm; border-radius: 2px; }
+  table { width: 100%; border-collapse: collapse; margin: 2mm 0 4mm; font-size: 9.2pt; break-inside: avoid; }
+  th { background: var(--ink); color: #fff; text-align: left; padding: 1.8mm 2.2mm; font-weight: 600; }
+  td { border-bottom: 1px solid var(--line); padding: 1.6mm 2.2mm; vertical-align: top; }
+  tr:nth-child(even) td { background: #F8FAFD; }
+  .cover { height: 250mm; background: var(--navy); color: #E6EDF6; margin: -18mm -16mm 0; padding: 40mm 22mm; position: relative; break-after: page; }
+  .cover .kicker { color: #22D3EE; letter-spacing: .18em; font-size: 9pt; font-weight: 700; }
+  .cover h1 { color: #fff; font-size: 34pt; margin: 6mm 0 3mm; letter-spacing: .02em; }
+  .cover .sub { font-size: 15pt; color: #B8C6DA; max-width: 150mm; }
+  .cover .doc { margin-top: 18mm; font-size: 13pt; color: #fff; font-weight: 600; }
+  .cover .meta { position: absolute; bottom: 30mm; left: 22mm; right: 22mm; font-size: 9.5pt; color: #93A4BC; border-top: 1px solid #24476F; padding-top: 5mm; }
+  .cover .bar { width: 60mm; height: 3px; background: linear-gradient(90deg, #22D3EE, #2DD4BF); margin-top: 8mm; }
+  .toc { columns: 2; column-gap: 10mm; font-size: 9.8pt; }
+  .toc div { margin-bottom: 1.4mm; }
+  .tag { display: inline-block; font-size: 7.5pt; font-weight: 700; letter-spacing: .06em; padding: .3mm 1.8mm; border-radius: 2mm; margin-right: 1.5mm; vertical-align: 1px; }
+  .cur { background: #DDF4F1; color: #0B7466; } .dem { background: #DDEFFA; color: #075985; } .fut { background: #EEE8FB; color: #5B3AA6; } .lim { background: #FDEBDD; color: #9A3F07; }
+  .note { border-left: 4px solid var(--amber); background: #FFF8EA; padding: 2.5mm 3.5mm; margin: 2mm 0 4mm; break-inside: avoid; }
+  .note.red { border-color: var(--red); background: #FDF0F0; }
+  .note.blue { border-color: var(--cyan); background: #EAF7FB; }
+  figure { margin: 3mm 0 5mm; break-inside: avoid; }
+  figure img { width: 100%; border: 1px solid var(--line); border-radius: 2mm; }
+  figcaption { font-size: 8.6pt; color: var(--muted); margin-top: 1.2mm; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 4mm; }
+  .pb { break-before: page; }
+  .small { font-size: 8.8pt; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <div class="kicker">GOVERNMENT CHALLENGE SUBMISSION</div>
+  <h1>SENTINEL VISION</h1>
+  <div class="sub">Unified CCTV Intelligence &amp; Real-Time Smart Policing Platform</div>
+  <div class="bar"></div>
+  <div class="doc">High-Level Design / Architecture Document</div>
+  <div class="meta">
+    Version 1.0 · September 2026<br>
+    Repository: github.com/RuudyLinux/SENTINEL-AI (branch <code style="background:none;color:#B8C6DA">demo-readiness-phase2</code>, PR #2)<br>
+    Every capability in this document is checked against the code. Items are labelled
+    <b style="color:#5EEAD4">Current implementation</b>, <b style="color:#7DD3FC">Demonstrated capability</b> or
+    <b style="color:#C4B5FD">Planned / future scale</b>.
+  </div>
+</section>
+
+<h1>Contents</h1>
+<div class="toc">
+  <div>1. Executive Summary</div><div>2. Problem Context</div><div>3. Solution Overview</div><div>4. System Architecture</div>
+  <div>5. Component Architecture</div><div>6. Camera / VMS Integration</div><div>7. Video Processing Pipeline</div><div>8. AI Analytics</div>
+  <div>9. ANPR Pipeline</div><div>10. Rules &amp; Event Engine</div><div>11. Alert &amp; Incident Management</div><div>12. Evidence Management</div>
+  <div>13. GIS / Camera Map</div><div>14. Self-Heal Architecture</div><div>15. Security Architecture</div><div>16. Database Architecture</div>
+  <div>17. API / WebSocket Architecture</div><div>18. Deployment Architecture</div><div>19. Current Limitations</div><div>20. Scalability Roadmap</div>
+  <div>21. Technology Stack</div><div>22. Testing &amp; Verification</div><div>23. Conclusion</div>
+</div>
+<p class="small" style="margin-top:6mm">Labels used throughout:
+<span class="tag cur">CURRENT</span> implemented in the repository ·
+<span class="tag dem">DEMONSTRATED</span> shown working on real or recorded camera footage ·
+<span class="tag fut">FUTURE</span> planned, not implemented ·
+<span class="tag lim">LIMITATION</span> known issue.</p>
+
+<h2>1. Executive Summary</h2>
+<p>SENTINEL VISION is a working CCTV intelligence platform. It registers cameras from different sources in one catalogue, runs AI analytics on their video, turns detections into rule-based alerts and incidents, captures tamper-evident evidence, and gives control-room operators one web dashboard for live monitoring, mapping and investigation.</p>
+<p>The system runs today as a FastAPI backend with a per-camera asyncio pipeline, Ultralytics YOLO11s detection on a shared GPU model, ByteTrack tracking, a plate detector with EasyOCR for number plates, and a Next.js 16 dashboard. It has been exercised against a real 30-camera Sentinel Grid catalogue as well as local video, webcam and RTSP sources.</p>
+<p>This document describes the architecture as it exists, the measured behaviour, and the known limitations. Scale-out items (multi-node workers, edge AI, message bus) are described in Section 20 and are <b>not</b> implemented.</p>
+
+<h2>2. Problem Context</h2>
+<ul>
+  <li><b>Fragmented CCTV.</b> Cameras sit behind different vendors, recorders and VMS products, each with its own interface.</li>
+  <li><b>Manual monitoring.</b> Operators watch many feeds at once; attention does not scale with camera count.</li>
+  <li><b>Late identification.</b> Events such as a watch-listed vehicle or an intrusion into a restricted area are often found only after the fact.</li>
+  <li><b>Slow investigation.</b> Reconstructing where a vehicle went means scrubbing footage camera by camera and collecting evidence by hand.</li>
+  <li><b>Unreliable connectivity.</b> Streams drop, credentials expire and bandwidth varies; a monitoring system has to notice and recover on its own.</li>
+</ul>
+
+<h2>3. Solution Overview</h2>
+<table>
+  <tr><th style="width:28%">Capability</th><th>What SENTINEL VISION does</th><th style="width:16%">Status</th></tr>
+  <tr><td>Unified camera registry</td><td>One catalogue for webcam, video file, RTSP, Sentinel Grid and mock VMS sources, with catalogue sync, status and health per camera.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>AI video analytics</td><td>Person and vehicle detection (YOLO11s), multi-object tracking (ByteTrack), plate localisation and OCR (EasyOCR), switchable per camera.</td><td><span class="tag dem">DEMONSTRATED</span></td></tr>
+  <tr><td>Rules and events</td><td>Restricted zones, watchlists, loitering and a risk score produce alerts; CRITICAL alerts open or join incidents.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>Evidence</td><td>Snapshots, event clips and operator REC recordings, hashed at capture, verified on access, packaged per incident.</td><td><span class="tag dem">DEMONSTRATED</span></td></tr>
+  <tr><td>GIS map</td><td>Leaflet/OpenStreetMap camera map and vehicle journey maps; 19 of 30 grid cameras placed.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>Self-Heal</td><td>Camera health states, reconnect with backoff, grid-wide breaker, database retry, recovery events visible to operators.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>Security</td><td>JWT login, five roles with per-route RBAC, short-lived stream/evidence tokens, hash-chained audit log.</td><td><span class="tag cur">CURRENT</span></td></tr>
+</table>
+
+<h2 class="pb">4. System Architecture</h2>
+<figure><img src="../diagrams/architecture_diagram.png" alt="High-level architecture"><figcaption>Figure 1. High-level architecture. Every box is implemented; future items are listed only at the bottom.</figcaption></figure>
+<p>The system has four tiers. The <b>presentation</b> tier is a Next.js 16 / React 18 web application with 34 operator screens. The <b>API</b> tier is FastAPI: about 98 REST endpoints across 19 routers, a WebSocket at <code>/ws</code>, and token-protected stream and evidence routes. The <b>pipeline</b> tier runs one asyncio task per connected camera inside the backend process. The <b>data</b> tier is a relational database (SQLite in the demo, PostgreSQL + PostGIS in the Docker Compose deployment), an evidence file store, and an optional Valkey (Redis-protocol) store for shared runtime state.</p>
+
+<h2>5. Component Architecture</h2>
+<table>
+  <tr><th style="width:26%">Component</th><th>Responsibility</th><th style="width:30%">Code</th></tr>
+  <tr><td>Camera adapters</td><td>Open and read each source type; RTSP transport and buffer options; grid URL built in memory only.</td><td><code>pipeline/adapters.py</code>, <code>source.py</code></td></tr>
+  <tr><td>Grid supervisor</td><td>Catalogue discovery, autoconnect, staggered connects, escalating breaker with a probe camera.</td><td><code>pipeline/supervisor.py</code>, <code>sentinel_grid.py</code></td></tr>
+  <tr><td>Frame reader</td><td>Dedicated thread per camera keeps only the latest frame; grabs without decoding when nothing needs pixels.</td><td><code>pipeline/frame_reader.py</code></td></tr>
+  <tr><td>Camera worker</td><td>Per-camera loop: health state, preview, clip ring buffer, AI, persistence, heartbeat.</td><td><code>pipeline/worker.py</code></td></tr>
+  <tr><td>AI capacity guard</td><td>Grants AI slots per camera; rotates slots when more cameras want AI than the hardware can serve.</td><td><code>pipeline/ai_capacity.py</code></td></tr>
+  <tr><td>Detector / tracker</td><td>One shared YOLO11s model, one ByteTrack tracker per camera.</td><td><code>pipeline/detector.py</code></td></tr>
+  <tr><td>ANPR</td><td>Plate localisation, preprocessing variants, EasyOCR, per-track vote.</td><td><code>plate_detector.py</code>, <code>anpr.py</code>, <code>plate_tracker.py</code></td></tr>
+  <tr><td>Correlation</td><td>Vehicles, plate sightings, tracks, cross-camera journeys, appearance similarity.</td><td><code>pipeline/correlate.py</code>, <code>appearance.py</code></td></tr>
+  <tr><td>Rules engine</td><td>Zones, watchlists, loitering, cooldowns, risk score, alert and incident creation.</td><td><code>pipeline/rules_engine.py</code>, <code>risk.py</code></td></tr>
+  <tr><td>Clips / recorder</td><td>Event clips around alerts; operator REC button records annotated MP4 evidence.</td><td><code>pipeline/clips.py</code>, <code>recorder.py</code></td></tr>
+  <tr><td>Self-Heal</td><td>Failure classification, events, open problems, recovery reporting.</td><td><code>app/self_heal/</code></td></tr>
+  <tr><td>Security</td><td>Password hashing, JWT, resource tokens, RBAC dependencies, audit chain.</td><td><code>security.py</code>, <code>audit.py</code></td></tr>
+</table>
+
+<h2>6. Camera / VMS Integration</h2>
+<p><span class="tag cur">CURRENT</span> Cameras live in one registry table with code, name, location, coordinates, source type and AI switches. Adapters hide how each source is read, so the rest of the pipeline sees the same frames whatever the camera is.</p>
+<table>
+  <tr><th style="width:22%">Source</th><th>How it is integrated</th><th style="width:18%">Status</th></tr>
+  <tr><td>Webcam</td><td>Local device index through OpenCV.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>Video file</td><td>Uploaded through the dashboard, validated, looped as a continuous feed.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>RTSP</td><td>OpenCV/FFmpeg with configurable TCP or UDP transport and receive buffer.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>Sentinel Grid</td><td>Cookie login to the grid, catalogue sync of 30 cameras, RTSP over UDP, WHEP live video where offered. Credentials only in <code>.env</code>, never logged or returned.</td><td><span class="tag dem">DEMONSTRATED</span></td></tr>
+  <tr><td>Mock VMS</td><td>Synthetic feed that proves the generic VMS adapter interface.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>ONVIF / other VMS</td><td>Interface stub only; a new VMS is added as another adapter behind the same interface.</td><td><span class="tag fut">FUTURE</span></td></tr>
+</table>
+<div class="note"><b>Grid status (known, not fully resolved).</b> Grid authentication is only partly working. In recent runs about 29 cameras sat in a degraded (reconnecting) state while a few connected, with roughly 3.4 Mbit/s of total video received. At other times the grid rejected the account outright (HTTP 401/403). In one earlier controlled test over UDP, 27 of 30 streams delivered about 51 Mbit/s in total; over TCP the account was capped near 5 Mbit/s. The platform does not claim 30 simultaneous grid streams.</div>
+
+<h2>7. Video Processing Pipeline</h2>
+<p>Each connected camera gets one asyncio task and one reader thread. The reader keeps only the newest frame, so a slow consumer never builds a backlog. When nobody watches the camera and AI is off, it grabs packets without decoding them, which measured 5.9 ms per 1080p HEVC frame against 12.9 ms for a full decode.</p>
+<ol>
+  <li>Read the latest frame and its stream-relative timestamp.</li>
+  <li>Update health: CONNECTED (frames, AI off), PROCESSING (frames and AI), DEGRADED, RECONNECTING, AUTH_ERROR, DISCONNECTED.</li>
+  <li>Push a frame to the clip ring buffer and refresh the annotated preview for viewers.</li>
+  <li>If the camera holds an AI slot, run detection and tracking, then ANPR, persistence and rules.</li>
+  <li>Commit a heartbeat (last frame time, status) at most every 2 seconds.</li>
+</ol>
+
+<h2>8. AI Analytics</h2>
+<p><span class="tag cur">CURRENT</span> Detection uses Ultralytics <b>YOLO11s</b> (COCO classes: person, car, motorbike, bus, truck) at 960 px. YOLOv8s was the earlier baseline and was replaced after benchmarking. One model instance is shared across cameras on the GPU under a lock; each camera keeps its own <b>ByteTrack</b> tracker, so track IDs never mix between cameras. Measured GPU inference was about 24 ms per frame on the development laptop (RTX 3050 Ti).</p>
+<p><b>Selective analytics.</b> Person, vehicle and ANPR analytics are switched on per camera. When more cameras want AI than the hardware can serve, the capacity guard rotates AI slots between them (60 s turns) instead of starving some cameras permanently.</p>
+<div class="note blue"><b>Measured detection quality, with its caveats.</b> On the project's internal benchmark of grid frames, YOLO11s at 960 px scored vehicle precision 0.860 / recall 0.508 and person precision 0.959 / recall 0.538 (<code>docs/AI_ACCURACY.md</code>). The reference labels were built from agreeing model runs and reviewed by an AI assistant, not trained annotators, so these figures are an engineering comparison between configurations, not a certified accuracy.</div>
+
+<h2>9. ANPR Pipeline</h2>
+<ol>
+  <li>A vehicle detection with a track ID is cropped from the frame.</li>
+  <li>A fine-tuned YOLO plate detector localises the plate; perspective correction applies to skewed plates.</li>
+  <li>Preprocessing builds image variants; <b>EasyOCR</b> reads each and the best-agreeing read wins.</li>
+  <li>A read must pass a gate (Indian plate format, state codes, confidence) to count.</li>
+  <li>Reads are <b>voted</b> across frames of the same track. One lucky frame is stored as uncorroborated and goes to review; a CRITICAL watchlist alert needs corroboration across frames.</li>
+  <li>The sighting links to a vehicle record, which builds the cross-camera journey.</li>
+</ol>
+<p>OCR runs before any database write for the detection, so slow OCR never holds the database write lock.</p>
+
+<h2>10. Rules &amp; Event Engine</h2>
+<table>
+  <tr><th style="width:24%">Rule</th><th>Behaviour</th></tr>
+  <tr><td>Restricted zone</td><td>A confident detection inside an active zone, within its schedule, seen for at least two frames of the same track.</td></tr>
+  <tr><td>Watchlist plate</td><td>Fires only for an active watchlist entry (the entry is the authority, not a cached flag). Severity is capped at HIGH until the plate read is confident and corroborated.</td></tr>
+  <tr><td>Loitering</td><td>Dwell time in a zone above the zone's threshold, where an active loitering rule targets it.</td></tr>
+  <tr><td>Risk score</td><td>Combines zone severity, watchlist priority, plate confidence and vehicle history; it can raise severity, never lower a rule's CRITICAL.</td></tr>
+</table>
+<p>Cooldowns per camera, rule and track stop one object from raising the same alert every frame. With Valkey configured, cooldowns are shared across backend processes.</p>
+
+<h2>11. Alert &amp; Incident Management</h2>
+<p><span class="tag cur">CURRENT</span> An alert stores its reasons, severity, risk factors, detection, vehicle and snapshot, and is pushed to every dashboard over the WebSocket. Operators acknowledge, escalate or dismiss alerts, and feedback is recorded. A CRITICAL alert opens an incident or joins an open one for the same vehicle (or camera) within the correlation window, so one vehicle crossing four cameras becomes one incident whose title and priority grow with it. Incidents carry status, notes and a summary endpoint.</p>
+<figure><img src="../screenshots/09_incident_detail.png" alt="Incident detail"><figcaption>Figure 2. Incident detail from the running system.</figcaption></figure>
+
+<h2>12. Evidence Management</h2>
+<ul>
+  <li><b>Snapshot</b> for every alert, from the same frame.</li>
+  <li><b>Event clip</b> assembled from the pre-event ring buffer and post-event frames.</li>
+  <li><b>REC recording</b>: the operator starts and stops an annotated MP4 recording on a live camera; it is saved as evidence.</li>
+  <li><b>Integrity</b>: SHA-256 computed at capture, re-verified on access (VERIFIED badge), model and rule versions stamped on the record.</li>
+  <li><b>Access</b>: evidence files open only with a short-lived signed token (300 s), and every access is audited.</li>
+  <li><b>Evidence package</b> per incident: summary, camera timeline, vehicle details, evidence list, notes and audit trail, as JSON or PDF, with optional plate redaction for wider distribution.</li>
+  <li><b>Governance</b>: retention and purge controls (<code>routers/governance.py</code>, <code>docs/PRIVACY_GOVERNANCE.md</code>).</li>
+</ul>
+
+<h2 class="pb">13. GIS / Camera Map</h2>
+<p><span class="tag cur">CURRENT</span> The map uses Leaflet with OpenStreetMap tiles. The Sentinel Grid catalogue supplies no coordinates, so camera positions were looked up once in OpenStreetMap (Nominatim and Overpass) from each camera's place name and stored in <code>pipeline/grid_locations.json</code>, with the precision of each point.</p>
+<ul>
+  <li><b>19 of 30</b> grid cameras have usable positions: 10 at a landmark or junction, 5 at neighbourhood level, 4 at town level only.</li>
+  <li><b>11 cameras are intentionally not mapped</b> because no reliable match was found. They are not guessed; the map states how many are not shown.</li>
+  <li>A position is applied only if the camera's catalogue name still matches, and never overwrites a position an operator set.</li>
+  <li>The map fits all mapped cameras; cameras sharing one position are combined into a single marker with a count (for example the three Bilimora cameras).</li>
+  <li>Status colours with a legend: online (green), degraded/reconnecting (amber), offline (grey).</li>
+  <li>The vehicle journey map shows sightings on the cameras' positions; GRID-cam06 was verified at Timbavadi, Junagadh.</li>
+  <li>Nearby-camera search uses PostGIS <code>ST_DWithin</code> on PostgreSQL and a haversine fallback on SQLite.</li>
+</ul>
+<figure><img src="../screenshots/02_camera_map.png" alt="Camera network map"><figcaption>Figure 3. Camera network map: 19 cameras placed across Gujarat, grouped marker for Bilimora, 11 reported as not shown. Change in PR #2.</figcaption></figure>
+
+<h2>14. Self-Heal Architecture</h2>
+<table>
+  <tr><th style="width:26%">Failure</th><th>Detection and recovery</th></tr>
+  <tr><td>Stream drop / read failure</td><td>Camera goes DEGRADED, then RECONNECTING with per-camera backoff; recovers on its own when frames return.</td></tr>
+  <tr><td>Grid-wide rejection</td><td>Breaker pauses all grid connects for 5 minutes, doubling on each repeat up to 60 minutes; after a pause one probe camera must connect before the rest try. This protects the grid account from connect storms.</td></tr>
+  <tr><td>Database lock</td><td>Commit/flush retry with rollback and reapply of the pending write; each lock recovery is recorded as a Self-Heal event.</td></tr>
+  <tr><td>Worker crash</td><td>Last-resort guard logs the traceback, marks the camera offline and frees its AI slot; other cameras are unaffected.</td></tr>
+  <tr><td>WebSocket drop</td><td>The dashboard reconnects on its own with bounded exponential backoff.</td></tr>
+</table>
+<p>Every failure is classified and stored as a Self-Heal event; repeated failures become an open "problem" with its history, shown on the Health Dashboard, Problems, Recovery Activity, Error Logs and Camera Health screens.</p>
+
+<h2>15. Security Architecture</h2>
+<ul>
+  <li><b>Authentication</b>: bcrypt password hashes, JWT bearer tokens, login rate limiting per user and IP.</li>
+  <li><b>RBAC</b>: five roles (Administrator, Control Room Operator, Investigator, Supervisor, Auditor) enforced per route on the server; the UI only mirrors it.</li>
+  <li><b>Resource tokens</b>: live streams (1 h) and evidence files (5 min) use short-lived signed tokens scoped to one resource, so a URL in a browser history is not a standing credential.</li>
+  <li><b>Audit log</b>: every sensitive action is written to an append-only, hash-chained log; <code>GET /api/audit/verify-chain</code> detects any edited or deleted row.</li>
+  <li><b>Secrets</b>: grid and database credentials come from the environment only; the credentialed RTSP URL is built in memory and never stored, logged or returned. Logs pass through redaction.</li>
+  <li><b>Threat model</b> in <code>docs/THREAT_MODEL.md</code>; CI runs CodeQL analysis.</li>
+</ul>
+
+<h2>16. Database Architecture</h2>
+<p>SQLAlchemy models cover cameras, detections, vehicles, plates, tracks, alerts, incidents (with alert links and notes), evidence, zones, rules, watchlists, users/roles, audit logs and Self-Heal events. Alembic manages migrations.</p>
+<table>
+  <tr><th style="width:24%">Database</th><th>Role</th><th style="width:18%">Status</th></tr>
+  <tr><td>SQLite (WAL)</td><td>The demo and development database; used in the demonstration shown with this submission.</td><td><span class="tag cur">CURRENT</span></td></tr>
+  <tr><td>PostgreSQL 16 + PostGIS</td><td>The Docker Compose deployment path. CI builds the stack, runs Alembic to head, and checks the schema has no drift. PostGIS adds an indexed camera geography column.</td><td><span class="tag cur">CURRENT</span> (not load-tested with a live camera fleet)</td></tr>
+  <tr><td>Valkey</td><td>Optional shared runtime state (cooldowns, rate limits); in-process when absent.</td><td><span class="tag cur">CURRENT</span></td></tr>
+</table>
+<div class="note red"><b>SQLite write contention (known limitation, recently fixed).</b> SQLite allows one writer at a time. With the grid cameras connected, logins were observed taking 18 to 149 seconds. The measured cause was a camera holding the write lock while its commit waited for a free thread on a pool busy with AI work. A fix (commit <code>795ebc8</code>) gives database operations their own threads, moves snapshot I/O out of open transactions, stops a blocking flush on the event loop, and throttles error-count writes. It is covered by regression tests. Afterwards, login measured 0.25 s median with 8 cameras; it has <b>not yet been re-verified with all 30 grid cameras streaming</b>, because grid access was blocked at the time. SQLite remains a single-writer database; PostgreSQL is the recommended production database for a larger fleet.</div>
+
+<h2>17. API / WebSocket Architecture</h2>
+<p><b>REST</b> (FastAPI, about 98 endpoints): auth, users, cameras and camera control (bulk connect, start, AI, restart, disconnect), catalogue sync, streams, detections, vehicles, persons, alerts, incidents, evidence, zones, rules, watchlists, review, search, analytics, audit, governance, Self-Heal, system diagnostics and Prometheus metrics. OpenAPI documentation is served at <code>/docs</code>.</p>
+<p><b>WebSocket</b> <code>/ws</code> (authenticated) pushes 12 event types: <code>detection.created</code>, <code>detection.batch</code>, <code>plate.detected</code>, <code>plate.updated</code>, <code>vehicle.sighting</code>, <code>vehicle.route.updated</code>, <code>alert.created</code>, <code>incident.created</code>, <code>camera.status</code>, <code>camera.health</code>, <code>self_heal.recovery</code> and <code>bulk_progress</code>.</p>
+<p><b>Video to the browser</b>: annotated MJPEG per camera (token-protected); WHEP WebRTC where the grid offers it.</p>
+
+<h2>18. Deployment Architecture</h2>
+<table>
+  <tr><th style="width:24%">Mode</th><th>What runs</th><th style="width:18%">Status</th></tr>
+  <tr><td>Single machine (demo)</td><td><code>start.bat</code>: backend (Uvicorn, GPU environment when CUDA works, CPU otherwise) and the built Next.js frontend. SQLite, evidence on local disk.</td><td><span class="tag dem">DEMONSTRATED</span></td></tr>
+  <tr><td>Docker Compose</td><td>PostgreSQL + PostGIS, Valkey, backend (migrated on start) and frontend containers. Secrets from the environment; the stack refuses to start without them.</td><td><span class="tag cur">CURRENT</span> (CI-built)</td></tr>
+  <tr><td>Multi-node / cloud</td><td>Separate AI worker nodes, orchestration, managed database.</td><td><span class="tag fut">FUTURE</span></td></tr>
+</table>
+
+<h2>19. Current Limitations</h2>
+<table>
+  <tr><th style="width:30%">Limitation</th><th>Detail</th></tr>
+  <tr><td>Grid streaming</td><td>Grid authentication partly working; about 29 cameras degraded and about 3.4 Mbit/s observed in recent runs. Not all 30 stream at once.</td></tr>
+  <tr><td>SQLite concurrency</td><td>Single writer. Login contention fixed and tested, but not re-verified with 30 live grid streams.</td></tr>
+  <tr><td>Map coverage</td><td>11 of 30 grid cameras have no reliable location and are not mapped; 4 are town-level only.</td></tr>
+  <tr><td>Single process</td><td>All camera workers run in one backend process on one machine; AI throughput is bounded by that machine's GPU.</td></tr>
+  <tr><td>Accuracy</td><td>Detection and ANPR figures come from small internal benchmarks, not certified evaluation. ANPR on real CCTV is harder than on the benchmark crops.</td></tr>
+  <tr><td>VMS coverage</td><td>ONVIF and vendor VMS adapters are not implemented beyond the interface and a mock.</td></tr>
+</table>
+
+<h2>20. Scalability Roadmap</h2>
+<p><span class="tag fut">FUTURE</span> None of the items below is implemented. They are the intended path from a single-site deployment to a larger fleet.</p>
+<ol>
+  <li><b>PostgreSQL as the default database</b> for any multi-camera deployment (the Compose path exists; make it the standard and load-test it).</li>
+  <li><b>Separate AI worker processes / nodes</b>, each owning a set of cameras, coordinated through the database and Valkey.</li>
+  <li><b>Event streaming</b> between ingestion, analytics and alerting, with a message bus, once one node is no longer enough.</li>
+  <li><b>Edge AI</b> at camera clusters, sending events and clips instead of full video.</li>
+  <li><b>More VMS adapters</b> (ONVIF, vendor SDKs) behind the existing adapter interface.</li>
+  <li><b>Container orchestration</b> for the multi-node deployment.</li>
+</ol>
+
+<h2>21. Technology Stack</h2>
+<table>
+  <tr><th style="width:26%">Layer</th><th>Technology</th></tr>
+  <tr><td>Frontend</td><td>Next.js 16, React 18, TypeScript, Tailwind CSS, Leaflet 1.9 with OpenStreetMap</td></tr>
+  <tr><td>Backend</td><td>Python 3.11, FastAPI, Uvicorn, Pydantic settings, SQLAlchemy 2, Alembic</td></tr>
+  <tr><td>AI / video</td><td>Ultralytics YOLO11s, ByteTrack, YOLO plate detector, EasyOCR, OpenCV with FFmpeg, PyTorch (CUDA when available)</td></tr>
+  <tr><td>Data</td><td>SQLite (WAL); PostgreSQL 16 + PostGIS (Compose); Valkey (optional)</td></tr>
+  <tr><td>Security</td><td>bcrypt, JWT (python-jose), signed resource tokens, hash-chained audit</td></tr>
+  <tr><td>Operations</td><td>Docker, Docker Compose, Prometheus metrics, GitHub Actions (backend, frontend, Docker, CodeQL)</td></tr>
+</table>
+
+<h2>22. Testing &amp; Verification</h2>
+<table>
+  <tr><th style="width:34%">Check</th><th>Result</th></tr>
+  <tr><td>Backend test suite (pytest)</td><td>1101 passed, 18 skipped (after the contention fix, commit <code>795ebc8</code>); 1096 passed after the map change (commit <code>607fc72</code>)</td></tr>
+  <tr><td>Frontend unit tests (Vitest)</td><td>23 passed; TypeScript type check clean</td></tr>
+  <tr><td>Browser end-to-end tests (Playwright)</td><td>10 passed (login, live control room, plate search, vehicle, operator screens, camera control confirmation, console hygiene at phone and laptop widths)</td></tr>
+  <tr><td>Full-site click-through</td><td>34 pages and every visible button exercised on a copy of the database; no JavaScript errors, no page crashes, no server errors after fixes</td></tr>
+  <tr><td>CI (GitHub Actions)</td><td>Backend, Frontend, Docker (Compose with PostgreSQL + migration check) and CodeQL passed on PR #2</td></tr>
+  <tr><td>Regression tests for contention</td><td>Commit starved of a thread, event-loop freeze during an alert flush, snapshot inside a transaction: each fails on the old code and passes now</td></tr>
+</table>
+
+<h2>23. Conclusion</h2>
+<p>SENTINEL VISION already covers the full path a control room needs: cameras from mixed sources in one registry, AI detection, tracking and number-plate reading, rule-based alerts that grow into correlated incidents, evidence that can be verified and packaged, a camera map, and self-healing connectivity, all behind role-based access and an audit trail that shows tampering. The known limits are stated plainly: partial grid streaming, SQLite as a single-writer demo database, and a partly mapped camera fleet. The roadmap addresses them in order, starting with PostgreSQL as the standard database and separate AI workers.</p>
+
+</body>
+</html>

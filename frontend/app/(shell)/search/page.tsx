@@ -41,6 +41,7 @@ export default function SearchPage() {
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
+          aria-label="Search plates, cameras and incidents"
           placeholder="Find GJ05AB1234 after 18:00, or search a camera/incident..."
           className="flex-1 bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent"
         />

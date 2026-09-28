@@ -1,198 +1,191 @@
 # SENTINEL VISION
 
-Unified CCTV Intelligence & Real-Time Smart Policing Platform — built from
-`SENTINEL_VISION_Master_Project_Documentation_Gujarat_Police_Innovation_Challenge_2026.docx`
-for the Gujarat Police Innovation Challenge 2026.
+Unified CCTV intelligence and real-time smart policing platform, built for the Gujarat Police
+Innovation Challenge 2026.
 
-Real, running system: a FastAPI backend runs actual YOLOv8 detection + ByteTrack tracking + 
-EasyOCR ANPR against a webcam or an uploaded video file, persists everything to SQLite, and
-evaluates a real rules engine that produces explainable alerts and auto-created incidents.
-A Next.js dashboard covers the full site map from the doc against that live backend — no
-mocked data.
+SENTINEL VISION connects cameras from different sources into one registry, runs person and
+vehicle detection, tracking and number-plate recognition on their video, turns detections into
+rule-based alerts and correlated incidents, captures tamper-evident evidence, and gives
+control-room operators one web dashboard for live monitoring, mapping and investigation.
 
-## Run order
+## Capabilities
 
-1. **Backend**:
-   ```
-   cd backend
-   .venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8000
-   ```
-2. **Frontend**:
-   ```
-   cd frontend
-   npm run dev
-   ```
-3. Open http://localhost:3000 → log in (`admin` / `sentinel123`) → **Cameras → Add Camera**
-   → upload a short video (or use a webcam) → **Live Cameras** to watch real detections stream
-   in, or add a **Restricted Zone** / **Watchlist** entry under Map / Watchlists to see the
-   real rules engine fire an alert and auto-create an incident, then **Investigate** →
-   **Generate Evidence Package**.
+- **Camera integration**: one registry for webcams, uploaded video files, RTSP streams, the
+  Sentinel Camera Grid catalogue and a mock VMS adapter. ONVIF is an interface stub.
+- **AI analytics**: Ultralytics YOLO11s person and vehicle detection on one shared GPU model,
+  a ByteTrack tracker per camera, selectable per camera. AI slots rotate when the hardware is
+  short.
+- **ANPR**: YOLO plate detector, EasyOCR, Indian plate-format validation and multi-frame voting.
+  Uncorroborated reads go to a review queue.
+- **Rules and alerts**: restricted zones (with schedules), watchlists and loitering, with
+  cooldowns and an explainable risk score. CRITICAL alerts open or join incidents.
+- **Evidence**: a snapshot per alert, event clips, operator REC recordings, SHA-256 at capture,
+  and incident evidence packages (JSON or PDF, optional plate redaction).
+- **GIS**: Leaflet/OpenStreetMap camera map and vehicle journey maps; nearby-camera search.
+- **Self-Heal**: camera health states, reconnect with backoff, a grid-wide circuit breaker,
+  database lock retry, and recovery events shown to operators.
+- **Security**: JWT login with rate limiting, five roles with per-route RBAC, short-lived
+  stream and evidence tokens, WebSocket authentication, and a hash-chained audit log.
 
-## Real Sentinel Camera Grid (live-verified)
+## Architecture
 
-Beyond the official Gujarat catalogue, this build also integrates a second real, live camera
-source — 30 real traffic cameras — with genuine end-to-end verification: discovery, RTSP
-connection, real frames, real YOLOv8+ByteTrack detections, real alerts, incidents, and evidence
-snapshots. Setup/troubleshooting: put `SENTINEL_GRID_EMAIL`/`SENTINEL_GRID_PASSWORD` in
-`backend/.env` (see `backend/.env.example`), then **Cameras → Sync Sentinel Grid** to register
-(never auto-starts AI), then **Start**/**Connect** per camera or from the **Camera Control
-Center** (see below) — the 24/7 auto-connect supervisor (`app/pipeline/supervisor.py`) keeps
-eligible ones reconnected afterward, up to `SENTINEL_GRID_MAX_AUTOCONNECT`.
+```
+Camera sources ──> adapters ──> per-camera worker ──> YOLO11s + ByteTrack ──> ANPR
+                                     │                                          │
+                                     ▼                                          ▼
+                        clip buffer, preview (MJPEG)              correlation ──> rules engine
+                                                                                   │
+                                          alerts ──> incidents ──> evidence <──────┘
+                                                        │
+             FastAPI REST + WebSocket <─────────────────┘ ──> Next.js dashboard
+             SQLite (dev) / PostgreSQL + PostGIS (Compose), evidence store, optional Valkey
+```
 
-Credentials go in `backend/.env` only (gitignored — see `backend/.env.example`), **never** in
-source, docs, or committed anywhere. They never reach the frontend.
+The backend is one FastAPI process. Each connected camera runs as an asyncio task with its own
+frame-reader thread. Blocking work (decoding, inference, OCR, file I/O) runs in a thread pool
+sized to the camera count, and database operations run on a dedicated executor. Detections,
+alerts and camera state reach dashboards over a WebSocket. The detailed design is in
+`Documentation/02_High_Level_Design_Architecture.pdf`.
 
-## What this is (and isn't)
+| Path | Contents |
+|---|---|
+| `backend/app/pipeline/` | Adapters, frame reader, camera worker, detector, ANPR, correlation, rules, clips, recorder, grid supervisor |
+| `backend/app/routers/` | REST API (about 98 endpoints) |
+| `backend/app/self_heal/` | Recovery event log and open problems |
+| `backend/alembic/` | Database migrations |
+| `backend/tests/` | Backend test suite |
+| `frontend/` | Next.js 16 dashboard (App Router, TypeScript, Tailwind) |
+| `docs/` | Accuracy benchmarks, threat model, privacy and governance, development notes |
+| `Documentation/` | Challenge submission package (presentation, architecture, diagrams, demo) |
 
-This is the "working slice" the source document itself recommends for a hackathon build —
-real AI on real frames, running end-to-end from ingestion through alerting, investigation and
-evidence export — documented against, but not attempting to stand up, the statewide-scale
-architecture (80,000+ cameras, Kafka, Kubernetes, vector search, edge Jetson boxes) the same
-document describes as the long-term target. See the in-app **System → Scope & Honesty** panel
-for the full list of what's real vs. explicitly out of scope.
+## Technology stack
 
-## Layout
+| Layer | Technology | Licence |
+|---|---|---|
+| Dashboard | Next.js 16, React 18, TypeScript, Tailwind | MIT |
+| Maps | Leaflet 1.9, OpenStreetMap tiles | BSD-2-Clause (data ODbL) |
+| API | Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2, Alembic | MIT / BSD |
+| Video | OpenCV with FFmpeg (RTSP, decoding), libx264 for clips | Apache-2.0 / LGPL |
+| Detection and tracking | PyTorch, Ultralytics YOLO11s, ByteTrack | BSD / AGPL-3.0 |
+| Plate detection | YOLOv11 licence-plate model (morsetechlab) | AGPL-3.0 |
+| OCR | EasyOCR | Apache-2.0 |
+| Database | SQLite (WAL); PostgreSQL 16 + PostGIS 3.5 | Public domain / PostgreSQL, GPL-2.0 |
+| Shared runtime state | Valkey 8 (optional) | BSD-3-Clause |
+| Metrics | prometheus-client | Apache-2.0 |
+| Evidence PDF | ReportLab | BSD |
 
-- `backend/` — FastAPI app, detection pipeline (`app/pipeline/`), Self-Heal recovery engine
-  (`app/self_heal/`), SQLite datastore.
-- `frontend/` — Next.js 16 (App Router) + TypeScript + Tailwind dashboard, all ~26 screens
-  from the doc's site map plus the Camera Control Center and Self-Heal section, wired to the
-  live backend API + WebSocket.
+Ultralytics YOLO and the plate model are AGPL-3.0. Distributing the system or offering it as a
+network service carries AGPL obligations. The repository does not yet declare its own licence.
 
-## Database architecture & scaling decision
+## Getting started
 
-SQLite (`backend/sentinel.db`), WAL journal mode, `busy_timeout=30000` (`app/db.py`) — every
-write-heavy call site (camera workers, API routes) goes through the same connection pool, so a
-transient lock is absorbed by SQLite's own busy-wait before ever reaching Python, and any lock
-that does surface is retried with bounded backoff (see Self-Heal below) rather than crashing.
+### Docker Compose (PostgreSQL + PostGIS, Valkey, backend, dashboard)
 
-**Verified acceptable for this deployment shape** — a single backend process, a bounded number
-of concurrent camera workers (real-camera testing: staged up to the documented safe concurrency
-figure; synthetic stress test: 12 concurrent workers, real detection/heartbeat/alert writes,
-zero crashed workers — see `backend/tests/test_stress_concurrency.py`). **Not** appropriate
-once the deployment needs multiple backend *processes/instances* sharing one datastore (SQLite
-has no real concept of a remote/networked writer) or the statewide-scale (80,000+ camera)
-architecture the source document describes as the long-term target. That path is
-**PostgreSQL** — a separate, dedicated migration task (schema is already a plain SQLAlchemy
-ORM, so the model layer ports without a rewrite; what changes is the connection string, the
-SQLite-specific PRAGMAs in `app/db.py`, and the additive-migration helpers in `db.py` which
-assume SQLite's `ALTER TABLE`/`inspect()` behavior) — never mixed into a stability/hardening
-pass, and not attempted here.
+```
+cp .env.example .env          # set POSTGRES_PASSWORD and JWT_SECRET
+docker compose up --build
+```
 
-## Self-Heal (`backend/app/self_heal/`)
+Compose refuses to start without those secrets, and the backend runs `alembic upgrade head`
+before serving. Compose defaults to `DEMO_MODE=false`, so no demo accounts are seeded; create
+the first administrator separately. The backend image uses CPU-only PyTorch.
 
-Observes and logs the platform's real recovery paths — it does not re-implement or override
-them: SQLite lock retry (`pipeline/db_retry.py`), camera reconnect/backoff
-(`pipeline/worker.py`), outbound HTTP retry for this app's own camera-catalogue fetch
-(`self_heal/http_retry.py` — deliberately NOT applied to the Sentinel Grid client, whose
-timeouts are already real-measured/tuned). Every recovery attempt is a `SelfHealEvent` row
-(`GET /api/self-heal/health|problems|events|events/{id}`), broadcast live over the existing
-WebSocket. A repeat "recovered" event for the identical ongoing condition within a short window
-is deduplicated so the Error Log doesn't drown in identical rows; a genuine failure is never
-deduplicated. UI: sidebar **Self-Heal** section (Health Dashboard, Problems, Recovery Activity,
-Camera Health, Error Logs, Problem Details).
+### Local development (SQLite)
 
-**Known, honest limitation**: OpenCV/FFmpeg exposes no structured H264/decode-error signal to
-this codebase — a corrupted frame just makes `cv2.VideoCapture.read()` return `False`. Self-Heal
-therefore labels a stream disruption `STREAM_READ_FAILURE` (or `CAMERA_CONNECT_FAILURE` for an
-initial-connect failure), never a fabricated "H264 decoder" diagnosis — real ffmpeg stderr lines
-(`error while decoding MB...`, `mmco: unref short failure`, etc.) still appear in the server log
-as FFmpeg's own diagnostic output, just not parsed/re-classified by Self-Heal.
+Backend (Python 3.11):
 
-## Camera Control Center (`/cameras/control`, `POST /api/cameras/bulk`)
+```
+cd backend
+uv venv --python 3.11 .venv
+uv pip install --python .venv -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+.venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8000
+```
 
-Bulk connect/start/start AI/stop/restart/disconnect — reuses the existing per-camera
-start_worker/stop_worker/supervisor connect/disconnect, bounded concurrency (max 5 at once),
-per-camera failure isolation (one bad camera never aborts the batch), a duplicate-in-progress
-guard, one audit-log entry per bulk call, and live per-camera progress over the WebSocket.
-`stop` disables AI while keeping the stream connected; `disconnect` fully stops the worker;
-`connect`/`start` are honest aliases — this codebase has no real distinction between them.
-RBAC is enforced server-side (`require_roles("Administrator", "Control Room Operator")`) —
-a disabled frontend button is a convenience, not the security boundary.
+Frontend:
 
-## Known-fixed issues (kept here so they don't get re-introduced)
+```
+cd frontend
+npm install
+npm run dev
+```
 
-- **Login crash (bcrypt/passlib)**: `passlib`'s bcrypt backend detection breaks on
-  `bcrypt>=4.1`. Fixed by hashing/verifying directly with `bcrypt` in `app/security.py`
-  instead of going through `passlib`.
-- **Camera creation crash**: `POST /api/cameras` called `asyncio.create_task` from a sync
-  route handler running in FastAPI's worker thread (no running event loop there). Fixed by
-  making `create_camera`/`restart_camera` and the startup handler `async def`.
-- **Evidence download 401**: browsers can't attach a bearer header to a plain `<a href>` /
-  `<img>` / new-tab navigation, so `/api/evidence/{id}/file` and the evidence-package endpoint
-  401'd when opened directly. Originally "fixed" by dropping auth on those endpoints entirely —
-  that made police evidence fetchable by anyone with an ID. Replaced with short-lived signed
-  resource tokens instead (`security.create_resource_token` / `get_user_from_resource_token`):
-  the frontend fetches a token via an authenticated `.../file-token` (or `.../stream-token`,
-  `.../package-token`) request first, then appends it as `?token=` on the actual file/stream
-  URL. Same pattern now covers the MJPEG/snapshot endpoints too — nothing evidence- or
-  camera-feed-related is unauthenticated anymore, and every access is attributed to the real
-  user in the audit log.
-- **Alert flood**: a tracked object sitting in a zone re-fired a new alert every inference
-  cycle. Fixed with a per-(camera, zone/watchlist, track) cooldown in `rules_engine.py`.
-- **Map tiles watermarked**: the CARTO dark basemap now requires an API key. Switched to
-  key-free standard OpenStreetMap tiles with a CSS `invert()` filter for the dark look
-  (`components/CameraMap.tsx`).
-- **`next audit` critical CVEs (Next 14.2.16)**: upgraded to Next 16.3.4 + recharts 3 (`npm
-  audit` now reports 0 vulnerabilities). React stayed on 18.3.1 — Next 16's peer range still
-  accepts React 18, so no React 19 migration was needed.
-- **Leaflet map crash after the Next 16 upgrade** (`Map container is already initialized`):
-  react-leaflet v4's `MapContainer` doesn't clean up Leaflet's internal `_leaflet_id` on its
-  DOM node before React 18 Strict Mode's dev-only double-invoke remounts it — a known
-  upstream react-leaflet/Leaflet incompatibility with no clean fix short of a React 19 bump
-  (react-leaflet v5). Fixed by setting `reactStrictMode: false` in `next.config.js` (a
-  dev-only diagnostic feature; production builds don't double-invoke regardless).
-- **Failed fetches looked identical to "no real data" (strict real-data requirement)**: ~26
-  places used `.catch(() => {})` or had no error handling at all, so a backend outage, a 403,
-  or a network failure rendered the same empty table / stuck spinner / hardcoded-`0` KPI as a
-  genuine empty result — silently misrepresenting a failure as real data. Fixed project-wide
-  with `lib/useApiData.ts` (tracks `data`/`loading`/`error` honestly) and
-  `components/ErrorState.tsx` (a real "Data unavailable" panel with Retry), applied to every
-  page and to the header's system-status indicator (which was previously a hardcoded green
-  dot, always claiming "System" was healthy regardless of actual connectivity). Verified live
-  by killing the backend mid-session and confirming every page shows the real error state
-  instead of fake/empty content, then restoring it and confirming normal operation resumes.
-- **Shared tracker state across cameras**: `detector.py` cached a single YOLO model instance
-  (`lru_cache(maxsize=1)`) reused by every camera's worker; since `model.track(persist=True)`
-  keeps ByteTrack state on that shared object and each camera's inference runs on its own
-  thread (`asyncio.to_thread`), concurrent cameras could race and corrupt each other's track
-  IDs. Fixed with one YOLO/tracker instance per camera (`_MODELS_BY_CAMERA` dict, released on
-  `stop_worker`).
-- **No real reconnect on a dropped stream**: `worker.py`'s camera loop set `status="degraded"`
-  on a bad read and just kept looping forever with a 1s sleep — it never actually reopened the
-  source. Fixed with a real release+reopen retry using exponential backoff
-  (`reconnect_max_attempts`/`reconnect_backoff_base`/`_max`); after the retry budget is
-  exhausted the camera is marked `offline` and the worker stops (an operator's Restart brings
-  it back) instead of spinning "degraded" indefinitely.
-- **RTSP was a defined-but-unimplemented source type**: now routed through the same
-  `cv2.VideoCapture` path as `video_file` via OpenCV's FFmpeg backend, with open/read timeouts
-  so a dead stream fails fast. Best-effort (no ONVIF discovery, no real CCTV/VMS available to
-  test against here) but real, not a stub.
-- **ANPR correlated on any non-empty OCR read**: `looks_like_plate()` (Indian plate-format
-  regex) existed in `anpr.py` but was never called, so a 2-character garbage OCR read became a
-  real `Vehicle`/`Plate` row. Fixed by gating the correlation write on `looks_like_plate()` AND
-  a minimum confidence (`plate_min_confidence`, default 0.35) — noisy reads are simply not
-  persisted as a vehicle sighting, rather than trusted.
-- **Upload endpoint trusted the client filename**: `POST /api/cameras/upload-video` wrote
-  straight to `uploads_dir / file.filename` (path-traversal/overwrite risk, no extension
-  check, no size cap, whole file read into RAM first). Fixed with a server-generated UUID
-  filename, an extension allow-list, a streamed chunked write with a size cap
-  (`max_upload_mb`), and cleanup of any partial file on failure.
-- **Evidence package claimed an audit trail it didn't include**: the docstring said "audit
-  trail" but the returned JSON never actually queried `AuditLog`. Fixed — it now includes the
-  real `AuditLog` rows touching that incident or any of its evidence items.
-- **SQLite lock during `db.flush()`, not just `commit()`**: `worker.py`'s `db.add(det_row);
-  db.flush()` (assigns a detection's identity before the rest of the frame's processing) was
-  completely unguarded — a lock there escaped to the outer per-iteration `except`, silently
-  dropping that detection instead of retrying like every other write. Fixed with
-  `db_retry.safe_flush` (same rollback→reapply→bounded-backoff→retry as `safe_commit`) — see
-  `backend/tests/test_db_concurrency.py`.
-- **WebSocket reconnect had no backoff**: `useLiveSocket.ts` retried a dropped connection every
-  1s forever. Fixed with bounded exponential backoff (1s→30s cap, resets on a real reconnect);
-  also guarded `onopen`/`onmessage` against updating state from a socket that's already closing
-  during unmount (a real, if rare, stale-update race).
-- **Frontend API calls had no retry for transient failures**: `lib/api.ts` now retries GET
-  requests (never POST/PATCH/DELETE — those may have already taken effect server-side) on
-  408/429/500/502/503/504 or a network failure, bounded to 3 attempts.
-- **Camera Control's per-row action menu stayed open until another item was clicked**: fixed
-  with a real click-outside listener (`RowActionsMenu` in `cameras/control/page.tsx`).
+Open <http://localhost:3000> and sign in as `admin` / `sentinel123` (demo accounts are seeded
+while `DEMO_MODE=true`). Add a camera under **Cameras → Add Camera** (a video file of real
+traffic, a webcam or an RTSP URL), then watch **Live Cameras** and **AI Vision**. Create a
+restricted zone under **Map → Restricted Zones** or a watchlist entry to see alerts and incidents.
+
+On Windows, `start.bat` starts both services: the backend on `backend/.venv-gpu` when CUDA works
+there (CPU otherwise) and the production frontend build. `stop.bat` stops them.
+
+Model weights: YOLO11s downloads on first use. The plate detector weights are not bundled and
+never downloaded automatically; without them, ANPR falls back to classical plate localization
+(see `backend/app/config.py`, `plate_model_name`).
+
+## Configuration
+
+Settings are read from the environment or `backend/.env` (template: `backend/.env.example`;
+Compose uses the root `.env.example`). The main ones:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL URL; unset means SQLite at `DB_PATH` (default `backend/sentinel.db`) |
+| `JWT_SECRET` | Required when `DEMO_MODE=false`; a random per-process secret is used otherwise |
+| `DEMO_MODE` | Seeds demo accounts and the demo watchlist entry |
+| `CORS_ALLOWED_ORIGINS` | Dashboard origin(s), default `http://localhost:3000` |
+| `REDIS_URL` | Optional; shares cooldowns and rate limits across processes |
+| `SENTINEL_GRID_EMAIL`, `SENTINEL_GRID_PASSWORD` | Sentinel Camera Grid credentials (`.env` only) |
+| `SENTINEL_GRID_AUTOCONNECT` | Connect every grid camera at startup and keep it connected |
+| `METRICS_TOKEN` | Bearer token for a Prometheus scraper; otherwise `/api/metrics` needs an Administrator |
+| `NEXT_PUBLIC_API_BASE`, `NEXT_PUBLIC_WS_BASE` | Backend URLs, compiled into the frontend build |
+
+Every setting, with its reasoning, is in `backend/app/config.py`. `NEXT_PUBLIC_*` values are
+read at build time, so change them and rebuild. If port 8000 is taken, run the backend on
+another port and point `NEXT_PUBLIC_API_BASE`/`NEXT_PUBLIC_WS_BASE` at it; the login page shows
+which backend it reached.
+
+## Testing
+
+```
+cd backend && .venv/Scripts/python.exe -m pytest -q        # backend suite
+cd frontend && npm test                                   # Vitest unit tests
+cd frontend && npm run typecheck                          # TypeScript
+cd frontend && npx playwright test                        # browser tests, against a running stack
+```
+
+The Redis-backed tests are skipped unless a Redis-compatible server is available. CI (GitHub
+Actions) runs the backend suite, the frontend tests and build, a Docker Compose deployment with
+a migration check, and CodeQL.
+
+## Known limitations
+
+- **Sentinel Grid streaming is partial.** Grid authentication has been unreliable; in recent
+  runs most grid cameras stayed degraded while a few connected. The platform does not claim all
+  30 grid cameras streaming at once.
+- **SQLite is single-writer.** It is the development and demo database. Write transactions are
+  kept short and lock errors are retried, but PostgreSQL is the database for any larger
+  deployment. The fix for login stalls under camera load has not yet been re-verified with all
+  30 grid cameras streaming.
+- **Map coverage.** The grid catalogue has no coordinates; 19 of 30 grid cameras were placed from
+  OpenStreetMap place names (`backend/app/pipeline/grid_locations.json`) and 11 are
+  intentionally unmapped.
+- **One process, one machine.** AI throughput is bounded by that machine's GPU.
+- **Accuracy figures are internal benchmarks** (`docs/AI_ACCURACY.md`, `docs/ANPR_ACCURACY.md`),
+  not certified evaluations. ANPR on real CCTV depends heavily on plate size and sharpness.
+- **VMS coverage.** ONVIF and vendor VMS adapters are not implemented beyond the interface.
+
+## Production and scaling notes
+
+- Run on PostgreSQL + PostGIS (the Compose stack) with `DEMO_MODE=false` and real secrets.
+- Put the API behind a reverse proxy with TLS and address-level rate limiting.
+- Set `REDIS_URL` before running more than one backend process.
+- Set evidence and detection retention (`evidence_retention_days`, `detection_retention_days`)
+  to match local policy; see `docs/PRIVACY_GOVERNANCE.md`.
+- Planned, not implemented: separate AI worker processes per camera group, event streaming
+  between ingestion and alerting, edge inference, and more VMS adapters.
+
+## Further reading
+
+- `CHANGELOG.md`: release history
+- `docs/DEVELOPMENT_NOTES.md`: engineering log with design decisions and measurements
+- `docs/THREAT_MODEL.md`, `docs/PRIVACY_GOVERNANCE.md`: security and governance
+- `docs/AI_ACCURACY.md`, `docs/ANPR_ACCURACY.md`: detection and ANPR benchmarks

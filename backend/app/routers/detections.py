@@ -16,7 +16,10 @@ def list_detections(
     cls: Optional[str] = None,
     from_ts: Optional[datetime] = Query(None, alias="from"),
     to_ts: Optional[datetime] = Query(None, alias="to"),
-    limit: int = 100,
+    # Bounded like self_heal.py. limit=-1 reaches SQLite as LIMIT -1 (no
+    # limit) and limit=100000000 is the same thing: the whole detections
+    # table, the biggest one we have, in one response to any logged-in user.
+    limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):

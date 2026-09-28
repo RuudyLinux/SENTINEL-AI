@@ -1,15 +1,10 @@
-"""GET /api/cameras and GET /api/cameras/{id} both expose in-memory
-connection-lifecycle diagnostics (grid_state, reconnect_count, last_error)
-from worker.CAMERA_STATS — the 24/7 auto-connect supervisor's UI depends on
-this to distinguish REGISTERED/CONNECTED/PROCESSING/RECONNECTING/etc. from
-the stable DB `status` column. Null when a camera's worker has never run in
-this process, never fabricated.
+"""GET /api/cameras and GET /api/cameras/{id} carry the in-memory lifecycle
+diagnostics (grid_state, reconnect_count, last_error) from CAMERA_STATS. Null
+if the worker never ran in this process.
 
-The singular GET was found missing this attachment via the final freeze
-browser smoke test: the single-camera detail page read grid_state as always
-absent and rendered DISCONNECTED even while a camera was genuinely
-PROCESSING with real video and detections flowing — see
-test_get_camera_exposes_grid_state_diagnostics below."""
+The single-camera GET was missing them, so the detail page showed
+DISCONNECTED while the camera was processing live video.
+"""
 from app.pipeline.worker import CAMERA_STATS
 
 
@@ -46,8 +41,7 @@ def test_list_cameras_exposes_grid_state_and_reconnect_diagnostics(client, admin
 
 
 def test_get_camera_exposes_grid_state_diagnostics(client, admin_token, monkeypatch):
-    """The single-camera detail page (/live/[cameraId]) hits this endpoint,
-    not the list one — it must carry the same real-time diagnostics."""
+    """The detail page (/live/[cameraId]) uses this endpoint, not the list."""
     monkeypatch.setattr("app.routers.cameras.start_worker", lambda camera_id: None)
     camera = _create_camera(client, admin_token, camera_code="C-DIAG-TEST-3")
     CAMERA_STATS[camera["id"]] = {
@@ -64,12 +58,9 @@ def test_get_camera_exposes_grid_state_diagnostics(client, admin_token, monkeypa
 
 
 def test_list_cameras_diagnostics_are_null_when_worker_never_ran(client, admin_token, monkeypatch):
-    # POST /api/cameras itself calls start_worker() unconditionally on create
-    # (routers/cameras.py) — a real background asyncio task in the TestClient's
-    # own event loop would race a bare CAMERA_STATS.pop() after the fact (it
-    # can repopulate grid_state before the GET below runs). Patched out at
-    # the router's import site instead, so this test proves the "never ran"
-    # case deterministically rather than by timing luck.
+    # create_camera starts a worker, and a real task in the TestClient loop
+    # could repopulate grid_state before the GET. Patched at the router's
+    # import so the "never ran" case doesn't depend on timing.
     monkeypatch.setattr("app.routers.cameras.start_worker", lambda camera_id: None)
     camera = _create_camera(client, admin_token, camera_code="C-DIAG-TEST-2")
     CAMERA_STATS.pop(camera["id"], None)

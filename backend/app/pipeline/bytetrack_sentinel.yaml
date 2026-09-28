@@ -1,0 +1,13 @@
+# ByteTrack settings for this deployment, chosen on real grid sequences
+# (day cam06, night cam02) at the live AI rate of ~2.5 frames/s.
+# See docs/AI_ACCURACY.md for the measurements behind every value.
+tracker_type: bytetrack
+# Detections are fed to the tracker from TRACKER_FEED_CONFIDENCE (0.10) so the
+# second association stage can keep a track alive through a glare-dimmed frame;
+# only boxes >= CONFIDENCE_THRESHOLD are published as detections.
+track_high_thresh: 0.30
+track_low_thresh: 0.10
+new_track_thresh: 0.40   # a new ID needs a confident box: fewer one-frame IDs
+track_buffer: 60         # frames a lost track is kept (24s at 2.5fps)
+match_thresh: 0.90       # objects move far between frames at 2.5fps; 0.8 split them
+fuse_score: True

@@ -1,4 +1,4 @@
-"""5. Evidence authorization  6. Evidence token scope — P0-E."""
+"""Evidence authorization and token scope."""
 import pytest
 from fastapi import HTTPException
 

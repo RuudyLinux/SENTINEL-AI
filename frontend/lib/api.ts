@@ -32,14 +32,9 @@ class ApiError extends Error {
   }
 }
 
-// Self-Heal "API transient errors" recovery (spec recovery type 6): a
-// bounded retry, only for the standard transient set, only for GET — a
-// POST/PATCH/DELETE that reached the server may have already taken effect,
-// so auto-retrying those here could double-fire a non-idempotent action
-// (e.g. creating a duplicate incident); callers that need a retry for those
-// offer it explicitly (a Retry button), never silently. A network-level
-// fetch failure (no response at all) is retried for any method that never
-// left the browser — nothing on the server could have run yet.
+// Bounded retry on transient errors, GET only: a mutation that reached the
+// server may already have happened. Network failures with no response are
+// retried for any method, since the request never left the browser.
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const MAX_FETCH_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = [300, 900]; // between attempts 1->2 and 2->3
@@ -57,9 +52,23 @@ async function _fetchWithRetry(url: string, init: RequestInit, method: string): 
     }
     await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)]));
   }
-  // Unreachable in practice (the loop above always returns or throws on the
-  // final attempt) — satisfies the type checker without changing behavior.
+  // unreachable, the loop returns or throws on the last attempt; keeps tsc happy
   throw lastErr ?? new Error("request failed");
+}
+
+// FastAPI's 422 detail is a list of {loc, msg}; render it as readable text.
+export function formatDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((e: any) => {
+        const field = (Array.isArray(e?.loc) ? e.loc : []).filter((p: unknown) => p !== "body").join(".");
+        const msg = e?.msg ?? String(e);
+        return field ? `${field.replace(/_/g, " ")}: ${msg}` : msg;
+      })
+      .join("; ");
+  }
+  return JSON.stringify(detail);
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -73,15 +82,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || "GET").toUpperCase();
   const res = await _fetchWithRetry(`${API_BASE}${path}`, { ...options, headers }, method);
   if (res.status === 401) {
-    // The login endpoint itself returning 401 means "wrong credentials" —
-    // a normal, expected business response, not a "your session expired"
-    // signal. Treating it the same as every other 401 (clear token, hard-
-    // redirect to /login) used to fire here too: the redirect discarded
-    // the login page's in-flight React state before its own catch block
-    // could ever call setError(), so a wrong password silently reset the
-    // form with no message at all. Only the session-expiry case gets the
-    // redirect; the login endpoint just throws, same as any other error,
-    // so the caller's own error handling (and message) actually shows.
+    // A 401 from the login endpoint means wrong credentials, not an expired
+    // session, so only other endpoints clear the token and redirect.
     if (path !== "/api/auth/login") {
       clearToken();
       if (typeof window !== "undefined") window.location.href = "/login";
@@ -97,7 +99,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     let detail = res.statusText;
     try {
       const body = await res.json();
-      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      detail = formatDetail(body.detail);
     } catch {}
     throw new ApiError(res.status, detail);
   }
@@ -117,11 +119,9 @@ export const api = {
   del: <T,>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
-// Evidence file/package and camera stream endpoints are hit via plain
-// <img src>/<a href>/window.open — browsers can't attach an Authorization
-// header to those, so the backend hands out a short-lived resource token
-// via a normal authenticated request first (P0-E). These helpers do that
-// token fetch, then build/open the real URL with `?token=` appended.
+// Evidence files and camera streams load via <img src>, <a href> or
+// window.open, which can't send an Authorization header, so they use a
+// short-lived resource token appended as ?token=.
 export async function fetchResourceToken(tokenPath: string): Promise<string> {
   const { token } = await api.get<{ token: string }>(tokenPath);
   return token;
@@ -133,9 +133,84 @@ export async function buildTokenedUrl(tokenPath: string, resourcePath: string): 
   return `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}`;
 }
 
+/** A resource token's expiry in epoch ms, or null. For scheduling only; the
+ *  backend enforces expiry. */
+function tokenExpiresAt(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const { exp } = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** buildTokenedUrl plus the time the caller must refresh by. The backend ends
+ *  an MJPEG stream at token expiry; the timestamp in the new URL makes <img>
+ *  reconnect. */
+export async function buildTokenedStream(
+  tokenPath: string,
+  resourcePath: string,
+): Promise<{ url: string; expiresAt: number | null }> {
+  const token = await fetchResourceToken(tokenPath);
+  const sep = resourcePath.includes("?") ? "&" : "?";
+  return {
+    url: `${API_BASE}${resourcePath}${sep}token=${encodeURIComponent(token)}&reconnect=${Date.now()}`,
+    expiresAt: tokenExpiresAt(token),
+  };
+}
+
 export async function openTokenedResource(tokenPath: string, resourcePath: string): Promise<void> {
   const url = await buildTokenedUrl(tokenPath, resourcePath);
   window.open(url, "_blank");
+}
+
+
+// Backend identity preflight: /api/health returns a service name, so another
+// app listening on NEXT_PUBLIC_API_BASE is reported clearly instead of as
+// random 404/422 errors. No token, no retry, never throws.
+export const BACKEND_SERVICE_NAME = "sentinel-vision-backend";
+
+export type ApiPreflight =
+  | { status: "ok" }
+  | { status: "unreachable"; message: string }
+  | { status: "wrong-service"; message: string };
+
+export async function checkBackendIdentity(
+  base: string = API_BASE,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ApiPreflight> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${base}/api/health`, { method: "GET" });
+  } catch {
+    return {
+      status: "unreachable",
+      message: `No API is answering at ${base}. Start the backend, or point NEXT_PUBLIC_API_BASE at the port it is really on.`,
+    };
+  }
+  if (!res.ok) {
+    return {
+      status: "wrong-service",
+      message: `${base} answered ${res.status} on /api/health. Something is listening there, but it is not the SENTINEL backend.`,
+    };
+  }
+  let body: any = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  // The name must match, not merely be present.
+  if (!body || body.service !== BACKEND_SERVICE_NAME) {
+    const saw = body && typeof body.service === "string" ? `"${body.service}"` : "no service name";
+    return {
+      status: "wrong-service",
+      message: `${base} is answering, but it is not the SENTINEL backend (expected "${BACKEND_SERVICE_NAME}", got ${saw}). Another application is probably holding that port.`,
+    };
+  }
+  return { status: "ok" };
 }
 
 export { ApiError };

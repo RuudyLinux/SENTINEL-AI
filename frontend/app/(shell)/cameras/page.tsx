@@ -4,15 +4,14 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, getStoredUser, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
+import { hasLocation } from "@/lib/geo";
 import DataTable, { Column } from "@/components/DataTable";
 import ErrorState from "@/components/ErrorState";
 import ConnectionBadge, { AiBadge, deriveConnectionState } from "@/components/ConnectionBadge";
 import KpiCard from "@/components/KpiCard";
 
-// Mirrors the backend's require_roles("Administrator", "Control Room Operator")
-// on catalog sync / create / start / stop / restart (see routers/cameras.py) —
-// the backend is the actual enforcement; this just keeps an Auditor/
-// Investigator/Supervisor from being shown buttons that would 403.
+// Mirrors the backend's role check on camera routes; only hides buttons that
+// would return 403.
 const CAN_MANAGE_CAMERAS = ["Administrator", "Control Room Operator"];
 
 export default function CamerasPage() {
@@ -26,15 +25,17 @@ export default function CamerasPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [canManage, setCanManage] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [groupFilter, setGroupFilter] = useState<string>("");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
+  const [editForm, setEditForm] = useState({ name: "", location: "", camera_group: "", lat: "", lng: "", ai_person: true, ai_vehicle: true, ai_anpr: true });
   const [editBusy, setEditBusy] = useState(false);
   const [rowBusyId, setRowBusyId] = useState<string | null>(null);
 
   useEffect(() => {
     const user = getStoredUser();
     setCanManage(!!user && CAN_MANAGE_CAMERAS.includes(user.role));
+    setIsAdmin(user?.role === "Administrator");
   }, []);
 
   function toggle(id: string, e?: React.MouseEvent) {
@@ -51,6 +52,8 @@ export default function CamerasPage() {
     setEditingId(c.id);
     setEditForm({
       name: c.name, location: c.location, camera_group: c.camera_group || "",
+      // 0,0 is how the backend stores "unknown"; shown blank, not as a place.
+      lat: hasLocation(c) ? String(c.lat) : "", lng: hasLocation(c) ? String(c.lng) : "",
       ai_person: c.ai_person, ai_vehicle: c.ai_vehicle, ai_anpr: c.ai_anpr,
     });
   }
@@ -59,13 +62,34 @@ export default function CamerasPage() {
     setEditBusy(true);
     setActionError(null);
     try {
-      await api.patch(`/api/cameras/${id}`, editForm);
+      const blankLat = editForm.lat.trim() === "";
+      const blankLng = editForm.lng.trim() === "";
+      const lat = blankLat ? 0 : Number(editForm.lat);
+      const lng = blankLng ? 0 : Number(editForm.lng);
+      if (blankLat !== blankLng || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        setActionError("Enter both latitude and longitude, or leave both blank if the location is unknown");
+        return;
+      }
+      await api.patch(`/api/cameras/${id}`, { ...editForm, lat, lng });
       setEditingId(null);
       reload();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not update camera");
     } finally {
       setEditBusy(false);
+    }
+  }
+
+  // Retiring keeps the history and hides the camera from active lists.
+  async function retire(c: any, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!window.confirm(`Retire ${c.camera_code}? It stops, disappears from active camera lists and can no longer be connected. Its history is kept.`)) return;
+    setActionError(null);
+    try {
+      await api.post(`/api/cameras/${c.id}/retire`);
+      reload();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Could not retire camera");
     }
   }
 
@@ -116,12 +140,8 @@ export default function CamerasPage() {
     }
   }
 
-  // Catalogue sync only REGISTERS cameras — CONNECTING (establishing the
-  // backend stream) is a separate, explicit step the operator takes here.
-  // /start and /stop already mean Connect/Disconnect (routers/cameras.py
-  // routes sentinel_grid cameras through the supervisor's connect/disconnect,
-  // everything else through start_worker/stop_worker) — same endpoints,
-  // clearer labels below.
+  // Sync only registers cameras; connecting is a separate step. /start and
+  // /stop connect and disconnect the stream.
   async function bulkAction(action: "start" | "stop") {
     setBulkBusy(true);
     setActionError(null);
@@ -138,13 +158,8 @@ export default function CamerasPage() {
     }
   }
 
-  // Start AI / Stop AI is deliberately NOT /start or /stop — those connect
-  // or disconnect the stream. AI on/off is the ai_person/ai_vehicle flags
-  // (PATCH, already existed for the Edit form) — toggling them never stops
-  // the worker, so a camera stays CONNECTED with AI OFF when AI is stopped.
-  // ai_anpr is left untouched: it can never fire without person/vehicle
-  // detections feeding it, so it's inert either way and this shouldn't
-  // silently override an operator's separate ANPR preference.
+  // Start/Stop AI toggles ai_person/ai_vehicle via PATCH; the stream stays
+  // connected. ai_anpr is left as configured (it needs vehicle detections).
   async function bulkAiAction(on: boolean) {
     setBulkBusy(true);
     setActionError(null);
@@ -206,18 +221,13 @@ export default function CamerasPage() {
     { key: "location", label: "Location" },
     { key: "camera_group", label: "Group", render: (c) => c.camera_group ? <span className="text-xs text-slate-400">{c.camera_group}</span> : <span className="text-xs text-slate-600">—</span> },
     {
-      // Connection lifecycle (24/7 auto-connect supervisor) — REGISTERED/
-      // CONNECTING/CONNECTED/PROCESSING/DEGRADED/RECONNECTING/DISCONNECTED/
-      // AUTH_ERROR/ERROR. Replaces the old plain online/offline StatusDot:
-      // that DB column can't distinguish "never connected" from "was
-      // connected, then dropped" the way grid_state can.
+      // Connection lifecycle from grid_state, which distinguishes "never
+      // connected" from "dropped".
       key: "connection", label: "Connection",
       render: (c) => <ConnectionBadge camera={c} />,
     },
     {
-      // AI processing is independent of connection state — shown as its own
-      // fact so "CONNECTED, AI OFF" (the 24/7 auto-connect default) reads
-      // clearly rather than looking like AI is silently running.
+      // AI has its own column so a connected camera with AI off is explicit.
       key: "ai", label: "AI",
       render: (c) => <AiBadge camera={c} />,
     },
@@ -250,20 +260,23 @@ export default function CamerasPage() {
         return (
           <div className="flex flex-wrap gap-2">
             {connected ? (
-              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "stop", e)} className="text-xs text-critical hover:underline disabled:opacity-50">Disconnect</button>
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "stop", e)} className="row-action text-xs text-critical hover:underline disabled:opacity-50">Disconnect</button>
             ) : (
-              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "start", e)} className="text-xs text-accent hover:underline disabled:opacity-50">Connect</button>
+              <button disabled={busy} onClick={(e: React.MouseEvent) => connectionAction(c.id, "start", e)} className="row-action text-xs text-accent hover:underline disabled:opacity-50">Connect</button>
             )}
             {/* Start/Stop AI only makes sense once a stream exists to process. */}
             {connected && (
               aiOn ? (
-                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, false, e)} className="text-xs text-high hover:underline disabled:opacity-50">Stop AI</button>
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, false, e)} className="row-action text-xs text-high hover:underline disabled:opacity-50">Stop AI</button>
               ) : (
-                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, true, e)} className="text-xs text-accent hover:underline disabled:opacity-50">Start AI</button>
+                <button disabled={busy} onClick={(e: React.MouseEvent) => aiAction(c.id, true, e)} className="row-action text-xs text-accent hover:underline disabled:opacity-50">Start AI</button>
               )
             )}
-            <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="text-xs text-accent hover:underline">Edit</button>
-            <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="text-xs text-accent hover:underline">Restart</button>
+            <button onClick={(e: React.MouseEvent) => startEdit(c, e)} className="row-action text-xs text-accent hover:underline">Edit</button>
+            <button onClick={(e: React.MouseEvent) => restart(c.id, e)} className="row-action text-xs text-accent hover:underline">Restart</button>
+            {isAdmin && (
+              <button onClick={(e: React.MouseEvent) => retire(c, e)} className="row-action text-xs text-slate-400 hover:text-critical hover:underline">Retire</button>
+            )}
           </div>
         );
       },
@@ -275,23 +288,15 @@ export default function CamerasPage() {
   const visibleCameras = groupFilter ? allCameras.filter((c: any) => c.camera_group === groupFilter) : allCameras;
   const editingCamera = editingId ? allCameras.find((c: any) => c.id === editingId) : null;
 
-  // Auto-connect visibility (24/7 supervisor) — real cameras only, i.e.
-  // discovered from the Sentinel Grid catalogue (external_catalog_id set),
-  // not a manually-added test row of the same source_type. All numbers
-  // derived from this poll's actual API data, never hardcoded. "Connected"
-  // includes PROCESSING (a live stream with AI also on is still connected);
-  // "Processing" is called out separately since it's a strict subset.
-  // "Disconnected" is the residual so the five numbers stay internally
-  // consistent: Registered = Connected + Reconnecting + Disconnected.
+  // Auto-connect summary for grid cameras (external_catalog_id set).
+  // Registered = Connected (incl. Processing) + Reconnecting + Disconnected.
   const gridCameras = allCameras.filter((c: any) => c.source_type === "sentinel_grid" && c.external_catalog_id);
   const gridRegistered = gridCameras.length;
   const gridConnected = gridCameras.filter((c: any) => ["CONNECTED", "PROCESSING"].includes(deriveConnectionState(c))).length;
   const gridProcessing = gridCameras.filter((c: any) => deriveConnectionState(c) === "PROCESSING").length;
   const gridReconnecting = gridCameras.filter((c: any) => deriveConnectionState(c) === "RECONNECTING").length;
   const gridDisconnected = Math.max(0, gridRegistered - gridConnected - gridReconnecting);
-  // Real evidence the auto-connect machinery has actually run in this backend
-  // process, not an assumed/hardcoded flag — a camera only carries grid_state
-  // once its worker has started.
+  // True once any worker has started (cameras only get grid_state then).
   const supervisorActive = gridCameras.some((c: any) => !!c.grid_state);
   const lastCatalogSync = gridCameras.reduce((latest: string | null, c: any) => {
     if (!c.catalog_synced_at) return latest;
@@ -345,7 +350,7 @@ export default function CamerasPage() {
       {groups.length > 0 && (
         <div className="flex items-center gap-2 text-xs">
           <span className="text-slate-400">Group:</span>
-          <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="bg-panel2 border border-border rounded px-2 py-1">
+          <select aria-label="Filter by camera group" value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)} className="bg-panel2 border border-border rounded px-2 py-1">
             <option value="">All groups</option>
             {groups.map((g) => <option key={g} value={g}>{g}</option>)}
           </select>
@@ -361,6 +366,14 @@ export default function CamerasPage() {
           <label className="block text-xs text-slate-400">Location
             <input value={editForm.location} onChange={(e) => setEditForm({ ...editForm, location: e.target.value })} className="input" />
           </label>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs text-slate-400">Latitude (blank if unknown)
+              <input type="number" step="0.0001" min={-90} max={90} value={editForm.lat} onChange={(e) => setEditForm({ ...editForm, lat: e.target.value })} className="input" />
+            </label>
+            <label className="block text-xs text-slate-400">Longitude (blank if unknown)
+              <input type="number" step="0.0001" min={-180} max={180} value={editForm.lng} onChange={(e) => setEditForm({ ...editForm, lng: e.target.value })} className="input" />
+            </label>
+          </div>
           <label className="block text-xs text-slate-400">Group
             <input value={editForm.camera_group} onChange={(e) => setEditForm({ ...editForm, camera_group: e.target.value })} placeholder="North Zone" className="input" />
           </label>

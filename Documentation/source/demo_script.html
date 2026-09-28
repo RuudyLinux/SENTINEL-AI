@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SENTINEL VISION – Demo Video Script</title>
+<style>
+  @page { size: A4 landscape; margin: 14mm 14mm 16mm; }
+  body { font-family: "Segoe UI", Inter, Arial, sans-serif; color: #1B2536; font-size: 9.6pt; line-height: 1.45; margin: 0; }
+  h1 { font-size: 20pt; color: #14223A; margin: 0 0 1mm; }
+  h2 { font-size: 13pt; color: #14223A; border-bottom: 2px solid #0891B2; padding-bottom: 1mm; margin: 7mm 0 2.5mm; break-after: avoid; }
+  .sub { color: #5A6B82; font-size: 10.5pt; margin-bottom: 5mm; }
+  table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+  th { background: #14223A; color: #fff; text-align: left; padding: 1.8mm 2mm; }
+  td { border-bottom: 1px solid #D5DEEA; padding: 1.8mm 2mm; vertical-align: top; }
+  tr { break-inside: avoid; }
+  tr:nth-child(even) td { background: #F8FAFD; }
+  td.t { white-space: nowrap; font-weight: 700; color: #0891B2; width: 20mm; }
+  td.vo { font-style: italic; color: #24344D; width: 38%; }
+  ul { margin: 0 0 3mm 5mm; padding-left: 3mm; } li { margin-bottom: 1mm; }
+  .note { border-left: 4px solid #C98106; background: #FFF8EA; padding: 2.5mm 3.5mm; margin: 2mm 0 3mm; break-inside: avoid; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8mm; }
+  code { font-family: Consolas, monospace; font-size: 8.6pt; background: #F2F6FB; padding: 0 1mm; }
+</style>
+</head>
+<body>
+<h1>SENTINEL VISION · Solution Demonstration Video</h1>
+<div class="sub">Script, storyboard and shot list · target length 4:45 to 5:00 · recorded on the real running system (no mock-ups, no edited screens)</div>
+
+<div class="cols">
+<div>
+<h2>Recording principles</h2>
+<ul>
+  <li>Show only what the system does live. Every screen below exists in the current build.</li>
+  <li>Use a recorded traffic video as the <b>primary camera source</b> (reliable), and show the Sentinel Grid cameras only if they are connected at recording time.</li>
+  <li>Do not say "all 30 cameras streaming", "statewide", accuracy percentages or speed-ups on camera.</li>
+  <li>Screen: 1920×1080, browser at 100 % zoom, dark theme, notifications off. Voice-over recorded separately and laid over the capture.</li>
+</ul>
+</div>
+<div>
+<h2>Pre-recording setup (15 minutes before)</h2>
+<ul>
+  <li>Start the stack with <code>start.bat</code>; confirm <code>http://localhost:8000/api/health</code> and the login page load.</li>
+  <li>Upload a traffic clip as a camera (Cameras → Add Camera → Uploaded video file), with person, vehicle and ANPR on. A clip from <code>evidence_store/</code> of a grid junction works.</li>
+  <li>Map → Restricted Zones: create a HIGH zone on that camera (full frame).</li>
+  <li>Watchlists: add one plate known to appear in the clip, so a watchlist alert can fire.</li>
+  <li>Open one existing incident in a second tab as a fallback if a live alert is slow to appear.</li>
+  <li>Log in once beforehand so model weights are warm.</li>
+</ul>
+</div>
+</div>
+
+<div class="note"><b>Honesty guard for the narrator.</b> If the grid cameras are degraded during recording, say so in one line ("some grid cameras are reconnecting; Self-Heal is handling it") rather than cutting around it. It demonstrates the health monitoring truthfully.</div>
+
+<h2>Shot-by-shot storyboard with narration</h2>
+<table>
+  <tr><th>Time</th><th>Screen / action</th><th>On-screen emphasis</th><th>Voice-over</th></tr>
+  <tr><td class="t">0:00–0:20</td><td>Title card (slide 1 of the deck), then a slow pan over the Command Center.</td><td>Project name and subtitle.</td><td class="vo">"Control rooms watch hundreds of cameras from different systems, and most events are found too late. SENTINEL VISION brings those cameras into one platform, watches them with AI, and turns what it sees into alerts, incidents and evidence."</td></tr>
+  <tr><td class="t">0:20–0:45</td><td>Login page: enter operator credentials, press LOGIN. Command Center loads.</td><td>Cameras online count, active alerts, open incidents, System Health panel.</td><td class="vo">"Every operator signs in with their own account. Access is role-based: administrators, control-room operators, investigators, supervisors and auditors each see and do only what their role allows. This is the command centre: camera status, active alerts, open incidents and system health at a glance."</td></tr>
+  <tr><td class="t">0:45–1:20</td><td>Cameras → Camera Control Center (scroll the registry). Then Live Cameras → Camera Network Map; click the Bilimora marker with "3".</td><td>Registry of mixed sources; map across Gujarat; grouped marker popup; "11 cameras not shown".</td><td class="vo">"All cameras live in one registry, whatever their source: a webcam, a video file, an RTSP stream or the Sentinel Grid catalogue. The map places each camera. The grid supplies no coordinates, so we looked up nineteen of the thirty in OpenStreetMap; the eleven we could not place reliably are left off, not guessed. Three cameras in Bilimora share one marker."</td></tr>
+  <tr><td class="t">1:20–2:00</td><td>Open the uploaded traffic camera (Live Cameras → camera). Press Start / confirm AI ON. Show the annotated live view.</td><td>Connection badge turning PROCESSING; bounding boxes appearing.</td><td class="vo">"Here we connect a camera. Frames are read in the background, only the newest frame is kept so the view never lags, and AI is switched on for this camera. Analytics are selective: each camera can run person detection, vehicle detection and number-plate reading independently."</td></tr>
+  <tr><td class="t">2:00–2:35</td><td>Stay on the live view, then switch to AI Vision (Live AI Detection feed).</td><td>Person / car / motorbike labels with confidence.</td><td class="vo">"Detection uses the Ultralytics YOLO11 model, running on the GPU and shared across cameras. It finds people and vehicles in every analysed frame, and every detection streams to the operators' screens in real time over a WebSocket."</td></tr>
+  <tr><td class="t">2:35–3:00</td><td>AI Vision feed: filter to vehicles and point at consecutive rows carrying the same "track N" for one vehicle; cut back to the live view as it crosses.</td><td>The same track number repeating for one vehicle.</td><td class="vo">"ByteTrack tracking gives each object an identity that it keeps from frame to frame. That identity is what lets the system count dwell time in a zone and vote on a number plate across many frames instead of trusting a single one."</td></tr>
+  <tr><td class="t">3:00–3:25</td><td>Vehicles → ANPR: search a plate from the clip; open the vehicle; show the Journey map and the plate read with its confidence.</td><td>Plate text, confidence, corroborated/uncorroborated label, journey map.</td><td class="vo">"For vehicles, a plate detector finds the number plate and EasyOCR reads it. Reads are checked against the Indian plate format and voted across frames; a single-frame read is marked uncorroborated for review. Each sighting builds the vehicle's journey across cameras."</td></tr>
+  <tr><td class="t">3:25–3:55</td><td>Alerts: the new alert from the restricted zone (or watchlist) at the top; open it.</td><td>Severity badge, "why it fired" reasons, ACKNOWLEDGE / ESCALATE buttons.</td><td class="vo">"Rules turn detections into decisions. This vehicle entered a restricted zone, so an alert fired with its reasons and a risk score. The same engine handles watch-listed plates and loitering, with cooldowns so one object does not flood the screen."</td></tr>
+  <tr><td class="t">3:55–4:20</td><td>Press ESCALATE / open the linked incident. Show the incident's alerts, cameras and notes.</td><td>Incident title, correlated alerts, priority.</td><td class="vo">"Critical alerts open an incident, or join an existing one. If the same vehicle appears on another camera, it becomes one growing incident rather than a pile of separate alarms."</td></tr>
+  <tr><td class="t">4:20–4:45</td><td>In the incident: open an evidence item (VERIFIED badge, SHA-256), then GENERATE EVIDENCE PACKAGE and EXPORT PDF. Optionally press REC on a live camera for a few seconds.</td><td>VERIFIED integrity badge; package PDF opening.</td><td class="vo">"Evidence is captured automatically: a snapshot and a short clip around the event, each fingerprinted with SHA-256 at the moment of capture and re-verified whenever it is opened. An investigator can export the whole incident as an evidence package, and every access is written to a tamper-evident audit log."</td></tr>
+  <tr><td class="t">4:45–5:00</td><td>Self-Heal → Health Dashboard, then Camera Health; end on the Command Center.</td><td>Recovery events, degraded/reconnecting cameras in amber.</td><td class="vo">"Cameras fail, and the system is built to notice. Each camera reports its health, dropped streams reconnect on their own with backoff, and every recovery is logged. SENTINEL VISION: one platform to see, decide and prove."</td></tr>
+</table>
+
+<h2>Fallbacks if something is slow on the day</h2>
+<ul>
+  <li><b>No new alert within 30 s</b>: open the most recent existing zone-entry alert and say "here is one raised earlier today by the same rule".</li>
+  <li><b>Plate not read on the demo clip</b>: open an existing vehicle from Vehicles → ANPR that has a corroborated read.</li>
+  <li><b>Grid cameras degraded</b>: keep them on screen for the Self-Heal segment; they illustrate reconnecting honestly.</li>
+</ul>
+
+<h2>Post-production</h2>
+<ul>
+  <li>Lower-thirds with the feature name at each segment (e.g. "AI detection · YOLO11 + ByteTrack").</li>
+  <li>No speed-ups of detection footage; cut only between segments. Keep the on-screen clock visible where it appears.</li>
+  <li>End card: project name, repository URL, "Current implementation shown; scaling roadmap in the architecture document".</li>
+</ul>
+</body>
+</html>

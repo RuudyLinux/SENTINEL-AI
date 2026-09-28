@@ -1,7 +1,7 @@
 """Pydantic request/response schemas."""
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -50,19 +50,28 @@ class CameraCreate(BaseModel):
     location: str = ""
     lat: float = 0.0
     lng: float = 0.0
-    source_type: str  # webcam | video_file | rtsp | mock_vms | onvif (interface stub — see pipeline/adapters.py)
+    source_type: str  # webcam | video_file | rtsp | mock_vms | onvif (stub, see pipeline/adapters.py)
     source_uri: str  # "0" for webcam index, filename for video_file, url for rtsp
     ai_person: bool = True
     ai_vehicle: bool = True
     ai_anpr: bool = True
-    camera_group: str = ""  # free-form grouping/tag, e.g. "North Zone" — client-side filterable
+    camera_group: str = ""  # free-form tag like "North Zone", filtered client side
+
+
+class NearbyCameraOut(BaseModel):
+    id: str
+    camera_code: str
+    name: str
+    location: str
+    lat: float
+    lng: float
+    status: str
+    distance_m: float
 
 
 class CameraUpdate(BaseModel):
-    """PATCH payload — every field optional, only fields actually present in the
-    request are applied (see routers/cameras.py `model_dump(exclude_unset=True)`).
-    Deliberately excludes source_type/source_uri: changing a camera's source is a
-    reconnect operation (stop/re-add), not an in-place edit."""
+    """PATCH payload; only fields present are applied. The source can't be
+    edited: changing it is a reconnect."""
     name: Optional[str] = None
     location: Optional[str] = None
     camera_group: Optional[str] = None
@@ -91,29 +100,26 @@ class CameraOut(BaseModel):
     ai_vehicle: bool
     ai_anpr: bool
     camera_group: str = ""
+    retired: bool = False
+    # AI is on but no AI slot is free (pipeline/ai_capacity.py)
+    ai_blocked: bool = False
+    # REC button running for this camera (pipeline/recorder.py)
+    recording: bool = False
     last_frame_at: Optional[datetime] = None
-    # Richer connection-lifecycle state (24/7 auto-connect task) — in-memory
-    # only (CAMERA_STATS), attached by routers/cameras.py.list_cameras; null
-    # for a camera whose worker has never run in this process. Distinct from
-    # `status` (DB column, only ever online/offline/degraded).
+    # In-memory lifecycle state (CAMERA_STATS), null if the worker never ran.
+    # Distinct from `status`, the DB column (online/offline/degraded).
     grid_state: Optional[str] = None
-    # Same in-memory source (CAMERA_STATS), same reasoning as grid_state above —
-    # already computed by worker.py per iteration, just not previously exposed.
-    # Null for a camera whose worker has never run in this process.
     reconnect_count: Optional[int] = None
     last_error: Optional[str] = None
-    # Catalogue linkage — informational only. Deliberately no `source_uri`
-    # here: the RTSP URL may carry embedded credentials and must never reach
-    # the frontend/logs (see P0-E from Phase 1 and pipeline/catalog.py).
+    # Catalogue linkage, informational. No source_uri on purpose: the RTSP URL
+    # can carry credentials and must never reach the frontend or logs.
     external_catalog_id: Optional[str] = None
     catalog_codec: str = ""
     catalog_live_status: str = ""
     catalog_synced_at: Optional[datetime] = None
     catalog_stale: bool = False
-    # Unlike source_uri, these ARE meant for the client — WHEP is for a
-    # browser preview player, HLS for dashboard/mobile/restricted-network
-    # fallback (per the official spec). Neither is required; both stay
-    # null when the catalogue didn't supply one.
+    # These are meant for the client: WHEP for the browser player, HLS as the
+    # fallback. Null when the catalogue has none.
     whep_url: Optional[str] = None
     hls_url: Optional[str] = None
 
@@ -124,7 +130,7 @@ class DetectionOut(BaseModel):
     id: str
     camera_id: str
     timestamp: datetime  # PROCESSING time
-    source_timestamp: Optional[datetime] = None  # SOURCE time — see models.Detection
+    source_timestamp: Optional[datetime] = None  # SOURCE time, see models.Detection
     cls: str
     confidence: float
     bbox: List[float]
@@ -143,8 +149,34 @@ class PlateOut(BaseModel):
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
+    # V2 sighting fields. Optional, pre-V2 rows never had them and stay null
+    track_id: Optional[str] = None
+    last_seen: Optional[datetime] = None
+    reads_count: int = 1
+    vehicle_class: str = ""
+    detection_confidence: float = 0.0
+    vehicle_bbox: Optional[List[float]] = None
+    plate_bbox: Optional[List[float]] = None
+    # ANPR review
+    review_status: str = "auto_accepted"
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    corrected_text: Optional[str] = None
+    # ANPR explainability, separate from `confidence`. Null on older rows.
+    ocr_variant: Optional[str] = None
+    variants_agreeing: Optional[int] = None
+    corroborated: Optional[bool] = None
+    plate_crop_path: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PlateReviewCorrectRequest(BaseModel):
+    corrected_text: str
+
+
+class PlateReviewRejectRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 class VehicleOut(BaseModel):
@@ -161,17 +193,59 @@ class VehicleOut(BaseModel):
 
 
 class SightingOut(BaseModel):
+    """One hop in a vehicle's journey across cameras: where and when a camera saw
+    it. A camera-to-camera path, not a GPS track (no interpolated position,
+    heading or speed).
+    """
     camera_id: str
     camera_code: str
     camera_name: str
-    timestamp: datetime
+    timestamp: datetime  # first confident recognition at this camera
     confidence: float
     snapshot_path: Optional[str] = None
+    # V2 additions, defaulted so pre-V2 callers still work
+    location: str = ""
+    lat: float = 0.0
+    lng: float = 0.0
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    dwell_seconds: float = 0.0
+    reads_count: int = 1
+    track_id: Optional[str] = None
+    vehicle_class: str = ""
+    plate_id: Optional[str] = None
+    detection_id: Optional[str] = None
 
 
 class VehicleRouteOut(BaseModel):
     vehicle: VehicleOut
     sightings: List[SightingOut]
+
+
+class VehicleSummaryOut(BaseModel):
+    """Investigation header for one vehicle, shown before the journey,
+    evidence and alerts."""
+    vehicle: VehicleOut
+    total_sightings: int
+    cameras_visited: int
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    current_camera_id: Optional[str] = None
+    current_camera_code: Optional[str] = None
+    current_camera_name: Optional[str] = None
+    current_seen_at: Optional[datetime] = None
+    # only when the latest sighting is inside the live window: "on camera
+    # now" vs "last seen here"
+    is_live: bool = False
+    alert_count: int = 0
+    incident_count: int = 0
+    evidence_count: int = 0
+    watchlist_flag: bool = False
+    best_plate_confidence: float = 0.0
+    # from pipeline/risk.py
+    risk_score: int = 0
+    risk_severity: str = "LOW"
+    risk_factors: List[dict] = []
 
 
 class WatchlistCreate(BaseModel):
@@ -237,13 +311,35 @@ class AlertOut(BaseModel):
     severity: str
     status: str
     vehicle_id: Optional[str] = None
+    # the detection that fired the rule
+    detection_id: Optional[str] = None
     confidence: float
-    reasons: List[str]
+    # Coerced so a NULL in these nullable JSON columns becomes an empty list
+    # instead of failing validation for the whole response.
+    reasons: List[str] = []
     timestamp: datetime
     source_timestamp: Optional[datetime] = None
     snapshot_path: Optional[str] = None
+    # pipeline/risk.py. Pre-V2 alerts have 0 / [], no assessment was made
+    # back then and we don't invent one now
+    risk_score: int = 0
+    risk_factors: List[dict] = []
+
+    @field_validator("reasons", "risk_factors", mode="before")
+    @classmethod
+    def _null_json_is_empty(cls, value):
+        return [] if value is None else value
+    # false-positive feedback, null = not reviewed yet
+    feedback: Optional[str] = None
+    feedback_reason: Optional[str] = None
+    feedback_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AlertFeedbackRequest(BaseModel):
+    feedback: str  # confirmed | false_positive | needs_review
+    reason: Optional[str] = None
 
 
 class IncidentCreate(BaseModel):
@@ -276,7 +372,8 @@ class IncidentOut(BaseModel):
 
 
 class IncidentNoteCreate(BaseModel):
-    text: str
+    # Bounded so a single note can't be arbitrarily large.
+    text: str = Field(min_length=1, max_length=5000)
 
 
 class EvidenceOut(BaseModel):
@@ -292,8 +389,18 @@ class EvidenceOut(BaseModel):
     detection_id: Optional[str] = None
     event_type: str = ""
     source_timestamp: Optional[datetime] = None
+    # versions at capture. null on older evidence, not backfilled
+    model_version: Optional[str] = None
+    rule_version: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PurgeExpiredRequest(BaseModel):
+    # actually deleting needs dry_run=False AND confirm=True, one flag flip
+    # shouldn't destroy evidence
+    dry_run: bool = True
+    confirm: bool = False
 
 
 class AuditOut(BaseModel):

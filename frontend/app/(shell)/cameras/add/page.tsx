@@ -1,12 +1,16 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, API_BASE } from "@/lib/api";
+import { api } from "@/lib/api";
 
 export default function AddCameraPage() {
   const router = useRouter();
   const [form, setForm] = useState({
-    camera_code: "", name: "", department: "Police", location: "", camera_group: "", lat: 23.03, lng: 72.58,
+    camera_code: "", name: "", department: "Police", location: "", camera_group: "",
+    // blank, not a city centre: a prefilled position got saved for every camera
+    // nobody changed, and the map put them in the wrong place. blank = 0,0 =
+    // "location unavailable"
+    lat: "", lng: "",
     source_type: "video_file", source_uri: "",
     ai_person: true, ai_vehicle: true, ai_anpr: true,
   });
@@ -20,6 +24,13 @@ export default function AddCameraPage() {
   }
 
   async function uploadIfNeeded(): Promise<string> {
+    if (form.source_type === "video_file" && !file && !form.source_uri) {
+      throw new Error("Choose a video file first");
+    }
+    // mock_vms has no address field, it generates its own feed
+    if (["webcam", "rtsp", "onvif"].includes(form.source_type) && !form.source_uri.trim()) {
+      throw new Error("Enter the camera's source address first");
+    }
     if (form.source_type !== "video_file" || !file) return form.source_uri;
     const fd = new FormData();
     fd.append("file", file);
@@ -35,9 +46,9 @@ export default function AddCameraPage() {
       const fd = new FormData();
       fd.append("source_type", form.source_type);
       fd.append("source_uri", uri);
-      const res = await fetch(`${API_BASE}/api/cameras/test-connection`, { method: "POST", body: fd });
-      if (!res.ok) throw new Error(`Test request failed (HTTP ${res.status})`);
-      const data = await res.json();
+      // api.post so the bearer token goes along; this was the one camera route
+      // without auth, because this caller never sent one
+      const data = await api.post<any>("/api/cameras/test-connection", fd);
       setTestResult(data.detail);
       if (uri !== form.source_uri) set("source_uri", uri);
     } catch (err: any) {
@@ -52,7 +63,13 @@ export default function AddCameraPage() {
     setError(null);
     try {
       const uri = await uploadIfNeeded();
-      const camera = await api.post<any>("/api/cameras", { ...form, source_uri: uri });
+      const lat = form.lat.trim() === "" ? 0 : Number(form.lat);
+      const lng = form.lng.trim() === "" ? 0 : Number(form.lng);
+      if ((form.lat.trim() === "") !== (form.lng.trim() === "") || !Number.isFinite(lat) || !Number.isFinite(lng)
+          || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        throw new Error("Enter both latitude and longitude, or leave both blank if the location is unknown");
+      }
+      const camera = await api.post<any>("/api/cameras", { ...form, lat, lng, source_uri: uri });
       router.push(`/live/${camera.id}`);
     } catch (err: any) {
       setError(err.message || "Failed to save camera");
@@ -81,11 +98,11 @@ export default function AddCameraPage() {
           <Field label="Group (optional)">
             <input value={form.camera_group} onChange={(e) => set("camera_group", e.target.value)} placeholder="North Zone" className="input" />
           </Field>
-          <Field label="Latitude">
-            <input type="number" step="0.0001" value={form.lat} onChange={(e) => set("lat", parseFloat(e.target.value))} className="input" />
+          <Field label="Latitude (blank if unknown)">
+            <input type="number" step="0.0001" min={-90} max={90} value={form.lat} onChange={(e) => set("lat", e.target.value)} placeholder="e.g. 23.0225" className="input" />
           </Field>
-          <Field label="Longitude">
-            <input type="number" step="0.0001" value={form.lng} onChange={(e) => set("lng", parseFloat(e.target.value))} className="input" />
+          <Field label="Longitude (blank if unknown)">
+            <input type="number" step="0.0001" min={-180} max={180} value={form.lng} onChange={(e) => set("lng", e.target.value)} placeholder="e.g. 72.5714" className="input" />
           </Field>
         </div>
 

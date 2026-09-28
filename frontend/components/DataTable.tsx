@@ -31,13 +31,29 @@ export default function DataTable<T extends { id: string }>({
             <tr
               key={row.id}
               onClick={() => onRowClick?.(row)}
-              className={`border-t border-border ${onRowClick ? "cursor-pointer hover:bg-panel2 transition-colors duration-150" : ""}`}
+              // clickable rows are the only way to the detail pages, so they
+              // need keyboard access
+              tabIndex={onRowClick ? 0 : undefined}
+              onKeyDown={onRowClick ? (e) => {
+                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onRowClick(row); }
+              } : undefined}
+              className={`border-t border-border ${onRowClick ? "cursor-pointer hover:bg-panel2 focus:bg-panel2 focus:outline focus:outline-1 focus:outline-accent transition-colors duration-150" : ""}`}
             >
-              {columns.map((c) => (
-                <td key={c.key} className="px-3 py-2 whitespace-nowrap">
-                  {c.render ? c.render(row) : (row as any)[c.key]}
-                </td>
-              ))}
+              {columns.map((c) => {
+                const value = c.render ? c.render(row) : (row as any)[c.key];
+                return (
+                  <td
+                    key={c.key}
+                    // Cap the cell width so one very long value (e.g. an
+                    // audited username) can't widen the whole table; the full
+                    // value shows on hover.
+                    className="px-3 py-2 whitespace-nowrap max-w-xs truncate"
+                    title={typeof value === "string" ? value : undefined}
+                  >
+                    {value}
+                  </td>
+                );
+              })}
             </tr>
           ))}
         </tbody>

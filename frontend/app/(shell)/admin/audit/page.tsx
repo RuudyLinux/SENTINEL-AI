@@ -23,7 +23,7 @@ export default function AuditLogPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">Audit Logs</h1>
         <div className="flex items-center gap-2">
-          <input value={actorInput} onChange={(e) => setActorInput(e.target.value)} placeholder="Filter by user..." className="bg-panel2 border border-border rounded px-3 py-1.5 text-sm" />
+          <input aria-label="Filter by user" value={actorInput} onChange={(e) => setActorInput(e.target.value)} placeholder="Filter by user..." className="bg-panel2 border border-border rounded px-3 py-1.5 text-sm" />
           <button onClick={() => setActor(actorInput)} className="text-xs border border-border rounded px-3 py-1.5">FILTER</button>
         </div>
       </div>

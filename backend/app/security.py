@@ -15,8 +15,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=Fals
 
 
 def hash_password(password: str) -> str:
-    # bcrypt truncates at 72 bytes; enforced explicitly instead of via passlib
-    # (passlib's bcrypt backend-detection is broken on bcrypt>=4.1 as of this build).
+    # bcrypt truncates at 72 bytes. done by hand since passlib's backend
+    # detection breaks on bcrypt>=4.1
     return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
 
 
@@ -35,11 +35,8 @@ def create_access_token(user: models.User) -> str:
 
 
 def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.User]:
-    """Same JWT validation as get_current_user, usable outside the HTTP
-    Authorization-header/OAuth2PasswordBearer machinery — for the WebSocket
-    handshake (browsers can't attach a header there; the token travels as a
-    query parameter instead, see main.py's /ws). Returns None rather than
-    raising; the caller decides what "no valid user" means for its transport."""
+    """get_current_user's JWT check for the WebSocket handshake, where the token
+    arrives as a query parameter. Returns None instead of raising."""
     if not token:
         return None
     try:
@@ -48,6 +45,10 @@ def get_user_from_token(token: Optional[str], db: Session) -> Optional[models.Us
         if user_id is None:
             return None
     except JWTError:
+        return None
+    # Resource tokens share the secret and `sub`, so reject any scoped token
+    # here: they appear in URLs and must never work as a session token.
+    if "scope" in payload:
         return None
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if user is None or not user.active:
@@ -78,13 +79,16 @@ def require_roles(*allowed_roles: str):
     return dependency
 
 
-# --- Resource tokens (P0-E) ---------------------------------------------
-# Short-lived, scoped-to-one-resource signed tokens for the handful of
-# endpoints browsers hit via plain <img src>/<a href> navigation, which
-# can't attach an Authorization: Bearer header. The client fetches a token
-# via a normal authenticated (RBAC-checked) request first, then appends it
-# as `?token=` on the actual file/stream URL. Reuses the same JWT secret —
-# no new dependency, no server-side session state.
+# Roles that act on alerts, incidents and plate reads. Not Auditor: an
+# auditor who can dismiss the alerts or close the incidents they audit isn't
+# an auditor.
+OPERATIONAL_ROLES = ("Administrator", "Control Room Operator", "Investigator", "Supervisor")
+require_operational_role = require_roles(*OPERATIONAL_ROLES)
+
+
+# Resource tokens: short-lived, scoped to one resource, for URLs the browser
+# loads directly (<img src>, <a href>) and can't attach a bearer header to.
+# Stateless, signed with the JWT secret.
 
 def create_resource_token(resource: str, resource_id: str, user: models.User, ttl_seconds: int) -> str:
     expire = datetime.utcnow() + timedelta(seconds=ttl_seconds)
@@ -105,3 +109,15 @@ def get_user_from_resource_token(resource: str, resource_id: str, token: str, db
     if user is None or not user.active:
         raise credentials_exc
     return user
+
+
+def resource_token_expiry(token: str) -> "datetime | None":
+    """Expiry of a resource token, or None if it can't be decoded. Long responses
+    such as MJPEG are authorised once, so callers need the deadline to end them.
+    """
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    exp = payload.get("exp")
+    return datetime.utcfromtimestamp(exp) if exp else None

@@ -44,10 +44,38 @@ def create_user(payload: schemas.UserCreate, db: Session = Depends(get_db), user
 
 @router.post("/users/{user_id}/disable")
 def disable_user(user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Disable an account. Not your own.
+
+    Disabling yourself took effect immediately: login and existing tokens
+    both check active, so the admin got a 200 then a 401, and without an
+    enable endpoint the only fix was editing the database.
+
+    Self-disable is also the only way to reach zero administrators (only an
+    active admin can call this, and they remain), so refusing it keeps at
+    least one without a separate count.
+    """
     target = db.query(models.User).filter(models.User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    if target.id == user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="An administrator cannot disable their own account — ask another administrator to do it.",
+        )
     target.active = False
     db.commit()
     log_action(db, user, "disable_user", resource=user_id)
+    return {"ok": True}
+
+
+@router.post("/users/{user_id}/enable")
+def enable_user(user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Re-enable a disabled account, so a mistaken disable isn't permanent.
+    Audited like the other account changes."""
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.active = True
+    db.commit()
+    log_action(db, user, "enable_user", resource=user_id)
     return {"ok": True}

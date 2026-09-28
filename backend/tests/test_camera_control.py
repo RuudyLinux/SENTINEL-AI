@@ -1,9 +1,18 @@
-"""Camera Control Center bulk endpoint: RBAC enforcement, partial-failure
-handling (one bad camera never aborts the batch), duplicate-in-progress
-skip, and the one audit-log entry per bulk call."""
+"""Bulk camera endpoint: RBAC, one bad camera never aborts the batch,
+in-progress cameras skipped, one audit entry per call."""
+import asyncio
+import os
+import sqlite3
+import tempfile
+import threading
+import time
+
 import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
 
 from app import models
+from app.db import Base
 from app.routers import camera_control
 from app.security import hash_password, create_access_token
 
@@ -38,8 +47,8 @@ def operator_token(operator_user):
 
 @pytest.fixture
 def viewer_user(db_session):
-    """Investigator: no camera-control permission per seed.py's role list —
-    stands in for "Viewer: no control actions" (Part 7)."""
+    """Investigator has no camera-control permission (seed.py), standing in
+    for a view-only role."""
     role = db_session.query(models.Role).filter(models.Role.name == "Investigator").first()
     if role is None:
         role = models.Role(name="Investigator", description="test")
@@ -120,8 +129,7 @@ def test_bulk_action_records_one_audit_log_entry(client, admin_token, db_session
 
 
 def test_camera_already_in_progress_is_skipped_not_double_actioned(client, admin_token):
-    """Duplicate-click / overlapping-bulk-op guard (Part 4): a camera_id
-    already marked in-progress by another in-flight bulk call is reported as
+    """A camera another bulk call is already working on is reported as
     skipped, never actioned twice."""
     cam_id = _make_camera(client, admin_token, "C-BULK-INFLIGHT")
     camera_control._IN_PROGRESS.add(cam_id)
@@ -140,3 +148,69 @@ def test_disruptive_actions_list_matches_documented_set(client, admin_token):
     resp = client.get("/api/cameras/bulk/disruptive-actions", headers=_auth(admin_token))
     assert resp.status_code == 200
     assert set(resp.json()) == {"restart", "disconnect", "stop"}
+
+
+def _make_short_timeout_engine(db_path: str):
+    """db.py's PRAGMAs with a short busy_timeout so a real lock shows up in
+    ms (same harness as test_db_concurrency.py)."""
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False, "timeout": 0.2})
+
+    @event.listens_for(engine, "connect")
+    def _pragmas(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=200")
+        cursor.close()
+
+    return engine
+
+
+def test_set_ai_retries_through_a_real_sqlite_lock_and_durably_persists():
+    """_set_ai goes through safe_commit: a real second connection holds the
+    write lock (not mocked), and the reapplied value ends up committed,
+    checked from a fresh connection."""
+    tmp_dir = tempfile.mkdtemp(prefix="sentinel_bulk_lock_test_")
+    db_path = os.path.join(tmp_dir, "bulk_lock_test.db").replace("\\", "/")
+
+    engine = _make_short_timeout_engine(db_path)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+    db = Session()
+    camera = models.Camera(
+        camera_code="C-BULK-REAL-LOCK", name="bulk lock test", source_type="video_file",
+        source_uri="unused.mp4", status="offline", ai_person=False, ai_vehicle=False, ai_anpr=False,
+    )
+    db.add(camera)
+    db.commit()
+    camera_id = camera.id
+
+    lock_hold_seconds = 0.6
+
+    def _hold_lock():
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE cameras SET name = name WHERE id = ?", (camera_id,))
+        time.sleep(lock_hold_seconds)
+        conn.commit()
+        conn.close()
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    time.sleep(0.15)
+
+    try:
+        ok = asyncio.run(camera_control._set_ai(db, camera, True, "C-BULK-REAL-LOCK"))
+        assert ok is True
+    finally:
+        holder.join()
+        db.close()
+
+    verify_db = Session()
+    try:
+        reloaded = verify_db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+        assert reloaded is not None
+        assert reloaded.ai_person is True and reloaded.ai_vehicle is True and reloaded.ai_anpr is True
+    finally:
+        verify_db.close()
+    engine.dispose()

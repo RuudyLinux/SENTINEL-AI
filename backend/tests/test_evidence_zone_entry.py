@@ -1,12 +1,10 @@
-"""Evidence backfill for bare zone_entry alerts (final hardening task).
+"""Evidence for plain zone_entry alerts.
 
-Previously: rules_engine.py only attached a snapshot/Evidence at alert-creation
-time when the triggering Detection already had one (ANPR/watchlist path only) —
-a restricted-zone entry with no plate match produced Alert + Incident but NO
-Evidence at all. worker.py now captures one from the real processed frame for
-ANY alert that doesn't already have a snapshot, covering zone_entry without
-touching the existing ANPR/watchlist path (already-set snapshot_path short-
-circuits the new code, so that path is provably unchanged — asserted below).
+rules_engine only attached a snapshot when the detection already had one
+(ANPR/watchlist), so a zone entry without a plate got an Alert and Incident
+but no Evidence. worker.py now saves one from the frame for any alert
+without a snapshot. An existing snapshot_path skips it, so the ANPR path is
+unchanged (checked below).
 """
 import asyncio
 import uuid
@@ -19,10 +17,16 @@ from app import models
 from app.pipeline import worker, rules_engine
 
 
+@pytest.fixture(autouse=True)
+def _one_frame_zone_entry(monkeypatch):
+    # these tests fire a zone alert from one tracked frame; the multi-frame
+    # confirmation has its own tests in test_zone_alert_accuracy.py
+    from app.config import settings as _settings
+    monkeypatch.setattr(_settings, "zone_entry_min_frames", 1)
+
+
 def _make_camera_and_full_frame_zone(db_session, severity="HIGH", camera_code=None):
-    # uuid-suffixed, not a fixed literal — the shared SQLite file across this
-    # test module's tests (and the rest of the suite) enforces camera_code
-    # uniqueness; a hardcoded code collided across tests here.
+    # uuid suffix, camera_code is unique across the shared test DB
     camera_code = camera_code or f"C-EVIDENCE-TEST-{uuid.uuid4().hex[:8]}"
     camera = models.Camera(
         camera_code=camera_code, name="Evidence Test Cam", location="Test Location",
@@ -43,10 +47,10 @@ def _make_camera_and_full_frame_zone(db_session, severity="HIGH", camera_code=No
 
 @pytest.fixture(autouse=True)
 def _clear_rule_engine_state():
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
     yield
-    rules_engine._last_alert_at.clear()
+    rules_engine._alert_claims.clear()
     rules_engine._zone_presence.clear()
 
 
@@ -59,8 +63,7 @@ def test_bare_zone_entry_now_produces_a_real_evidence_row(monkeypatch, db_sessio
     async def _fake_detect_and_track(frame_arg, camera_id, want_person=True, want_vehicle=True):
         return [{"cls": "person", "confidence": 0.9, "bbox": [100, 100, 300, 300], "track_id": 1}]
 
-    # detect_and_track is a sync function normally run via asyncio.to_thread —
-    # patch the sync entry point worker actually calls.
+    # patch the sync function the worker runs via to_thread
     monkeypatch.setattr(worker, "detect_and_track", lambda f, cid, want_person=True, want_vehicle=True: [
         {"cls": "person", "confidence": 0.9, "bbox": [100, 100, 300, 300], "track_id": 1}
     ])
@@ -82,7 +85,7 @@ def test_bare_zone_entry_now_produces_a_real_evidence_row(monkeypatch, db_sessio
     assert evidence.verification_status == "unverified"
     assert evidence.file_path == alert.snapshot_path
 
-    # A real file, not a fabricated path — the actual processed frame, written to disk.
+    # a real file, the processed frame written to disk
     assert Path(evidence.file_path).exists()
     assert Path(evidence.file_path).stat().st_size > 0
 
@@ -92,10 +95,10 @@ def test_bare_zone_entry_now_produces_a_real_evidence_row(monkeypatch, db_sessio
 
 
 def test_filenames_do_not_collide_across_concurrent_cameras(monkeypatch, db_session, tmp_path):
-    """Two different cameras firing the same instant must not write to the same
-    path — the naming strategy is camera_code + alert_id + microsecond
-    timestamp, so this is inherently collision-safe."""
+    """Two cameras firing at the same instant get different paths
+    (camera_code + alert_id + microsecond timestamp)."""
     monkeypatch.setattr(worker.settings, "evidence_dir", tmp_path)
+    monkeypatch.setattr(worker.settings, "max_ai_cameras", 2)  # both cameras run AI
     monkeypatch.setattr(worker, "detect_and_track", lambda f, cid, want_person=True, want_vehicle=True: [
         {"cls": "person", "confidence": 0.9, "bbox": [100, 100, 300, 300], "track_id": 1}
     ])
@@ -115,11 +118,7 @@ def test_filenames_do_not_collide_across_concurrent_cameras(monkeypatch, db_sess
     asyncio.run(worker._process_frame(db_session, cam_a, frame, 0, 640, 480, None, []))
     asyncio.run(worker._process_frame(db_session, cam_b_camera, frame, 0, 640, 480, None, []))
 
-    # Scoped to exactly these two cameras' own evidence — an unscoped query
-    # over the whole table picks up rows from every other test file sharing
-    # this DB (same class of cross-test pollution fixed elsewhere this
-    # session), which is a test-isolation bug, not evidence of a real
-    # filename collision.
+    # only these two cameras' evidence; the whole table has other tests' rows
     paths = [
         e.file_path for e in db_session.query(models.Evidence)
         .filter(models.Evidence.camera_id.in_([cam_a.id, cam_b_camera.id]))
@@ -132,10 +131,8 @@ def test_filenames_do_not_collide_across_concurrent_cameras(monkeypatch, db_sess
 
 
 def test_anpr_watchlist_snapshot_path_unchanged_evidence_not_duplicated(monkeypatch, db_session, tmp_path):
-    """The pre-existing ANPR/watchlist evidence path is untouched: when a
-    detection already carries a snapshot_path (set earlier in _process_frame,
-    same as before this change), the new backfill code must not run again and
-    must not create a second Evidence row for the same alert."""
+    """With snapshot_path already set by the ANPR path, the backfill doesn't
+    run and there's no second Evidence row."""
     monkeypatch.setattr(worker.settings, "evidence_dir", tmp_path)
     monkeypatch.setattr(worker, "detect_and_track", lambda f, cid, want_person=True, want_vehicle=True: [
         {"cls": "car", "confidence": 0.9, "bbox": [100, 100, 300, 300], "track_id": 1}
@@ -152,13 +149,61 @@ def test_anpr_watchlist_snapshot_path_unchanged_evidence_not_duplicated(monkeypa
     db_session.commit()
     db_session.refresh(camera)
 
-    # ANPR gate rejects every read (no plausible plate in a blank crop) — so
-    # this exercises the plain zone_entry path even on a car, proving the new
-    # code activates regardless of vehicle class once ANPR doesn't match.
+    # the gate rejects every read (blank crop), so a car takes the plain
+    # zone_entry path too
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     asyncio.run(worker._process_frame(db_session, camera, frame, 0, 640, 480, None, []))
 
     alerts = db_session.query(models.Alert).filter(models.Alert.camera_id == camera.id).all()
     assert len(alerts) == 1
     evidence_rows = db_session.query(models.Evidence).filter(models.Evidence.alert_id == alerts[0].id).all()
-    assert len(evidence_rows) == 1  # exactly one — no duplication
+    assert len(evidence_rows) == 1  # no duplicate
+
+
+def test_critical_watchlist_evidence_carries_alert_and_detection_reference(db_session):
+    """rules_engine's own incident Evidence row didn't set alert_id/
+    detection_id/event_type/source_timestamp (worker.py's backfill does), so
+    the UI showed "Alert: —" on a real CRITICAL watchlist match."""
+    from app.pipeline import rules_engine
+
+    camera = models.Camera(
+        camera_code=f"C-EVIDENCE-CRITICAL-{uuid.uuid4().hex[:8]}", name="Critical Evidence Test Cam",
+        source_type="mock_vms", source_uri="", status="online",
+    )
+    db_session.add(camera)
+    db_session.flush()
+    # plate_confidence above the watchlist floor, this is about linkage not
+    # confidence gating (test_watchlist_confidence_gating.py). And a real
+    # WatchlistEntry, not just the flag: the flag is only ever set from an
+    # entry, and the rule now needs the entry so its reason string is true.
+    db_session.add(models.WatchlistEntry(
+        entity_type="plate", identifier="GJ01ZZ9999", priority="CRITICAL", active=True,
+        reason="evidence linkage test",
+    ))
+    vehicle = models.Vehicle(
+        plate_text="GJ01ZZ9999", plate_confidence=0.9, watchlist_flag=True,
+        plate_corroborated=True,  # CRITICAL now needs corroboration as well as confidence
+    )
+    db_session.add(vehicle)
+    db_session.flush()
+    detection = models.Detection(
+        camera_id=camera.id, cls="car", confidence=0.9, bbox=[1, 2, 3, 4],
+        snapshot_path="/tmp/fake-real-snapshot.jpg",
+    )
+    db_session.add(detection)
+    db_session.commit()
+
+    rules_engine._alert_claims.clear()
+    alerts = asyncio.run(rules_engine.evaluate(db_session, camera, detection, 640, 480, vehicle))
+    assert len(alerts) == 1
+    assert alerts[0].severity == "CRITICAL"
+
+    incident = db_session.query(models.Incident).filter(models.Incident.alert_id == alerts[0].id).first()
+    assert incident is not None
+    evidence = db_session.query(models.Evidence).filter(models.Evidence.incident_id == incident.id).first()
+    assert evidence is not None
+    assert evidence.alert_id == alerts[0].id  # the missing field
+    assert evidence.detection_id == detection.id
+    assert evidence.event_type == "watchlist_match"
+    assert evidence.camera_id == camera.id
+    assert evidence.file_path == "/tmp/fake-real-snapshot.jpg"

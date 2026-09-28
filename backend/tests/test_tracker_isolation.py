@@ -1,42 +1,47 @@
-"""10. Camera tracker isolation — P0-B: one YOLO/ByteTrack instance per
-camera, never shared, so concurrent cameras cannot corrupt each other's
-track IDs. YOLO itself is mocked out — this test is about the per-camera
-instance bookkeeping, not the model weights."""
+"""One YOLO model shared by every camera, one ByteTrack tracker per camera,
+so cameras can't corrupt each other's track ids and GPU memory doesn't grow
+with the number of cameras. YOLO is mocked."""
+import numpy as np
+
 from app.pipeline import detector
 
 
 class _FakeYOLO:
-    _count = 0
+    count = 0
 
     def __init__(self, *a, **kw):
-        _FakeYOLO._count += 1
-        self.instance_id = _FakeYOLO._count
+        _FakeYOLO.count += 1
+
+    def predict(self, *a, **kw):
+        return []
 
 
-def test_each_camera_gets_its_own_model_instance(monkeypatch):
+def _fresh(monkeypatch):
     monkeypatch.setattr(detector, "YOLO", _FakeYOLO)
-    detector._MODELS_BY_CAMERA.clear()
-
-    model_a = detector.get_model("cam_A")
-    model_b = detector.get_model("cam_B")
-    assert model_a is not model_b
-    assert model_a.instance_id != model_b.instance_id
+    monkeypatch.setattr(detector, "_MODEL", None)
+    _FakeYOLO.count = 0
+    detector._TRACKERS.clear()
 
 
-def test_repeated_calls_for_the_same_camera_reuse_its_instance(monkeypatch):
-    monkeypatch.setattr(detector, "YOLO", _FakeYOLO)
-    detector._MODELS_BY_CAMERA.clear()
+def test_every_camera_shares_one_model(monkeypatch):
+    _fresh(monkeypatch)
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    detector.detect_and_track(frame, "cam_A")
+    detector.detect_and_track(frame, "cam_B")
+    assert _FakeYOLO.count == 1
+    assert detector.get_model() is detector.get_model()
 
-    first = detector.get_model("cam_A")
-    second = detector.get_model("cam_A")
-    assert first is second
+
+def test_each_camera_gets_its_own_tracker(monkeypatch):
+    _fresh(monkeypatch)
+    assert detector._tracker("cam_A") is not detector._tracker("cam_B")
+    assert detector._tracker("cam_A") is detector._tracker("cam_A")
 
 
-def test_release_model_drops_the_instance_so_a_fresh_one_is_built_next(monkeypatch):
-    monkeypatch.setattr(detector, "YOLO", _FakeYOLO)
-    detector._MODELS_BY_CAMERA.clear()
-
-    first = detector.get_model("cam_A")
+def test_release_drops_only_that_cameras_tracker(monkeypatch):
+    _fresh(monkeypatch)
+    a, b = detector._tracker("cam_A"), detector._tracker("cam_B")
     detector.release_model("cam_A")
-    second = detector.get_model("cam_A")
-    assert first is not second
+    assert detector._tracker("cam_A") is not a
+    assert detector._tracker("cam_B") is b
+    assert _FakeYOLO.count == 0  # releasing never touches the shared model

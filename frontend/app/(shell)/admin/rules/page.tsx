@@ -12,16 +12,23 @@ export default function AiRulesPage() {
   const zones = zonesData || [];
   const [form, setForm] = useState({ name: "", rule_type: "watchlist_plate", zone_id: "", priority: "CRITICAL" });
   const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
+  // double-submit guard like the other forms; nothing here to collide on, so
+  // a second click would just make a second identical rule
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setActionError(null);
+    setBusy(true);
     try {
       await api.post("/api/rules", { ...form, zone_id: form.zone_id || null });
       setForm({ name: "", rule_type: "watchlist_plate", zone_id: "", priority: "CRITICAL" });
       reloadRules();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not create rule");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -50,12 +57,12 @@ export default function AiRulesPage() {
 
       <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex gap-2 items-end flex-wrap max-w-3xl">
         <div>
-          <label className="text-xs text-slate-400">Rule name</label>
-          <input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
+          <label htmlFor="rule-name" className="text-xs text-slate-400">Rule name</label>
+          <input id="rule-name" required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>
         <div>
-          <label className="text-xs text-slate-400">Type</label>
-          <select value={form.rule_type} onChange={(e) => setForm({ ...form, rule_type: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
+          <label htmlFor="rule-type" className="text-xs text-slate-400">Type</label>
+          <select id="rule-type" value={form.rule_type} onChange={(e) => setForm({ ...form, rule_type: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
             <option value="watchlist_plate">Watchlist Plate Match</option>
             <option value="zone_entry">Restricted Zone Entry</option>
             <option value="loitering">Loitering (dwell time)</option>
@@ -63,8 +70,8 @@ export default function AiRulesPage() {
         </div>
         {(form.rule_type === "zone_entry" || form.rule_type === "loitering") && (
           <div>
-            <label className="text-xs text-slate-400">Zone</label>
-            <select required value={form.zone_id} onChange={(e) => setForm({ ...form, zone_id: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
+            <label htmlFor="rule-zone" className="text-xs text-slate-400">Zone</label>
+            <select id="rule-zone" required value={form.zone_id} onChange={(e) => setForm({ ...form, zone_id: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
               <option value="">Select zone...</option>
               {zones.map((z) => (
                 <option key={z.id} value={z.id}>
@@ -81,12 +88,12 @@ export default function AiRulesPage() {
           </div>
         )}
         <div>
-          <label className="text-xs text-slate-400">Priority</label>
-          <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
+          <label htmlFor="rule-priority" className="text-xs text-slate-400">Priority</label>
+          <select id="rule-priority" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="block bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
             <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
           </select>
         </div>
-        <button className="text-xs bg-accent text-ink font-medium rounded px-4 py-2">CREATE RULE</button>
+        <button type="submit" disabled={busy} className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 disabled:opacity-50">{busy ? "Creating..." : "CREATE RULE"}</button>
       </form>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
 

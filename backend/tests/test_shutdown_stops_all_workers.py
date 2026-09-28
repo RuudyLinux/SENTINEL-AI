@@ -1,12 +1,13 @@
-"""Regression test for a real shutdown-leak bug: _on_startup starts workers
-directly for every webcam/video_file/mock_vms camera via start_worker(),
-completely bypassing the supervisor — those tasks are never registered in
-supervisor.AUTO_MANAGED. The old _on_shutdown() only called
-supervisor.stop_supervisor(), which only stops AUTO_MANAGED workers, so a
-directly-started camera's asyncio task and cv2.VideoCapture handle were
-just abandoned at process exit instead of going through _camera_loop's
-`finally: source.release()`. Fixed by having _on_shutdown also stop
-whatever is still left in worker.RUNNING after the supervisor is stopped.
+"""Two shutdown leaks:
+
+1. Startup starts local cameras with start_worker() directly, outside the
+   supervisor, and shutdown only stopped supervisor-managed workers, so
+   those tasks and their VideoCaptures were abandoned. Shutdown now also
+   stops whatever is left in RUNNING.
+2. stop_worker() only requests cancellation; the release in the task's
+   finally runs when it's next scheduled, which may be never. Shutdown now
+   gathers the tasks, so the asserts below run right after
+   `await main._on_shutdown()` with no polling.
 """
 import asyncio
 
@@ -17,10 +18,8 @@ from app.pipeline import supervisor, worker
 
 
 class _FakeAlwaysOpenSource:
-    """Stands in for CameraSource: opens instantly, always has a frame
-    ready, and records whether release() was actually called — the concrete
-    proof that _camera_loop's cleanup path ran to completion rather than
-    the task being silently abandoned."""
+    """Fake CameraSource: opens instantly, always has a frame, records
+    whether release() ran."""
     def __init__(self, frame):
         self._frame = frame
         self.released = False
@@ -45,9 +44,8 @@ class _FakeAlwaysOpenSource:
 
 
 def test_shutdown_stops_a_directly_started_webcam_worker_not_just_supervisor_managed_ones(monkeypatch, db_session):
-    """Simulates exactly what _on_startup does for a webcam/video_file/
-    mock_vms camera: start_worker() called directly, never registered with
-    the supervisor. _on_shutdown() must still stop it."""
+    """Like startup does for a local camera: start_worker directly, not via
+    the supervisor. Shutdown still has to stop it."""
     camera = models.Camera(
         camera_code="C-SHUTDOWN-DIRECT-TEST", name="test", source_type="webcam",
         source_uri="0", status="offline",
@@ -65,7 +63,7 @@ def test_shutdown_stops_a_directly_started_webcam_worker_not_just_supervisor_man
     assert camera.id not in supervisor.AUTO_MANAGED  # never touched by the supervisor, by construction
 
     async def _drive():
-        worker.start_worker(camera.id)  # exactly what _on_startup does for webcam/video_file/mock_vms
+        worker.start_worker(camera.id)  # what _on_startup does for local cameras
         for _ in range(150):
             await asyncio.sleep(0.02)
             if worker.CAMERA_STATS.get(camera.id, {}).get("grid_state") == "CONNECTED":
@@ -73,20 +71,14 @@ def test_shutdown_stops_a_directly_started_webcam_worker_not_just_supervisor_man
         assert camera.id in worker.RUNNING  # actually running before we shut down
 
         await main._on_shutdown()
-
-        # task.cancel() is asynchronous — give the event loop a moment to
-        # actually unwind _camera_loop's while-loop and run its `finally`.
-        for _ in range(100):
-            if camera.id not in worker.RUNNING and source.released:
-                break
-            await asyncio.sleep(0.02)
+        # no polling, _on_shutdown gathers the stopped tasks itself
 
     try:
         asyncio.run(_drive())
         # The actual bug: this camera was never in AUTO_MANAGED, so the old
         # _on_shutdown() (supervisor.stop_supervisor() only) left it running.
         assert camera.id not in worker.RUNNING
-        assert source.released is True  # source.release() in _camera_loop's finally actually ran
+        assert source.released is True  # the loop's finally really ran
     finally:
         worker.stop_worker(camera.id)
         worker.CAMERA_STATS.pop(camera.id, None)

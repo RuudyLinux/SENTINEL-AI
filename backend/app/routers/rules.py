@@ -14,8 +14,26 @@ def list_rules(db: Session = Depends(get_db), user: models.User = Depends(get_cu
     return db.query(models.AlertRule).all()
 
 
+# rule types rules_engine actually evaluates. anything else would sit in the
+# list looking active and never fire
+_RULE_TYPES = ("watchlist_plate", "zone_entry", "loitering")
+
+
 @router.post("", response_model=schemas.AlertRuleOut)
 def create_rule(payload: schemas.AlertRuleCreate, db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Supervisor"))):
+    """Create an alert rule, refusing ones that can never fire.
+
+    Unknown rule_type is refused, and an unknown zone_id (a 500 once FKs were
+    enforced) is a 404. A loitering rule needs a zone; rules_engine only
+    applies loitering to the zone a rule names, so without one it watches
+    nothing.
+    """
+    if payload.rule_type not in _RULE_TYPES:
+        raise HTTPException(status_code=400, detail=f"rule_type must be one of {list(_RULE_TYPES)}")
+    if payload.rule_type == "loitering" and not payload.zone_id:
+        raise HTTPException(status_code=400, detail="A loitering rule must name the zone it applies to")
+    if payload.zone_id and not db.query(models.Zone).filter(models.Zone.id == payload.zone_id).first():
+        raise HTTPException(status_code=404, detail="Zone not found")
     rule = models.AlertRule(**payload.model_dump())
     db.add(rule)
     db.commit()

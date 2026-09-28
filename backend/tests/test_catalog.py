@@ -92,8 +92,7 @@ def test_upsert_leaves_whep_hls_null_when_catalogue_never_supplied_one(db_sessio
 
 
 def test_upsert_does_not_erase_whep_hls_on_a_resync_that_omits_them(db_session):
-    """Idempotent re-sync: a later catalogue response that happens not to
-    repeat the whep/hls fields must not be read as 'they were removed'."""
+    """A re-sync that doesn't repeat whep/hls doesn't mean they were removed."""
     upsert_from_catalog(db_session, [{
         "id": "CAM-302", "location": "Zone F", "rtsp_url": "rtsp://h/302",
         "whep_url": "http://h:8889/stream/302/whep",
@@ -106,10 +105,8 @@ def test_upsert_does_not_erase_whep_hls_on_a_resync_that_omits_them(db_session):
 
 
 def test_existing_camera_row_without_whep_hls_migrates_safely(db_session):
-    """Simulates a camera row that predates this column (as ensure_columns'
-    additive migration would leave one) — reading whep_url/hls_url on it
-    must not error, and must come back as None, not a crash or a
-    fabricated value."""
+    """A row from before these columns (as ensure_columns would leave it):
+    whep_url/hls_url read as None, no crash."""
     camera = models.Camera(
         camera_code="C-PRE-EXISTING", name="pre-existing", source_type="rtsp",
         source_uri="rtsp://h/pre", external_catalog_id="CAM-PRE",

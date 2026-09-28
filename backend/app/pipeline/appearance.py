@@ -1,14 +1,8 @@
-"""Person appearance-similarity signature (Phase 5 — cross-camera intelligence).
+"""Person appearance signature for cross-camera similarity.
 
-Explicitly NOT face recognition and NOT an identity claim. This computes a compact
-color-histogram "visual signature" of a person's bounding-box crop — a lightweight,
-non-biometric feature used only to *rank* candidate sightings across cameras by how
-visually similar they look (clothing/color, roughly), for an investigator to review
-and confirm manually. It cannot and does not identify who someone is. See
-routers/persons.py and README.md → "Cross-camera intelligence" for the exact
-honest framing used throughout the app.
-
-No new dependency — built entirely on cv2/numpy, already in requirements.txt.
+A small HSV histogram of the person crop (roughly clothing colour), used only
+to rank sightings on other cameras for an investigator to check by hand. Not
+face recognition and not identity.
 """
 import numpy as np
 import cv2
@@ -18,9 +12,8 @@ SIGNATURE_BINS = 16  # per channel
 
 
 def compute_signature(crop: "np.ndarray") -> "list[float] | None":
-    """HSV color histogram of a person crop, 3 channels x SIGNATURE_BINS bins each,
-    each channel independently normalized to sum to 1. Returns None (never a
-    fabricated/zero vector) if the crop is too small to be meaningful."""
+    """HSV histogram of a person crop, 3 channels x SIGNATURE_BINS, each
+    channel normalized to sum 1. None if the crop is too small."""
     if crop is None or crop.size == 0:
         return None
     h, w = crop.shape[:2]
@@ -39,18 +32,13 @@ def compute_signature(crop: "np.ndarray") -> "list[float] | None":
     return sig
 
 
-# Per-channel weights for the final score: Hue is the primary color signal;
-# Value (brightness) is the least reliable across lighting/exposure differences
-# between cameras, so it counts least. Comparing one flat concatenated vector
-# instead (tried first) let two very differently-hued but similarly bright/
-# saturated crops (e.g. pure red vs. pure blue) score misleadingly high, since
-# a matching S/V spike outweighed a completely mismatched H spike.
+# Hue is the main colour signal; Value (brightness) varies most between cameras,
+# so it is weighted least. Channels are compared separately.
 _CHANNEL_WEIGHTS = (0.6, 0.3, 0.1)  # H, S, V
 
 
 def similarity(a: "list[float] | None", b: "list[float] | None") -> float:
-    """0..1 similarity between two signatures (1.0 = identical). Returns 0.0 if
-    either signature is missing or malformed — never guessed."""
+    """0..1 similarity (1.0 identical). 0.0 if either is missing or malformed."""
     expected_len = 3 * SIGNATURE_BINS
     if not a or not b or len(a) != len(b) or len(a) != expected_len:
         return 0.0

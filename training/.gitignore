@@ -1,0 +1,14 @@
+# No dataset artefacts in the repository, ever. Images, manifests and crops live
+# in the controlled environment described in docs/ANPR_M0_DATA_ACQUISITION.md.
+# This is a backstop against an accidental `git add`, not the primary control.
+*.jsonl
+*.jpg
+*.jpeg
+*.png
+*.mp4
+data/
+dataset/
+crops/
+frames/
+splits/
+reports/

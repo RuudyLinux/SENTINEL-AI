@@ -1,30 +1,25 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 
-/** Smart Shield brand mark — falls back to the project's existing shield
- * icon (app/icon.svg, always present) until the real logo is placed at
- * public/branding/smart-shield-logo.png (see that folder's README).
+/** Smart Shield mark, falling back to the project's shield icon (app/icon.svg).
  *
- * Real bug found via live browser testing, not just reading the code: a
- * plain `<img onError={...}>` misses the fallback on a fast (e.g.
- * localhost) 404 — the native `error` event can fire before React finishes
- * hydrating and attaches its synthetic listener, so `onError` never runs
- * and the broken image just sits there. Checked directly: naturalWidth was
- * 0 and `/icon.svg` never got requested. Fixed by also checking
- * `img.complete` on mount (catches an error that already happened before
- * hydration) in addition to the `onError` handler (catches one that
- * happens after). Shared here so both the login page and the sidebar use
- * the same, actually-verified-working fallback instead of duplicating it.
+ * A custom logo is opt-in via NEXT_PUBLIC_BRAND_LOGO_URL
+ * (public/branding/README.md). img.complete is checked on mount as well as
+ * onError, because a fast 404 can fire before hydration attaches the listener.
  */
+const FALLBACK_LOGO = "/icon.svg";
+/** NEXT_PUBLIC_* is inlined at build time. */
+const BRAND_LOGO_URL = process.env.NEXT_PUBLIC_BRAND_LOGO_URL || FALLBACK_LOGO;
+
 export default function BrandLogo({ size, className = "" }: { size: number; className?: string }) {
-  const [src, setSrc] = useState("/branding/smart-shield-logo.png");
+  const [src, setSrc] = useState(BRAND_LOGO_URL);
   const imgRef = useRef<HTMLImageElement>(null);
   const fellBack = useRef(false);
 
   function fallback() {
     if (fellBack.current) return;
     fellBack.current = true;
-    setSrc("/icon.svg");
+    setSrc(FALLBACK_LOGO);
   }
 
   useEffect(() => {

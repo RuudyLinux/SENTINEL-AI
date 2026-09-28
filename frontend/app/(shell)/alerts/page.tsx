@@ -14,26 +14,29 @@ export default function AlertsPage() {
   const params = useSearchParams();
   const [severity, setSeverity] = useState("ALL");
 
-  const alertsPath = severity === "ALL" ? "/api/alerts" : `/api/alerts?severity=${severity}`;
+  // Filtered by camera on the server. Filtering the 200 newest system-wide in
+  // the browser showed an empty list for a camera with older alerts. Severity
+  // stays client side so the counters can show every severity.
+  const cameraFilter = params.get("camera_id");
+  const alertsPath = cameraFilter ? `/api/alerts?camera_id=${encodeURIComponent(cameraFilter)}` : "/api/alerts";
   const { data: alertsData, error, reload } = useApiData<any[]>(alertsPath, { pollMs: 5000 });
   const alerts = alertsData || [];
 
-  const { data: camsData } = useApiData<any[]>("/api/cameras");
+  const { data: camsData } = useApiData<any[]>("/api/cameras?include_retired=true");
   const cameras = useMemo(() => Object.fromEntries((camsData || []).map((c) => [c.id, c])), [camsData]);
 
   useLiveSocket((e) => {
     if (e.type === "alert") reload();
   });
 
-  const cameraFilter = params.get("camera_id");
-  const filtered = cameraFilter ? alerts.filter((a) => a.camera_id === cameraFilter) : alerts;
+  const filtered = severity === "ALL" ? alerts : alerts.filter((a) => a.severity === severity);
 
   const summary = SEVERITIES.slice(1).map((s) => ({ s, count: alerts.filter((a) => a.severity === s && a.status === "new").length }));
 
   const columns: Column<any>[] = [
     { key: "severity", label: "Severity", render: (a) => <SeverityBadge severity={a.severity} /> },
     { key: "camera_id", label: "Camera", render: (a) => cameras[a.camera_id]?.camera_code || a.camera_id },
-    { key: "reasons", label: "Why Triggered", render: (a) => a.reasons.join("; ") },
+    { key: "reasons", label: "Why Triggered", render: (a) => (a.reasons || []).join("; ") },
     { key: "confidence", label: "Confidence", render: (a) => `${(a.confidence * 100).toFixed(0)}%` },
     { key: "status", label: "Status" },
     { key: "timestamp", label: "Time", render: (a) => new Date(a.timestamp).toLocaleTimeString() },

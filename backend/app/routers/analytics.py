@@ -1,8 +1,6 @@
-"""All numbers here are real aggregates computed from the DB at request time —
-per the doc's AI-honesty rule, nothing here is a hard-coded demo number.
-"""
+"""Real aggregates from the DB at request time, no hard-coded demo numbers."""
 from datetime import datetime, timedelta
-from sqlalchemy import func
+from sqlalchemy import extract, func
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -15,8 +13,10 @@ router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 @router.get("/overview")
 def overview(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    total_cameras = db.query(models.Camera).count()
-    online_cameras = db.query(models.Camera).filter(models.Camera.status == "online").count()
+    # Retired cameras are history, not part of the operational fleet.
+    active = db.query(models.Camera).filter(models.Camera.retired == False)  # noqa: E712
+    total_cameras = active.count()
+    online_cameras = active.filter(models.Camera.status == "online").count()
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     detections_today = db.query(models.Detection).filter(models.Detection.timestamp >= today_start).count()
     active_alerts = db.query(models.Alert).filter(models.Alert.status == "new").count()
@@ -36,15 +36,27 @@ def overview(db: Session = Depends(get_db), user: models.User = Depends(get_curr
 
 @router.get("/events-by-hour")
 def events_by_hour(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Detections per hour over the last 24 hours. Uses extract() rather than
+    strftime(), which exists only on SQLite; the label is formatted in Python.
+    """
     since = datetime.utcnow() - timedelta(hours=24)
+    parts = (
+        extract("year", models.Detection.timestamp).label("y"),
+        extract("month", models.Detection.timestamp).label("m"),
+        extract("day", models.Detection.timestamp).label("d"),
+        extract("hour", models.Detection.timestamp).label("h"),
+    )
     rows = (
-        db.query(func.strftime("%Y-%m-%d %H:00", models.Detection.timestamp).label("hour"), func.count().label("count"))
+        db.query(*parts, func.count().label("count"))
         .filter(models.Detection.timestamp >= since)
-        .group_by("hour")
-        .order_by("hour")
+        .group_by(*parts)
+        .order_by(*parts)
         .all()
     )
-    return [{"hour": r.hour, "count": r.count} for r in rows]
+    return [
+        {"hour": f"{int(r.y):04d}-{int(r.m):02d}-{int(r.d):02d} {int(r.h):02d}:00", "count": r.count}
+        for r in rows
+    ]
 
 
 @router.get("/alerts-by-type")
@@ -55,15 +67,14 @@ def alerts_by_type(db: Session = Depends(get_db), user: models.User = Depends(ge
 
 @router.get("/camera-uptime")
 def camera_uptime(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    cams = db.query(models.Camera).all()
+    cams = db.query(models.Camera).filter(models.Camera.retired == False).all()  # noqa: E712
     return [{"camera_code": c.camera_code, "status": c.status, "fps": c.fps, "error_count": c.error_count} for c in cams]
 
 
 @router.get("/ai-performance")
 def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Reports measured detection volumes and ANPR read rate. No accuracy
-    percentages are fabricated — precision/recall need a labeled ground-truth
-    set, which is not available in this environment (doc §65 honesty rule).
+    """Detection volume and ANPR read rate. No accuracy figures: precision and
+    recall need labelled ground truth.
     """
     total_detections = db.query(models.Detection).count()
     person_detections = db.query(models.Detection).filter(models.Detection.cls == "person").count()
@@ -80,3 +91,45 @@ def ai_performance(db: Session = Depends(get_db), user: models.User = Depends(ge
         "non_empty_plate_reads": plausible_plate_reads,
         "note": "Precision/recall/exact-match rate require a labeled test set; not computed here. See README.",
     }
+
+
+# Below this many reviewed alerts a rate is noise; one dismissed alert would
+# print "100% false-positive rate". Raise it once real usage builds up.
+MIN_FEEDBACK_SAMPLE_SIZE = 20
+
+
+@router.get("/alert-precision")
+def alert_precision(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Alert quality from operator feedback (Alert.feedback), not from workflow
+    status. Below MIN_FEEDBACK_SAMPLE_SIZE it reports insufficient_sample.
+    """
+    total_alerts = db.query(models.Alert).count()
+    confirmed = db.query(models.Alert).filter(models.Alert.feedback == "confirmed").count()
+    false_positive = db.query(models.Alert).filter(models.Alert.feedback == "false_positive").count()
+    needs_review = db.query(models.Alert).filter(models.Alert.feedback == "needs_review").count()
+    reviewed = confirmed + false_positive + needs_review
+    dismissed = db.query(models.Alert).filter(models.Alert.status == "dismissed").count()
+
+    result = {
+        "total_alerts": total_alerts,
+        "reviewed_alerts": reviewed,
+        "confirmed": confirmed,
+        "false_positive": false_positive,
+        "needs_review": needs_review,
+        "dismissed_status": dismissed,
+        "min_sample_size": MIN_FEEDBACK_SAMPLE_SIZE,
+        "sample_sufficient": reviewed >= MIN_FEEDBACK_SAMPLE_SIZE,
+    }
+    if reviewed < MIN_FEEDBACK_SAMPLE_SIZE:
+        result["precision"] = None
+        result["false_positive_rate"] = None
+        result["note"] = (
+            f"insufficient_sample: only {reviewed} alert(s) have operator feedback "
+            f"(need {MIN_FEEDBACK_SAMPLE_SIZE}) — no rate is reported to avoid a "
+            "misleading figure from a handful of reviews."
+        )
+    else:
+        result["precision"] = round(confirmed / reviewed, 4)
+        result["false_positive_rate"] = round(false_positive / reviewed, 4)
+        result["note"] = f"Computed from {reviewed} operator-reviewed alert(s)."
+    return result

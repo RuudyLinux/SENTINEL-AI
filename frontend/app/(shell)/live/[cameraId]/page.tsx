@@ -1,10 +1,13 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { api, buildTokenedUrl, ApiError } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
+import { useStreamUrl } from "@/lib/useStreamUrl";
 import ConnectionBadge, { AiBadge } from "@/components/ConnectionBadge";
 import ErrorState from "@/components/ErrorState";
+import WhepVideo from "@/components/WhepVideo";
+import RecButton, { RecIndicator } from "@/components/RecButton";
 
 export default function SingleCameraPage() {
   const { cameraId } = useParams<{ cameraId: string }>();
@@ -12,20 +15,22 @@ export default function SingleCameraPage() {
   const { data: camera, loading: cameraLoading, error: cameraError, reload: reloadCamera } = useApiData<any>(
     `/api/cameras/${cameraId}`, { pollMs: 4000 }
   );
-  const [streamUrl, setStreamUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (camera?.status !== "online") return;
-    let cancelled = false;
-    buildTokenedUrl(`/api/streams/${cameraId}/stream-token`, `/api/streams/${cameraId}/mjpeg`)
-      .then((url) => { if (!cancelled) setStreamUrl(url); })
-      .catch(() => { if (!cancelled) setStreamUrl(null); });
-    return () => { cancelled = true; };
-  }, [camera?.status, cameraId]);
+  // re-authorized on a timer: the backend cuts a stream when its token
+  // expires, and this page gets left open for a whole shift
+  const streamUrl = useStreamUrl(
+    `/api/streams/${cameraId}/stream-token`,
+    `/api/streams/${cameraId}/mjpeg`,
+    camera?.status === "online",
+  );
   const { data: detections, error: detectionsError, reload: reloadDetections } = useApiData<any[]>(
     `/api/detections?camera_id=${cameraId}&limit=50`, { pollMs: 4000 }
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  // MJPEG from the backend has the AI boxes and is the default. With a WHEP
+  // URL in the catalogue you can also watch raw WebRTC from the media server,
+  // lower latency.
+  const [videoMode, setVideoMode] = useState<"mjpeg" | "webrtc">("mjpeg");
+  const [webrtcError, setWebrtcError] = useState<string | null>(null);
 
   const detectionRows = detections || [];
   const counts = detectionRows.reduce((acc: Record<string, number>, d) => {
@@ -68,9 +73,32 @@ export default function SingleCameraPage() {
         </div>
       </div>
 
+      {camera.whep_url && (
+        <div className="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="Video source">
+          <button
+            onClick={() => setVideoMode("mjpeg")}
+            aria-pressed={videoMode === "mjpeg"}
+            className={`rounded px-3 py-1.5 border ${videoMode === "mjpeg" ? "border-accent text-accent" : "border-border text-slate-400"}`}
+          >AI OVERLAY (MJPEG)</button>
+          <button
+            onClick={() => { setWebrtcError(null); setVideoMode("webrtc"); }}
+            aria-pressed={videoMode === "webrtc"}
+            className={`rounded px-3 py-1.5 border ${videoMode === "webrtc" ? "border-accent text-accent" : "border-border text-slate-400"}`}
+          >LOW LATENCY (WEBRTC)</button>
+          {webrtcError && <span className="text-critical">WebRTC unavailable ({webrtcError}); showing MJPEG.</span>}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
-        <div className="bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
-          {camera.status === "online" && streamUrl ? (
+        <div className="relative bg-black rounded-lg overflow-hidden border border-border aspect-video flex items-center justify-center">
+          <RecIndicator recording={!!camera.recording} />
+          {videoMode === "webrtc" && camera.whep_url ? (
+            <WhepVideo
+              url={camera.whep_url}
+              label={`${camera.name} (WebRTC)`}
+              onError={(message) => { setWebrtcError(message); setVideoMode("mjpeg"); }}
+            />
+          ) : camera.status === "online" && streamUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img src={streamUrl} alt={camera.name} className="w-full h-full object-contain" />
           ) : (
@@ -91,12 +119,13 @@ export default function SingleCameraPage() {
           <div className="border border-border rounded-lg p-3 bg-panel text-xs text-slate-400 space-y-1">
             <div>FPS: {camera.fps?.toFixed(1) ?? "—"}</div>
             <div>Resolution: {camera.resolution || "—"}</div>
-            <div>Errors: {camera.error_count}</div>
+            <div title="Every read failure and error recorded for this camera since it was added — not reset on reconnect or restart">Errors (lifetime): {camera.error_count}</div>
             {typeof camera.reconnect_count === "number" && <div>Reconnects: {camera.reconnect_count}</div>}
             {camera.last_error && <div className="text-critical truncate" title={camera.last_error}>Last error: {camera.last_error}</div>}
           </div>
           {actionError && <div className="text-xs text-critical">{actionError}</div>}
           <div className="flex flex-col gap-2">
+            <RecButton cameraId={cameraId} online={camera.status === "online"} recording={!!camera.recording} onChange={reloadCamera} />
             <button onClick={createIncident} className="text-xs bg-accent text-ink font-medium rounded py-2">CREATE INCIDENT</button>
             <button onClick={() => router.push(`/vehicles/tracking`)} className="text-xs border border-border rounded py-2 hover:border-accent">TRACK OBJECT</button>
             <button onClick={() => router.push(`/alerts?camera_id=${cameraId}`)} className="text-xs border border-border rounded py-2 hover:border-accent">OPEN ALERTS</button>

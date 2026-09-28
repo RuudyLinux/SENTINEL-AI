@@ -16,6 +16,18 @@ export default function AnprPage() {
     e.preventDefault();
     setError(null);
     try {
+      // exact plate goes straight to that vehicle, no point making the officer
+      // click through a one-result list. partial matches still get the list
+      // empty box lists everything; /by-plate/ with no plate is always a 404
+      if (plate.trim()) {
+        try {
+          const exact = await api.get<any>(`/api/vehicles/by-plate/${encodeURIComponent(plate.trim())}`);
+          router.push(`/vehicles/${exact.id}`);
+          return;
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 404) throw err;
+        }
+      }
       const vehicles = await api.get<any[]>(`/api/vehicles?plate=${encodeURIComponent(plate)}`);
       setResults(vehicles);
       setSearched(true);
@@ -40,6 +52,7 @@ export default function AnprPage() {
         <input
           value={plate}
           onChange={(e) => setPlate(e.target.value.toUpperCase())}
+          aria-label="Plate number"
           placeholder="GJ05AB1234"
           className="flex-1 bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent font-mono"
         />
@@ -51,7 +64,7 @@ export default function AnprPage() {
         <DataTable
           columns={columns}
           rows={results}
-          onRowClick={(v) => router.push(`/vehicles/tracking?vehicle_id=${v.id}`)}
+          onRowClick={(v) => router.push(`/vehicles/${v.id}`)}
           emptyTitle={searched ? "No plate matches found" : "Search a plate to see results"}
           emptyHint="Reads come from real OCR over vehicle crops — accuracy depends on plate visibility in the source footage."
         />

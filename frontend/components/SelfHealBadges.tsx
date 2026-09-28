@@ -1,9 +1,7 @@
 import { Info, TriangleAlert, OctagonAlert, CheckCircle2, XCircle, Loader2, Settings2, type LucideIcon } from "lucide-react";
 
-// Self-Heal severities (info | warning | critical) are a distinct, smaller
-// set from alert severities (CRITICAL/HIGH/MEDIUM/LOW — see SeverityBadge)
-// — a separate small component rather than overloading that one with a
-// second, unrelated color/icon mapping.
+// self-heal severities (info/warning/critical) aren't alert severities
+// (SeverityBadge), so they get their own small component
 const SEVERITY_COLORS: Record<string, string> = {
   critical: "bg-critical/15 text-critical border border-critical/30",
   warning: "bg-high/15 text-high border border-high/30",

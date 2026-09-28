@@ -6,13 +6,22 @@ from ..db import get_db
 from ..security import get_current_user, require_roles
 from ..audit import log_action
 from ..pipeline.anpr import normalize_plate
+from .. import watchlist
 
 router = APIRouter(prefix="/api/watchlists", tags=["watchlists"])
 
 
 @router.get("", response_model=list[schemas.WatchlistOut])
-def list_watchlist(entity_type: str | None = None, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    q = db.query(models.WatchlistEntry)
+def list_watchlist(
+    entity_type: str | None = None,
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """In-force entries by default; include_inactive=true lists everything
+    (inactive rows are kept for audit).
+    """
+    q = watchlist.entries_in_force(db) if not include_inactive else db.query(models.WatchlistEntry)
     if entity_type:
         q = q.filter(models.WatchlistEntry.entity_type == entity_type)
     return q.order_by(models.WatchlistEntry.valid_from.desc()).all()
@@ -24,16 +33,37 @@ def create_watchlist_entry(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_roles("Administrator", "Supervisor", "Investigator")),
 ):
+    """Add one entity to the watchlist.
+
+    409 if an in-force entry for the same (entity_type, identifier) already
+    exists, naming it instead of merging, since the operator may want a
+    different priority or reason. Inactive entries don't block re-adding.
+    """
     identifier = normalize_plate(payload.identifier) if payload.entity_type == "plate" else payload.identifier
+    existing = watchlist.entries_in_force(db).filter(
+        models.WatchlistEntry.entity_type == payload.entity_type,
+        models.WatchlistEntry.identifier == identifier,
+    ).first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{identifier} is already on the {payload.entity_type} watchlist "
+                f"(priority {existing.priority}). Deactivate the existing entry before adding it again."
+            ),
+        )
     entry = models.WatchlistEntry(
         entity_type=payload.entity_type, identifier=identifier, reason=payload.reason,
         priority=payload.priority, valid_until=payload.valid_until, added_by=user.id,
     )
     db.add(entry)
     if payload.entity_type == "plate":
+        # Recomputed rather than set, since an entry may already be expired.
+        # Flush first: autoflush is off, so the new entry wouldn't be seen.
+        db.flush()
         vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == identifier).first()
         if vehicle:
-            vehicle.watchlist_flag = True
+            watchlist.refresh_vehicle_flag(db, vehicle)
     db.commit()
     db.refresh(entry)
     log_action(db, user, "create_watchlist_entry", resource=identifier)
@@ -46,6 +76,13 @@ def deactivate_entry(entry_id: str, db: Session = Depends(get_db), user: models.
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
     entry.active = False
+    if entry.entity_type == "plate":
+        # Recompute the cached flag (another in-force entry may keep it set).
+        # Flush first, as in create.
+        db.flush()
+        vehicle = db.query(models.Vehicle).filter(models.Vehicle.plate_text == entry.identifier).first()
+        if vehicle:
+            watchlist.refresh_vehicle_flag(db, vehicle)
     db.commit()
     log_action(db, user, "deactivate_watchlist_entry", resource=entry_id)
     return {"ok": True}

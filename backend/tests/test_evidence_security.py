@@ -1,6 +1,5 @@
-"""Hardening pass: evidence file-serving path containment, and an expired
-resource token concretely proven rejected (not just assumed from jose's
-default `exp` handling)."""
+"""Evidence file serving stays inside the evidence dir, and an expired
+resource token is actually rejected (not just assumed from jose)."""
 import pytest
 from fastapi import HTTPException
 
@@ -26,9 +25,8 @@ def _make_evidence(db_session, file_path: str) -> models.Evidence:
 
 
 def test_download_evidence_rejects_a_path_outside_the_evidence_directory(client, admin_token, db_session, tmp_path):
-    # Simulates a corrupted/attacker-influenced DB row — every real write
-    # path (worker.py, clips.py) only ever writes under settings.evidence_dir,
-    # but the serving endpoint must not simply trust the column value.
+    # a corrupted row; real writes only go under evidence_dir, but serving
+    # mustn't trust the column
     outside_file = tmp_path / "not_evidence.txt"
     outside_file.write_text("should never be served")
     evidence = _make_evidence(db_session, str(outside_file))

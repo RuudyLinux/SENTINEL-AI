@@ -1,7 +1,5 @@
-"""Person appearance-similarity signature (Phase 5). Explicitly testing visual
-similarity behavior only — nothing here claims or tests identity."""
+"""Person appearance signature. Visual similarity only, nothing about identity."""
 import numpy as np
-import pytest
 
 from app.pipeline.appearance import compute_signature, similarity
 

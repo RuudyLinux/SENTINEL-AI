@@ -1,14 +1,15 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
-import { api, buildTokenedUrl, ApiError } from "@/lib/api";
+import { api, buildTokenedUrl, openTokenedResource, ApiError } from "@/lib/api";
 import { useApiData } from "@/lib/useApiData";
 import ErrorState from "@/components/ErrorState";
+import EvidenceIntegrityBadge from "@/components/EvidenceIntegrityBadge";
 
 export default function EvidenceDetailPage() {
   const { evidenceId } = useParams<{ evidenceId: string }>();
   const { data: evidence, error, reload } = useApiData<any>(`/api/evidence/${evidenceId}`);
-  const { data: camerasData } = useApiData<any[]>("/api/cameras");
+  const { data: camerasData } = useApiData<any[]>("/api/cameras?include_retired=true");
   const cameras = camerasData || [];
   const [actionError, setActionError] = useState<string | null>(null);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
@@ -21,6 +22,17 @@ export default function EvidenceDetailPage() {
       .catch(() => { if (!cancelled) setFileUrl(null); });
     return () => { cancelled = true; };
   }, [evidence?.file_path, evidenceId]);
+
+  // fresh token per click: the preview's token only lives 5 minutes, and a
+  // page left open during a briefing gave the download a dead token (raw 401)
+  async function download() {
+    setActionError(null);
+    try {
+      await openTokenedResource(`/api/evidence/${evidenceId}/file-token`, `/api/evidence/${evidenceId}/file`);
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Could not download the evidence file");
+    }
+  }
 
   async function verify() {
     setActionError(null);
@@ -57,13 +69,16 @@ export default function EvidenceDetailPage() {
         {evidence.source_timestamp && (
           <div><span className="text-slate-500">Source time:</span> {new Date(evidence.source_timestamp).toLocaleString()}</div>
         )}
-        <div><span className="text-slate-500">Verification:</span> {evidence.verification_status}</div>
+        <div className="flex items-center gap-2"><span className="text-slate-500">Evidence Integrity:</span> <EvidenceIntegrityBadge status={evidence.verification_status} /></div>
+        {(evidence.model_version || evidence.rule_version) && (
+          <div><span className="text-slate-500">Captured by:</span> {evidence.model_version || "—"} / {evidence.rule_version || "—"}</div>
+        )}
         {evidence.sha256 && <div><span className="text-slate-500">SHA-256:</span> <span className="font-mono text-xs break-all">{evidence.sha256}</span></div>}
       </div>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
       <div className="flex gap-2">
-        {evidence.file_path && fileUrl && (
-          <a href={fileUrl} target="_blank" className="text-xs border border-border rounded px-3 py-1.5 hover:border-accent">DOWNLOAD</a>
+        {evidence.file_path && (
+          <button onClick={download} className="text-xs border border-border rounded px-3 py-1.5 hover:border-accent">DOWNLOAD</button>
         )}
         {evidence.verification_status !== "verified" && (
           <button onClick={verify} className="text-xs bg-accent text-ink font-medium rounded px-3 py-1.5">VERIFY (COMPUTE HASH)</button>

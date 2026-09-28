@@ -1,8 +1,7 @@
 import { CircleAlert, RefreshCw } from "lucide-react";
 
-/** Shown when a real fetch to the backend actually failed — never swapped
- * for placeholder/demo content. Distinct from EmptyState, which means
- * "the request succeeded and there is genuinely nothing to show yet".
+/** A real backend fetch failed. Never swapped for demo content. EmptyState
+ * is the other case: request fine, just nothing to show yet.
  */
 export default function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (

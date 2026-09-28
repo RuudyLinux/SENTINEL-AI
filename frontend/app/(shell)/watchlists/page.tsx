@@ -13,16 +13,24 @@ export default function WatchlistsPage() {
   const entries = entriesData || [];
   const [form, setForm] = useState({ identifier: "", reason: "", priority: "HIGH" });
   const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
+  // Three clicks on SAVE made three identical in-force entries for one plate.
+  // The backend now 409s the duplicate (routers/watchlists.py); this shows a
+  // submit in flight instead of taking more clicks.
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setActionError(null);
+    setBusy(true);
     try {
       await api.post("/api/watchlists", { ...form, entity_type: tab });
       setForm({ identifier: "", reason: "", priority: "HIGH" });
       reload();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : "Could not save watchlist entry");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -49,20 +57,20 @@ export default function WatchlistsPage() {
 
       <form onSubmit={create} className="bg-panel border border-border rounded-lg p-4 flex flex-wrap gap-2 items-end max-w-2xl">
         <div className="flex-1 min-w-[140px]">
-          <label className="text-xs text-slate-400">{tab === "plate" ? "Plate number" : tab === "vehicle" ? "Vehicle identifier" : "Person identifier / note"}</label>
-          <input required value={form.identifier} onChange={(e) => setForm({ ...form, identifier: e.target.value.toUpperCase() })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
+          <label htmlFor="watchlist-identifier" className="text-xs text-slate-400">{tab === "plate" ? "Plate number" : tab === "vehicle" ? "Vehicle identifier" : "Person identifier / note"}</label>
+          <input id="watchlist-identifier" required value={form.identifier} onChange={(e) => setForm({ ...form, identifier: e.target.value.toUpperCase() })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>
         <div className="flex-1">
-          <label className="text-xs text-slate-400">Reason</label>
-          <input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
+          <label htmlFor="watchlist-reason" className="text-xs text-slate-400">Reason</label>
+          <input id="watchlist-reason" value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="w-full bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1" />
         </div>
         <div>
-          <label className="text-xs text-slate-400">Priority</label>
-          <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
+          <label htmlFor="watchlist-priority" className="text-xs text-slate-400">Priority</label>
+          <select id="watchlist-priority" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="bg-panel2 border border-border rounded px-3 py-2 text-sm mt-1">
             <option>LOW</option><option>MEDIUM</option><option>HIGH</option><option>CRITICAL</option>
           </select>
         </div>
-        <button className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 h-fit">SAVE</button>
+        <button type="submit" disabled={busy} className="text-xs bg-accent text-ink font-medium rounded px-4 py-2 h-fit disabled:opacity-50">{busy ? "Saving..." : "SAVE"}</button>
       </form>
       {actionError && <div className="text-xs text-critical">{actionError}</div>}
 

@@ -1,6 +1,5 @@
-"""Adapter interface (Model 3 — VMS Federation/Middleware): the factory dispatches to
-the right adapter class, the mock generic-VMS adapter produces real frames end-to-end,
-and the ONVIF stub fails loudly instead of pretending to work."""
+"""Adapters: the factory picks the right class, the mock VMS adapter gives
+real frames end to end, and the ONVIF stub fails loudly."""
 import pytest
 
 from app.pipeline.adapters import (

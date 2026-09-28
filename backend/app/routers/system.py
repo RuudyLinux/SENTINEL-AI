@@ -9,9 +9,9 @@ from ..config import settings
 from ..db import get_db
 from ..security import get_current_user, require_roles
 from ..audit import log_action
-from ..pipeline.worker import RUNNING, stop_worker
+from ..pipeline.worker import RUNNING, start_worker, stop_worker
 from ..pipeline.demo_scenario import trigger_scenario, DemoScenarioError
-from ..seed import reset_demo_data
+from ..seed import reset_demo_data, DEMO_CAMERAS
 from ..ws import manager
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -24,10 +24,9 @@ def _require_demo_mode():
 
 @router.get("/status")
 def system_status(db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
-    """Real subsystem checks, not hardcoded strings — each one actually
-    exercises the thing it claims to report on."""
+    """Live subsystem checks; each one actually exercises what it reports on."""
     running_workers = sum(1 for t in RUNNING.values() if not t.done())
-    total_cameras = db.query(models.Camera).count()
+    total_cameras = db.query(models.Camera).filter(models.Camera.retired == False).count()  # noqa: E712
 
     try:
         db.execute(text("SELECT 1"))
@@ -53,26 +52,38 @@ def system_status(db: Session = Depends(get_db), user: models.User = Depends(get
 
 
 @router.post("/demo/reset")
-def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
-    """Returns the app to a clean, repeatable judge-demo state. DEMO_MODE
-    only. Stops any running camera workers first (their DB rows are about
-    to be reset), wipes transactional data, and re-ensures the two demo
-    cameras + the demo watchlist entry — see seed.reset_demo_data."""
+async def demo_reset(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator"))):
+    """Back to a clean demo state. DEMO_MODE only. Stops running workers
+    first (their rows are about to go), wipes transactional data and
+    re-creates the demo cameras and watchlist entry (seed.reset_demo_data).
+
+    Then starts the two demo cameras' workers, like startup does for
+    video_file cameras. Without that LATEST_FRAMES was empty when
+    /demo/trigger-scenario came next, and the scenario (rightly) refuses to
+    fake a frame, so the demo produced no evidence at all.
+
+    async def because start_worker calls create_task, which needs the loop;
+    sync handlers run in a thread without one.
+    """
     _require_demo_mode()
     for camera in db.query(models.Camera).all():
         stop_worker(camera.id)
     summary = reset_demo_data(db)
+    demo_codes = [c["camera_code"] for c in DEMO_CAMERAS]
+    for camera in db.query(models.Camera).filter(
+        models.Camera.camera_code.in_(demo_codes), models.Camera.retired == False,  # noqa: E712
+    ).all():
+        start_worker(camera.id)
     log_action(db, user, "demo_reset", resource=",".join(summary["cameras"]))
     return summary
 
 
 @router.post("/demo/trigger-scenario")
 async def demo_trigger_scenario(db: Session = Depends(get_db), user: models.User = Depends(require_roles("Administrator", "Control Room Operator"))):
-    """Deterministically fires the primary judge-demo scenario (watchlist
-    plate sighted on C-014, then C-019) through the real correlation/alert
-    code path — see pipeline/demo_scenario.py for exactly what is and isn't
-    real about it. DEMO_MODE only; requires POST /demo/reset (or otherwise
-    having C-014 and C-019 registered) first."""
+    """Fire the demo scenario (watchlist plate on C-014, then C-019) through
+    the real correlation/alert path; pipeline/demo_scenario.py says exactly
+    what's real. DEMO_MODE only, needs /demo/reset (or C-014 and C-019
+    registered) first."""
     _require_demo_mode()
     try:
         result = await trigger_scenario(db, user)

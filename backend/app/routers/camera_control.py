@@ -1,29 +1,15 @@
-"""CAMERA CONTROL CENTER — bulk camera operations (Self-Heal spec Parts 3-6).
+"""Camera Control Center: bulk camera operations.
 
-Reuses the exact same per-camera actions the existing single-camera
-endpoints already use (routers/cameras.py's start_camera/stop_camera/
-restart_camera, pipeline.worker.start_worker/stop_worker,
-pipeline.supervisor.connect/disconnect) — this router adds no new camera
-lifecycle logic, only a bounded-concurrency loop over the existing one, plus
-progress broadcast and one audit-log entry per bulk call.
+Runs the same per-camera actions as the single-camera endpoints, with bounded
+concurrency, progress broadcasts and one audit entry per call.
 
-Action semantics (mapped onto what this codebase actually has — no
-fabricated states):
-  connect   — open the camera's stream/worker; AI stays whatever it's
-              already configured to (identical to POST /{id}/start).
-  start     — alias of connect. This codebase has no real distinction
-              between "connect" and "start" for a camera worker (both mean
-              "make the stream flow") — aliased rather than inventing a
-              fake difference.
-  start_ai  — ensures the camera is connected, then enables AI
-              (ai_person/ai_vehicle/ai_anpr = True). Never starts a second
-              AI worker for an already-running camera (worker.py's
-              start_worker/get_model already no-op/reuse per camera).
-  stop      — disables AI (ai_person/ai_vehicle/ai_anpr = False) while
-              KEEPING the stream connected — "AI STOPPED", camera stays
-              online. Distinct from disconnect.
-  restart   — disconnect then reconnect (identical to POST /{id}/restart).
-  disconnect— fully stops the worker (identical to POST /{id}/stop).
+Actions:
+  connect    open the stream/worker; AI unchanged (= POST /{id}/start)
+  start      same as connect
+  start_ai   connect if needed, then enable ai_person/ai_vehicle/ai_anpr
+  stop       disable AI; the stream stays connected
+  restart    disconnect then reconnect (= POST /{id}/restart)
+  disconnect stop the worker (= POST /{id}/stop)
 """
 import asyncio
 import uuid
@@ -36,27 +22,25 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db, SessionLocal
 from ..security import require_roles
+from ..pipeline import ai_capacity
 from ..audit import log_action
+from ..pipeline.db_retry import close_session
 from ..ws import manager
 from ..pipeline.worker import start_worker, stop_worker
 from ..pipeline import supervisor
+from ..pipeline.db_retry import safe_commit
 
 router = APIRouter(prefix="/api/cameras/bulk", tags=["camera-control"])
 
 BulkAction = Literal["connect", "start", "start_ai", "restart", "stop", "disconnect"]
 
-# Disruptive actions the frontend must show a confirmation dialog for
-# (Part 4) — exposed so the UI doesn't have to hardcode its own copy of
-# this list.
+# actions the UI must confirm; exposed so it doesn't keep its own copy
 DISRUPTIVE_ACTIONS = {"restart", "disconnect", "stop"}
 
-MAX_CONCURRENT = 5  # bounded batching (Part 4) — never fire dozens of simultaneous operations
+MAX_CONCURRENT = 5  # never fire dozens of operations at once
 
-# Duplicate-click / overlapping-bulk-op guard: camera_ids currently being
-# acted on by ANY in-flight bulk call. A camera already in here is skipped
-# (not double-actioned) rather than racing two bulk operations against the
-# same worker. In-memory, process-local — cleared as each camera finishes,
-# regardless of the outcome.
+# Cameras an in-flight bulk call is working on; overlapping calls skip them
+# rather than race on one worker.
 _IN_PROGRESS: set[str] = set()
 
 
@@ -65,45 +49,64 @@ class BulkRequest(BaseModel):
     camera_ids: list[str] | None = None  # None/omitted = every registered camera
 
 
-def _set_ai(db: Session, camera: models.Camera, enabled: bool) -> None:
+async def _set_ai(db: Session, camera: models.Camera, enabled: bool, camera_code: str) -> bool:
+    """Commit through safe_commit, since a bulk call runs several concurrent
+    writers."""
     camera.ai_person = enabled  # type: ignore[assignment]
     camera.ai_vehicle = enabled  # type: ignore[assignment]
     camera.ai_anpr = enabled  # type: ignore[assignment]
-    db.commit()
+
+    def reapply():
+        camera.ai_person = enabled  # type: ignore[assignment]
+        camera.ai_vehicle = enabled  # type: ignore[assignment]
+        camera.ai_anpr = enabled  # type: ignore[assignment]
+
+    return await safe_commit(db, f"bulk camera {camera_code}", reapply=reapply)
 
 
 async def _apply_one(action: BulkAction, camera_id: str) -> dict:
-    """Runs one camera's action against a SHORT-LIVED session of its own
-    (never the request's shared session — these run concurrently under the
-    semaphore below) and never raises; every outcome (including an
-    exception) becomes a result dict so one camera's failure can never abort
-    the batch."""
+    """Run one camera's action on its own short-lived session. Never raises:
+    every outcome is a result dict, so one failure can't abort the batch."""
     db = SessionLocal()
     try:
         camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
         if not camera:
             return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": "Camera not found"}
         code = str(camera.camera_code)
+        if bool(camera.retired) and action in ("connect", "start", "start_ai", "restart"):
+            return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": True, "detail": "Camera is retired"}
 
+        ai_wanted = bool(camera.ai_person) or bool(camera.ai_vehicle)
         if action in ("connect", "start"):
             if camera.source_type == "sentinel_grid":
                 supervisor.connect(camera_id)
             else:
                 start_worker(camera_id)
-            detail = "Connected"
+            refusal = ai_capacity.blocked(camera_id) if ai_wanted else None
+            if ai_wanted and refusal is None:
+                ai_capacity.try_acquire(camera_id)  # reserve now, so two quick starts cannot both pass
+            detail = "Connected" if refusal is None else f"Connected without AI — {refusal}"
         elif action == "start_ai":
+            refusal = ai_capacity.blocked(camera_id)
+            if refusal is not None:
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": refusal}
+            got_slot = ai_capacity.try_acquire(camera_id)
             if camera.source_type == "sentinel_grid":
                 supervisor.connect(camera_id)
             else:
                 start_worker(camera_id)
-            _set_ai(db, camera, True)
-            detail = "AI started"
+            if not await _set_ai(db, camera, True, code):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Connected, but AI-enable write did not persist (database busy) — retry"}
+            detail = "AI started" if got_slot else "AI on, waiting for its turn on an AI slot"
         elif action == "stop":
-            _set_ai(db, camera, False)
+            ai_capacity.release(camera_id)
+            if not await _set_ai(db, camera, False, code):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "AI-disable write did not persist (database busy) — retry"}
             detail = "AI stopped"
         elif action == "restart":
-            stop_worker(camera_id)
-            start_worker(camera_id)
+            # supervisor.restart keeps the grid bookkeeping right, same as the
+            # single-camera restart endpoint
+            await supervisor.restart(camera_id, str(camera.source_type))
             detail = "Restarted"
         elif action == "disconnect":
             if camera.source_type == "sentinel_grid":
@@ -111,7 +114,12 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
             else:
                 stop_worker(camera_id)
             camera.status = "offline"  # type: ignore[assignment]
-            db.commit()
+
+            def _reapply_offline():
+                camera.status = "offline"  # type: ignore[assignment]
+
+            if not await safe_commit(db, f"bulk camera {code}", reapply=_reapply_offline):
+                return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": "Worker stopped, but status write did not persist (database busy) — retry"}
             detail = "Disconnected"
         else:
             return {"camera_id": camera_id, "camera_code": code, "ok": False, "skipped": False, "detail": f"Unknown action {action}"}
@@ -120,7 +128,8 @@ async def _apply_one(action: BulkAction, camera_id: str) -> dict:
     except Exception as exc:
         return {"camera_id": camera_id, "camera_code": None, "ok": False, "skipped": False, "detail": f"{type(exc).__name__}: {exc}"}
     finally:
-        db.close()
+        # close_session waits for a commit still running in a thread.
+        close_session(db)
 
 
 @router.post("")
@@ -132,7 +141,7 @@ async def bulk_camera_action(
     if payload.camera_ids is not None:
         target_ids = payload.camera_ids
     else:
-        target_ids = [c.id for c in db.query(models.Camera.id).all()]
+        target_ids = [c.id for c in db.query(models.Camera.id).filter(models.Camera.retired == False).all()]  # noqa: E712
     if not target_ids:
         raise HTTPException(status_code=400, detail="No cameras to operate on")
 

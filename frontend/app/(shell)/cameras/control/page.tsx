@@ -7,6 +7,7 @@ import {
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket } from "@/lib/useLiveSocket";
 import { api, ApiError, getStoredUser } from "@/lib/api";
+import { aiState } from "@/lib/cameraState";
 import ErrorState from "@/components/ErrorState";
 import StatusDot from "@/components/StatusDot";
 
@@ -22,25 +23,30 @@ const BULK_BUTTONS: { action: BulkAction; label: string; icon: typeof Wifi }[] =
   { action: "start", label: "Start", icon: Play },
   { action: "start_ai", label: "Start AI", icon: BrainCircuit },
   { action: "restart", label: "Restart", icon: RotateCcw },
-  { action: "stop", label: "Stop", icon: Square },
+  // "stop" only switches AI off; the stream stays connected (see CONFIRM_TEXT).
+  { action: "stop", label: "Stop AI", icon: Square },
   { action: "disconnect", label: "Disconnect", icon: WifiOff },
 ];
 
-const DISRUPTIVE = new Set<BulkAction>(["restart", "disconnect", "stop"]);
+// "ing" glued onto the action name gave "START AIING" and "STOPING"
+const PROGRESS_LABEL: Record<BulkAction, string> = {
+  connect: "Connecting",
+  start: "Starting",
+  start_ai: "Starting AI on",
+  restart: "Restarting",
+  stop: "Stopping AI on",
+  disconnect: "Disconnecting",
+};
+
+// fallback only; the real list comes from GET /api/cameras/bulk/disruptive-actions
+// below, so this page can't drift from the backend
+const DEFAULT_DISRUPTIVE = new Set<BulkAction>(["restart", "disconnect", "stop"]);
 
 const DISRUPTIVE_COPY: Record<string, string> = {
   restart: "This will temporarily interrupt active streams.",
   disconnect: "This will fully stop the camera worker and end the stream.",
   stop: "This will stop AI processing on the selected camera(s); the stream stays connected.",
 };
-
-function aiState(c: Camera): string {
-  if (c.grid_state === "PROCESSING") return "AI RUNNING";
-  if (c.grid_state === "CONNECTED") return "AI STOPPED";
-  if (c.grid_state === "ERROR") return "AI ERROR";
-  if (c.grid_state === "RECONNECTING" || c.grid_state === "CONNECTING") return "AI STARTING";
-  return "—";
-}
 
 type ProgressState = {
   opId: string; action: BulkAction; total: number; completed: number;
@@ -59,6 +65,12 @@ export default function CameraControlCenterPage() {
 
   const user = useMemo(() => getStoredUser(), []);
   const canControl = user?.role === "Administrator" || user?.role === "Control Room Operator";
+
+  const { data: disruptiveList } = useApiData<string[]>("/api/cameras/bulk/disruptive-actions");
+  const disruptive = useMemo(
+    () => (disruptiveList ? new Set(disruptiveList as BulkAction[]) : DEFAULT_DISRUPTIVE),
+    [disruptiveList]
+  );
 
   useLiveSocket((e) => {
     if (e.type === "bulk_progress") {
@@ -107,7 +119,7 @@ export default function CameraControlCenterPage() {
   function requestBulk(action: BulkAction, scope: "selected" | "all") {
     const ids = scope === "selected" ? Array.from(selected) : null;
     if (scope === "selected" && ids && ids.length === 0) return;
-    if (DISRUPTIVE.has(action)) {
+    if (disruptive.has(action)) {
       setConfirmAction({ action, ids });
     } else {
       runBulk(action, ids);
@@ -160,7 +172,7 @@ export default function CameraControlCenterPage() {
       {progress && (
         <div className="border border-border rounded-lg bg-panel p-4 space-y-2 animate-fade-in">
           <div className="flex items-center justify-between text-sm">
-            <span className="font-medium text-slate-100">{progress.action.replace(/_/g, " ").toUpperCase()}ING CAMERAS</span>
+            <span className="font-medium text-slate-100">{(PROGRESS_LABEL[progress.action] ?? progress.action).toUpperCase()} CAMERAS</span>
             <span className="text-slate-400">{progress.completed} / {progress.total} completed</span>
           </div>
           <div className="h-2 bg-panel2 rounded-full overflow-hidden">
@@ -225,7 +237,7 @@ export default function CameraControlCenterPage() {
                       camera={c}
                       canControl={canControl}
                       onAction={async (action) => {
-                        if (DISRUPTIVE.has(action)) {
+                        if (disruptive.has(action)) {
                           setConfirmAction({ action, ids: [c.id] });
                         } else {
                           await runSingle(action, c);
@@ -264,11 +276,9 @@ export default function CameraControlCenterPage() {
   );
 }
 
-/** Per-camera "..." action menu — owns its own open/busy state so a double
- * click can't fire the same action twice (menu closes as soon as the
- * request starts, button disabled until it resolves), and closes itself on
- * an outside click (audit finding: previously stayed open until another
- * menu item was clicked). */
+/** Per-camera "..." menu. Owns its open/busy state so a double click can't
+ * fire an action twice (closes when the request starts, disabled until it
+ * resolves), and closes on an outside click. */
 function RowActionsMenu({
   camera, canControl, onAction,
 }: { camera: Camera; canControl: boolean; onAction: (action: BulkAction) => Promise<void> }) {
@@ -297,10 +307,12 @@ function RowActionsMenu({
 
   return (
     <div ref={containerRef} className="relative inline-block">
+      {/* p-1 around a 15px icon is 23px, one under WCAG 2.5.8, and this is the
+          only way to reach the per-camera actions. p-1.5 = 27px. */}
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={!canControl || busy}
-        className="p-1 rounded hover:bg-panel2 disabled:opacity-40"
+        className="p-1.5 rounded hover:bg-panel2 disabled:opacity-40"
         aria-label={`Actions for ${camera.camera_code}`}
       >
         {busy ? <Loader2 size={15} className="animate-spin" /> : <MoreVertical size={15} />}

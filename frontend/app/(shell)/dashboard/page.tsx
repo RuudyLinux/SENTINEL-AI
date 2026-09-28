@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { Wifi, Play, BrainCircuit, RotateCcw, Square, ArrowRight } from "lucide-react";
 import { useApiData } from "@/lib/useApiData";
 import { useLiveSocket } from "@/lib/useLiveSocket";
+import { EVENT } from "@/lib/useLiveFeed";
 import { api } from "@/lib/api";
 import KpiCard from "@/components/KpiCard";
 import SeverityBadge from "@/components/SeverityBadge";
@@ -15,7 +16,7 @@ const QUICK_ACTIONS: { action: string; label: string; icon: typeof Wifi }[] = [
   { action: "start", label: "Start All", icon: Play },
   { action: "start_ai", label: "Start AI", icon: BrainCircuit },
   { action: "restart", label: "Restart All", icon: RotateCcw },
-  { action: "stop", label: "Stop All", icon: Square },
+  { action: "stop", label: "Stop AI All", icon: Square },
 ];
 
 function CameraControlWidget() {
@@ -23,9 +24,8 @@ function CameraControlWidget() {
   const [busy, setBusy] = useState<string | null>(null);
 
   async function quickAction(action: string) {
-    // "Restart All"/"Stop All" are disruptive per Camera Control Center's own
-    // confirmation rule — this compact widget only offers the full flow
-    // (with confirmation) via the deep link, not a bare fire-here button.
+    // Restart All / Stop All need confirmation (Camera Control Center), so this
+    // widget only deep-links there instead of firing directly
     if (action === "restart" || action === "stop") {
       router.push("/cameras/control");
       return;
@@ -42,7 +42,7 @@ function CameraControlWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">Camera Control</h3>
-        <button onClick={() => router.push("/cameras/control")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/cameras/control")} className="row-action gap-1 text-xs text-accent hover:underline">
           Open Camera Control Center <ArrowRight size={12} />
         </button>
       </div>
@@ -70,7 +70,7 @@ function SystemHealthWidget() {
     <div className="border border-border rounded-lg bg-panel p-4 space-y-2">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-200">System Health</h3>
-        <button onClick={() => router.push("/self-heal/health")} className="flex items-center gap-1 text-xs text-accent hover:underline">
+        <button onClick={() => router.push("/self-heal/health")} className="row-action gap-1 text-xs text-accent hover:underline">
           Details <ArrowRight size={12} />
         </button>
       </div>
@@ -94,12 +94,19 @@ export default function DashboardPage() {
   const { data: overview, error, reload } = useApiData<any>("/api/analytics/overview", { pollMs: 10000 });
 
   useLiveSocket((e) => {
-    if (e.type === "alert") {
+    if (e.type === EVENT.ALERT_CREATED) {
       setLiveFeed((prev) => [{ ...e.data, kind: "alert" }, ...prev].slice(0, 20));
       reload();
     }
-    if (e.type === "detection") {
-      setLiveFeed((prev) => [{ ...e.data, kind: "detection" }, ...prev].slice(0, 20));
+    // detections come batched from ws.py, otherwise N cameras x inference rate
+    // would be that many state updates a second
+    if (e.type === EVENT.DETECTION_BATCH) {
+      const batched = (e.data?.events ?? []).map((d: any) => ({ ...d, kind: "detection" }));
+      if (batched.length) setLiveFeed((prev) => [...batched.reverse(), ...prev].slice(0, 20));
+    }
+    // a recognized plate is an identification, gets its own row in the feed
+    if (e.type === EVENT.VEHICLE_SIGHTING) {
+      setLiveFeed((prev) => [{ ...e.data, kind: "sighting" }, ...prev].slice(0, 20));
     }
   });
 
@@ -163,11 +170,21 @@ export default function DashboardPage() {
                 <div className="flex items-center gap-3">
                   {item.kind === "alert" ? (
                     <SeverityBadge severity={item.severity} />
+                  ) : item.kind === "sighting" ? (
+                    <span className="badge bg-accent/15 text-accent border border-accent/30 font-mono">
+                      {item.plate_text}
+                    </span>
                   ) : (
                     <span className="badge bg-slate-500/15 text-slate-300 border border-slate-500/30">{item.cls}</span>
                   )}
                   <span className="text-slate-300">{item.camera_code}</span>
                   {item.kind === "alert" && <span className="text-slate-400 text-xs">{item.reasons?.join("; ")}</span>}
+                  {item.kind === "sighting" && (
+                    <span className="text-slate-400 text-xs">
+                      {Math.round((item.plate_confidence ?? 0) * 100)}% plate confidence
+                      {item.watchlist_flag ? " · WATCHLIST" : ""}
+                    </span>
+                  )}
                 </div>
                 <span className="text-xs text-slate-500">{new Date(item.timestamp).toLocaleTimeString()}</span>
               </div>

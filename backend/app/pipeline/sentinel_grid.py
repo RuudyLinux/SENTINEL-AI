@@ -1,25 +1,17 @@
-"""Real Sentinel Camera Grid integration (final integration task).
+"""Sentinel Camera Grid integration.
 
-Discovery is NOT a bare public JSON endpoint, despite how it's often described:
-`GET {base_url}/cameras.json` unauthenticated redirects (302) to
-`{base_url}/auth/login` — a session-cookie web login (`POST /auth/login` with
-`email`/`password` form fields, confirmed by fetching the real login page's markup;
-`{base_url}` and that shape are not secret). So discovery here is: log in once to
-get a session cookie, then fetch the catalogue with it, all inside one
-`httpx.AsyncClient` so the cookie is carried automatically.
+The catalogue (GET {base_url}/cameras.json) requires a cookie session from
+POST /auth/login, so one httpx client logs in and fetches in the same session.
 
-Credentials (`settings.sentinel_grid_email/password`) come from `.env` only — never
-hardcoded, never logged, never included in any exception message, never returned by
-any API response. A missing/rejected credential fails loudly and specifically
-(`SentinelGridError`, distinguishing "not configured" from "rejected by the grid")
-rather than silently no-op'ing or fabricating camera data.
-
-Sync here only REGISTERS cameras (see `upsert_grid_cameras`) — it never starts AI
-processing, matching the existing official-catalogue sync's contract
-(`pipeline/catalog.py`).
+Credentials come from .env only and are never logged, included in errors or
+returned. Missing and rejected credentials raise distinct SentinelGridErrors.
+Sync only registers cameras; it never starts workers.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
+import json
+from pathlib import Path
 import uuid
 
 import httpx
@@ -27,13 +19,12 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import settings
-from .catalog import _first  # same tolerant multi-key-spelling lookup, reused not duplicated
+from .catalog import _first  # same tolerant key lookup as the catalogue
 
 
 class SentinelGridError(Exception):
-    """Raised for any grid login/fetch/parse failure. The caller (the sync
-    endpoint) turns this into a clear HTTP error, never a stack trace, and never
-    falls back to fabricated camera data."""
+    """Any grid login, fetch or parse failure; surfaced as an HTTP error by the
+    sync endpoint."""
 
 
 @dataclass
@@ -46,6 +37,22 @@ class GridCameraRecord:
     lat: float = 0.0
     lng: float = 0.0
     missing_fields: list[str] = field(default_factory=list)
+
+
+@lru_cache(maxsize=1)
+def _known_locations() -> dict:
+    path = Path(__file__).with_name("grid_locations.json")
+    return {k: v for k, v in json.loads(path.read_text(encoding="utf-8")).items() if not k.startswith("_")}
+
+
+def known_location(grid_id: str, name: str) -> tuple[float, float] | None:
+    """Looked-up position for a grid camera the catalogue gives none for.
+    Only when the name still matches, so a renumbered grid can't move a
+    camera onto someone else's spot."""
+    entry = _known_locations().get(grid_id)
+    if entry and entry["name"].strip().lower() == name.strip().lower():
+        return entry["lat"], entry["lng"]
+    return None
 
 
 def _normalize_grid_record(record: dict) -> "GridCameraRecord | None":
@@ -91,10 +98,8 @@ async def _login(client: httpx.AsyncClient) -> None:
     except httpx.RequestError as exc:
         raise SentinelGridError(f"Sentinel Camera Grid host unreachable: {exc.__class__.__name__}")
 
-    # A 3xx back to /auth/login (httpx does not auto-follow by default here) or a
-    # 401/403 both mean the credentials were rejected — reported as AUTH_ERROR-class,
-    # distinct from "not configured" above, and never includes the credentials
-    # themselves in the message.
+    # A redirect back to /auth/login or a 401/403 means rejected credentials,
+    # reported without the credentials themselves.
     if resp.status_code in (401, 403):
         raise SentinelGridError(
             "Sentinel Camera Grid login rejected (AUTH_ERROR) — check "
@@ -120,8 +125,8 @@ async def fetch_grid_cameras() -> list[dict]:
             raise SentinelGridError(f"Sentinel Camera Grid host unreachable: {exc.__class__.__name__}")
 
         if resp.status_code in (301, 302, 303, 307, 308) and "/auth/login" in resp.headers.get("location", ""):
-            # Logged in but the session wasn't accepted for this request — report
-            # as an honest auth failure rather than an opaque parse error.
+            # logged in but the session wasn't accepted, say so instead of a
+            # confusing parse error
             raise SentinelGridError("Sentinel Camera Grid rejected the authenticated session (AUTH_ERROR)")
         if resp.status_code != 200:
             raise SentinelGridError(f"Sentinel Camera Grid catalogue returned HTTP {resp.status_code}")
@@ -141,15 +146,10 @@ async def fetch_grid_cameras() -> list[dict]:
 
 
 def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
-    """Idempotent, register-only sync — matched by a `grid:<id>` marker stored in
-    the existing `external_catalog_id` column (distinct prefix so it can never
-    collide with an official-catalogue id in the same column). `source_uri` is
-    set to the BARE grid camera id, never a credentialed URL — the real RTSP URL
-    is built in memory, at connect time, by `pipeline/adapters.SentinelGridAdapter`
-    and is never persisted anywhere. A grid camera absent from this sync's response
-    (removed/deprecated in the catalogue) is marked `catalog_stale=True` — same field
-    and convention as the official-catalogue sync (`pipeline/catalog.py`) — never
-    deleted, so its detections/alerts/incidents/evidence history survives."""
+    """Idempotent register-only sync, matched on a `grid:<id>` marker in
+    external_catalog_id. source_uri is the bare grid id; the credentialed URL
+    exists only in memory at connect time. Cameras missing from the response are
+    marked catalog_stale, never deleted."""
     created, updated, skipped_invalid = 0, 0, 0
     seen_markers: set[str] = set()
     for raw in raw_records:
@@ -172,18 +172,12 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
                 source_uri=norm.grid_id,
                 external_catalog_id=marker,
                 camera_group="Sentinel Grid",
-                status="offline",  # registered only — not connected
-                # AI OFF by default on discovery — the model's column default
-                # is True, which would make Camera.model's own default enable
-                # full YOLO/ByteTrack/ANPR the moment the 24/7 auto-connect
-                # supervisor (pipeline/supervisor.py) starts this camera's
-                # RTSP connection. "Registered/connected" and "AI processing"
-                # must stay independent by design; AI is explicit opt-in per
-                # camera via PATCH /api/cameras/{id}, never a side effect of
-                # being discovered or auto-connected.
-                ai_person=False,
-                ai_vehicle=False,
-                ai_anpr=False,
+                status="offline",  # registered, not connected
+                # AI on by default, like the column default and POST
+                # /api/cameras; PATCH turns it off per camera.
+                ai_person=True,
+                ai_vehicle=True,
+                ai_anpr=True,
             )
             db.add(camera)
             created += 1
@@ -193,6 +187,12 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
         camera.location = norm.location or camera.location
         camera.lat = norm.lat or camera.lat
         camera.lng = norm.lng or camera.lng
+        # catalogue has no coordinates; fill from the lookup table, but never
+        # over a position an operator set with PATCH
+        if not camera.lat and not camera.lng:
+            known = known_location(norm.grid_id, norm.name or norm.location)
+            if known:
+                camera.lat, camera.lng = known
         camera.catalog_codec = norm.codec or camera.catalog_codec
         camera.resolution = norm.resolution or camera.resolution
         camera.catalog_stale = False

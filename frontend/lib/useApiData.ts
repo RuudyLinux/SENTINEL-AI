@@ -2,9 +2,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 
-/** Fetches real data from the backend and tracks loading/error state honestly:
- * a failed request surfaces as `error`, never as a silently-empty result that
- * could be mistaken for "there is genuinely no data yet".
+/** Fetches backend data and tracks loading and error state. A failed request
+ * is reported as `error`, never as an empty result.
  */
 export function useApiData<T>(
   path: string | null,
@@ -38,10 +37,36 @@ export function useApiData<T>(
   useEffect(() => {
     setLoading(true);
     load();
-    if (opts?.pollMs) {
-      const t = setInterval(load, opts.pollMs);
-      return () => clearInterval(t);
+    if (!opts?.pollMs) return;
+
+    // Polling pauses while the tab is hidden and refreshes once when it becomes
+    // visible again; live events arrive over the WebSocket.
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    function start() {
+      if (timer !== null) return;
+      timer = setInterval(load, opts!.pollMs);
     }
+    function stop() {
+      if (timer === null) return;
+      clearInterval(timer);
+      timer = null;
+    }
+    function onVisibilityChange() {
+      if (document.hidden) {
+        stop();
+      } else {
+        load();
+        start();
+      }
+    }
+
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, opts?.pollMs]);
 

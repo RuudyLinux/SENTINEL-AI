@@ -15,7 +15,7 @@ export default function VehicleTrackingPage() {
   const [plateInput, setPlateInput] = useState("");
   const [route, setRoute] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
-  const { data: camerasData, error: camerasError, reload: reloadCameras } = useApiData<any[]>("/api/cameras");
+  const { data: camerasData, error: camerasError, reload: reloadCameras } = useApiData<any[]>("/api/cameras?include_retired=true");
   const cameras = camerasData || [];
 
   function loadRoute() {
@@ -84,6 +84,7 @@ export default function VehicleTrackingPage() {
         <input
           value={plateInput}
           onChange={(e) => setPlateInput(e.target.value.toUpperCase())}
+          aria-label="Plate number"
           placeholder="GJ05AB1234"
           className="flex-1 bg-panel2 border border-border rounded-md px-3 py-2 text-sm outline-none focus:border-accent font-mono"
         />

@@ -5,14 +5,9 @@
 html, body {
   background-color: #0b0f14;
   color: #e6edf3;
-  /* Standard arrow cursor site-wide — without this, hovering any plain text
-     (headings, labels, the login subtitle, etc.) shows the browser's default
-     text-select I-beam, which can read as a stray "text caret". No custom
-     cursor exists anywhere in this codebase (verified) — this only overrides
-     that default text-hover behavior. Links/buttons/DataTable rows keep
-     pointer via their existing `cursor-pointer` Tailwind classes (Tailwind's
-     utility layer loads after this base rule, so those keep winning), and
-     <input>/<textarea> keep the native text-edit cursor regardless. */
+  /* Arrow cursor for plain text instead of the text-select I-beam. Links,
+     buttons and inputs keep their own cursors (Tailwind utilities load after
+     this base rule). */
   cursor: default;
 }
 
@@ -41,10 +36,8 @@ html, body {
   text-transform: uppercase;
 }
 
-/* Small stagger helper for a short list of entrance-animated siblings (e.g.
-   the 4 dashboard KPI cards) — nth-child so no per-item inline style/JS is
-   needed. Deliberately capped at 6: a stagger is only perceptible on a
-   handful of items; a hundred-row table must never use this. */
+/* Stagger helper for a short list of entrance-animated siblings (e.g. the
+   dashboard KPI cards). Capped at 6; not for long lists. */
 .stagger-children > *:nth-child(1) { animation-delay: 0ms; }
 .stagger-children > *:nth-child(2) { animation-delay: 40ms; }
 .stagger-children > *:nth-child(3) { animation-delay: 80ms; }
@@ -52,10 +45,8 @@ html, body {
 .stagger-children > *:nth-child(5) { animation-delay: 160ms; }
 .stagger-children > *:nth-child(6) { animation-delay: 200ms; }
 
-/* Accessibility (Phase 16): every decorative animation/transition in this
-   app is CSS-driven (Tailwind `animate-*`/`transition-*` utilities), so one
-   rule here genuinely covers all of them — nothing functional depends on
-   motion; this only ever removes movement, never behavior. */
+/* Reduced motion: all decorative animation is CSS-driven, so this one rule
+   covers it. Nothing functional depends on motion. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -63,4 +54,22 @@ html, body {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Touch targets (WCAG 2.5.8, 24x24 CSS px). Text-style row actions get a
+   minimum height; min-height rather than padding keeps the text baseline and
+   leaves the width unchanged. */
+.row-action {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Row-selection checkboxes at 18px instead of the 13px default. A full 24px
+   target would need a padded <label>, which would double-fire the /cameras
+   shift-click range selection. */
+table input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
 }

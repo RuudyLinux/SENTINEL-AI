@@ -1,25 +1,45 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime
 
 from .. import models, schemas
 from ..db import get_db
-from ..security import get_current_user
+from ..security import get_current_user, require_operational_role
 from ..audit import log_action
+from .. import watchlist
 
 router = APIRouter(prefix="/api/incidents", tags=["incidents"])
 
 
 @router.get("", response_model=list[schemas.IncidentOut])
-def list_incidents(status: str | None = None, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def list_incidents(
+    status: str | None = None,
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Most recent incidents, newest first, optionally by status. Bounded like
+    the other list endpoints; ge=1 because SQLite treats LIMIT -1 as unlimited.
+    """
     q = db.query(models.Incident)
     if status:
         q = q.filter(models.Incident.status == status)
-    return q.order_by(models.Incident.created_at.desc()).all()
+    return q.order_by(models.Incident.created_at.desc()).limit(limit).all()
+
+
+def _require_exists(db: Session, model, value: "str | None", label: str) -> None:
+    """404 for a referenced row that doesn't exist, instead of a foreign-key
+    error.
+    """
+    if value and not db.query(model).filter(model.id == value).first():
+        raise HTTPException(status_code=404, detail=f"{label} not found")
 
 
 @router.post("", response_model=schemas.IncidentOut)
-def create_incident(payload: schemas.IncidentCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def create_incident(payload: schemas.IncidentCreate, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
+    _require_exists(db, models.Camera, payload.camera_id, "Camera")
+    _require_exists(db, models.Alert, payload.alert_id, "Alert")
+    _require_exists(db, models.Vehicle, payload.vehicle_id, "Vehicle")
     incident = models.Incident(**payload.model_dump())
     db.add(incident)
     db.commit()
@@ -36,6 +56,76 @@ def get_incident(incident_id: str, db: Session = Depends(get_db), user: models.U
     return inc
 
 
+@router.get("/{incident_id}/summary")
+def incident_summary(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+    """Investigator summary in one call: what happened, why it was flagged, where
+    the vehicle was seen, the supporting evidence and its confidence. Reads
+    already-computed data; nothing is recomputed here.
+    """
+    inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    linked_ids = {row.alert_id for row in db.query(models.IncidentAlert).filter(models.IncidentAlert.incident_id == incident_id).all()}
+    if inc.alert_id:
+        linked_ids.add(inc.alert_id)
+    alerts = db.query(models.Alert).filter(models.Alert.id.in_(linked_ids)).order_by(models.Alert.timestamp.asc()).all() if linked_ids else []
+    primary_alert = next((a for a in alerts if a.id == inc.alert_id), alerts[0] if alerts else None)
+
+    vehicle = db.query(models.Vehicle).filter(models.Vehicle.id == inc.vehicle_id).first() if inc.vehicle_id else None
+    # from the entry, not the cached flag: this tells an investigator the
+    # vehicle is on the watchlist, so it has to be true right now
+    watchlist_entry = watchlist.plate_entry_in_force(db, vehicle.plate_text) if vehicle else None
+
+    route = []
+    plate_reads_total = 0
+    if vehicle:
+        from ..pipeline.correlate import get_route
+        route = get_route(db, vehicle.id)
+        plate_reads_total = sum(hop.get("reads_count", 1) for hop in route)
+
+    evidence_items = db.query(models.Evidence).filter(models.Evidence.incident_id == incident_id).all()
+
+    return {
+        "incident_id": incident_id,
+        "what": inc.title,
+        "why": [reason for a in alerts for reason in (a.reasons or [])],
+        "risk": {
+            "score": primary_alert.risk_score if primary_alert else 0,
+            "factors": primary_alert.risk_factors if primary_alert else [],
+        },
+        "vehicle": {
+            "plate_text": vehicle.plate_text if vehicle else None,
+            "plate_confidence": vehicle.plate_confidence if vehicle else None,
+            "total_plate_reads": plate_reads_total,
+            "watchlist_match": {
+                "priority": watchlist_entry.priority, "reason": watchlist_entry.reason,
+            } if watchlist_entry else None,
+        } if vehicle else None,
+        "where": {
+            "cameras_visited": len({hop["camera_id"] for hop in route}),
+            "route": route,
+        },
+        "related_alerts": [
+            {
+                "id": a.id, "severity": a.severity, "risk_score": a.risk_score,
+                "reasons": a.reasons, "timestamp": a.timestamp.isoformat(),
+                "feedback": a.feedback,
+            }
+            for a in alerts
+        ],
+        "evidence": [
+            {
+                "id": e.id, "evidence_type": e.evidence_type,
+                "verification_status": e.verification_status,
+                "sha256": e.sha256, "model_version": e.model_version, "rule_version": e.rule_version,
+            }
+            for e in evidence_items
+        ],
+        "evidence_fully_verified": bool(evidence_items) and all(e.verification_status == "verified" for e in evidence_items),
+    }
+
+
 @router.get("/{incident_id}/timeline")
 def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
@@ -45,7 +135,9 @@ def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: mod
     if inc.alert_id:
         alert = db.query(models.Alert).filter(models.Alert.id == inc.alert_id).first()
         if alert:
-            events.append({"timestamp": alert.timestamp, "label": f"Alert fired: {', '.join(alert.reasons)}"})
+            # Alert.reasons is nullable and join(None) raised TypeError, a 500
+            # on a valid incident's timeline
+            events.append({"timestamp": alert.timestamp, "label": f"Alert fired: {', '.join(alert.reasons or [])}"})
     if inc.vehicle_id:
         from ..pipeline.correlate import get_route
         for s in get_route(db, inc.vehicle_id):
@@ -58,7 +150,7 @@ def incident_timeline(incident_id: str, db: Session = Depends(get_db), user: mod
 
 
 @router.post("/{incident_id}/notes")
-def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -71,10 +163,17 @@ def add_note(incident_id: str, payload: schemas.IncidentNoteCreate, db: Session 
 
 
 @router.post("/{incident_id}/assign")
-def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
+    assignee = db.query(models.User).filter(models.User.id == assignee_user_id).first()
+    if not assignee:
+        raise HTTPException(status_code=404, detail="Assignee not found")
+    if not assignee.active:
+        # assigning to a disabled account leaves the case in_progress with
+        # nobody who can log in to work it
+        raise HTTPException(status_code=400, detail="That account is disabled and cannot be assigned work")
     inc.assigned_to = assignee_user_id
     inc.status = "in_progress"
     inc.updated_at = datetime.utcnow()
@@ -84,7 +183,7 @@ def assign_incident(incident_id: str, assignee_user_id: str, db: Session = Depen
 
 
 @router.post("/{incident_id}/close")
-def close_incident(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def close_incident(incident_id: str, db: Session = Depends(get_db), user: models.User = Depends(require_operational_role)):
     inc = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")

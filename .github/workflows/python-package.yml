@@ -1,40 +1,197 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
-
-name: Python package
+# Backend CI.
+#
+# Previously this ran `pytest` from the repository ROOT across Python 3.9/3.10/
+# 3.11. The test suite lives in `backend/tests` and imports `app.*`, so from the
+# root pytest collected nothing and the job passed without ever running a test.
+# The code also requires 3.11 (`X | None` in runtime-evaluated annotations,
+# among others), so the 3.9/3.10 legs could never have worked either.
+name: Backend
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+    defaults:
+      run:
+        working-directory: backend
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
-      run: |
-        pytest
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      # opencv-python-headless needs libGL/glib at import time, and the
+      # detection pipeline decodes video through ffmpeg.
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+
+      - name: Lint (syntax errors and undefined names only)
+        run: |
+          flake8 app tests --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 app tests --count --exit-zero --max-complexity=12 --max-line-length=127 --statistics
+
+      - name: Test
+        env:
+          # Never let CI reach the real external camera grid, and keep the demo
+          # seed path active so the suite's fixtures behave as documented.
+          SENTINEL_GRID_EMAIL: ""
+          SENTINEL_GRID_PASSWORD: ""
+          SENTINEL_GRID_AUTOCONNECT: "false"
+          CAMERA_CATALOG_BASE_URL: ""
+          DEMO_MODE: "true"
+        # `python -m pytest`, not bare `pytest`: `-m` prepends the current
+        # directory to sys.path, which is what makes `import app` resolve.
+        # The bare `pytest` console script has no equivalent — pytest's own
+        # rootdir-based sys.path insertion only adds `tests/`'s package root,
+        # not its sibling `app/`. This was never caught locally because every
+        # local run in this project used `python -m pytest` (see README/dev
+        # workflow); the first real CI run surfaced it as
+        # `ModuleNotFoundError: No module named 'app'` at conftest import
+        # time. alembic's own steps below were unaffected because
+        # alembic.ini sets `prepend_sys_path = .`, which is alembic-specific
+        # and has no pytest equivalent for a bare invocation.
+        #
+        # Coverage is measured on this run rather than in a third full pass,
+        # and gated at the MEASURED level (85% total, 4904 statements)
+        # floored to 84. The floor is a ratchet against regression, not an
+        # aspiration: a floor above what the suite actually achieves is just
+        # a red build, and a number nobody measured would be worse than none.
+        #
+        # Read it per-module, not in aggregate. The floor moved 80 -> 84 after
+        # the thin routers were tested, and that testing was worth far more
+        # than the number: every one of them was hiding real defects (search
+        # reported filters it never applied; deactivating a watchlist entry
+        # did not stop its alerts; a live stream outlived its token; an
+        # administrator could lock out every administrator; zones and rules
+        # accepted configurations that could never fire; incident creation,
+        # assignment and timeline 500'd on ordinary input). Coverage found
+        # them by forcing the code to be executed, not by the percentage
+        # itself.
+        #
+        # Remaining thin areas are read-mostly routers (incidents 43% before
+        # this work, alerts 52%, analytics 59%, persons 60%). A higher GLOBAL
+        # floor would not distinguish those from the well-covered core
+        # (risk 99%, search 99%, watchlists 98%, zones 97%, auth 97%).
+        #
+        # Worth knowing before anyone removes `--cov` again: enabling it here
+        # initially looked like it BROKE the suite — runs aborted around 25%
+        # with `Assertion fctx->async_lock failed at
+        # libavcodec/pthread_frame.c:178` (pytest exit 3, no traceback), one
+        # run in four completing. Coverage was not the cause. A test had
+        # registered a real `video_file` camera, and `create_camera` starts a
+        # worker for it, so a live FFmpeg decode was left running with no
+        # teardown — precisely the hazard tests/conftest.py's `client` fixture
+        # comment documents. Coverage only changed the timing enough to hit it
+        # almost every run. With that test switched to `mock_vms`, three
+        # consecutive coverage runs pass clean.
+        run: python -m pytest tests -q --cov=app --cov-report=term --cov-fail-under=84
+
+      # Inter-test coupling gate (workstream E2). The suite shares one on-disk
+      # SQLite database and several module-global caches, so a test that
+      # asserts on global state can pass purely because of WHERE it happens to
+      # land in alphabetical collection order. Running the same suite in a
+      # randomized order makes that dependency fail loudly instead of lurking.
+      #
+      # Not theoretical — enabling this found four real order-dependent tests
+      # that had been green for the whole project's life:
+      #   * a plate-pipeline test asserting row COUNTS for a hardcoded plate
+      #     another module also used
+      #   * the demo-scenario precondition test, which could no longer delete
+      #     its cameras once foreign keys were enforced
+      #   * three grid tests sharing one set of 30 catalogue records, so
+      #     "created == 30" depended on which ran first
+      #   * a self-heal test suppressed by the module-global dedup cache after
+      #     an unrelated test recorded the same (component, error_type) key
+      #
+      # The seed is printed in the run header; reproduce a failure locally with
+      # `python -m pytest tests --random-order --random-order-seed=<seed>`.
+      - name: Test (randomized order — inter-test coupling gate)
+        env:
+          SENTINEL_GRID_EMAIL: ""
+          SENTINEL_GRID_PASSWORD: ""
+          SENTINEL_GRID_AUTOCONNECT: "false"
+          CAMERA_CATALOG_BASE_URL: ""
+          DEMO_MODE: "true"
+        run: python -m pytest tests -q --random-order
+
+      - name: Verify migrations apply and roll back
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+        env:
+          DB_PATH: ${{ runner.temp }}/migration-check.db
+
+  migration-drift:
+    # Catches the common failure where a model gains a column but no migration
+    # is written: autogenerate against an up-to-date database must produce an
+    # EMPTY migration. Separate job so a drift failure is unambiguous.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0
+      - run: pip install -r requirements.txt
+      - name: Detect model/migration drift
+        env:
+          DB_PATH: ${{ runner.temp }}/drift-check.db
+        run: |
+          alembic upgrade head
+          alembic check
+
+  training-tooling:
+    # Dataset tooling (M1): schema, vehicle-disjoint splitting, QC, evaluation
+    # metrics. A separate job from the backend because it shares nothing with
+    # it — stdlib only, no torch, no OpenCV, no ffmpeg — so it runs in seconds
+    # and a failure here is unambiguous.
+    #
+    # The job exists primarily for ONE assertion: the cross-split leakage gate.
+    # A dataset where a single vehicle identity appears in both train and test
+    # must FAIL the build. Frames of one vehicle are near-duplicates, so a leaked
+    # identity means the model is scored on its own training data — which is
+    # undetectable from the accuracy number itself, because it simply looks like
+    # a very good model. See training/tests/test_split_and_leakage.py
+    # (TestCiLeakageGate) and docs/ANPR_M1_DATA_TOOLING.md.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: training
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      # `python -m pytest`, not bare `pytest`, for the same sys.path reason the
+      # backend job documents above.
+      - name: Test (dataset tooling)
+        run: python -m pytest tests -q
+      # Same inter-test coupling gate the backend job runs, for the same
+      # reason: these tests assert on split assignment, which must not depend
+      # on collection order any more than it depends on record order.
+      - name: Test (randomized order)
+        run: python -m pytest tests -q --random-order
