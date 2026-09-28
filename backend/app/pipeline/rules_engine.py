@@ -22,7 +22,7 @@ from .. import models, metrics, watchlist
 from ..config import settings
 from ..ws import manager, EventType
 from . import risk
-from .db_retry import safe_commit
+from .db_retry import locked_flush, safe_commit
 from .. import runtime_state
 from ..evidence_hash import sha256_file
 
@@ -335,7 +335,9 @@ async def evaluate(
         risk_factors=assessment.as_dicts(),
     )
     db.add(alert)
-    db.flush()
+    # was a bare db.flush() on the event loop: waiting on a locked database
+    # froze every camera and request for up to the busy_timeout
+    await locked_flush(db)
     alerts.append(alert)
     metrics.ALERTS_TOTAL.labels(camera_code=str(camera.camera_code), severity=severity).inc()
 
@@ -405,7 +407,7 @@ async def evaluate(
                 vehicle_id=vehicle.id if vehicle else None,
             )
             db.add(incident)
-            db.flush()
+            await locked_flush(db)
 
         # every alert of an incident gets a link, the opening one too, so
         # listing an incident's alerts is one query
@@ -413,7 +415,7 @@ async def evaluate(
             incident_id=incident.id, alert_id=alert.id, correlation_reason=correlation_reason,
         )
         db.add(incident_link)
-        db.flush()
+        await locked_flush(db)
         # split by outcome so the noise reduction from correlation is visible
         metrics.INCIDENTS_TOTAL.labels(outcome="correlated" if incident_targets else "opened").inc()
         if detection.snapshot_path:

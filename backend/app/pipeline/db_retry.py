@@ -22,21 +22,52 @@ objects, and reassign persistent attributes from values captured before the
 first attempt, never re-read.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
+import functools
 import logging
 import threading
 import time
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from weakref import WeakKeyDictionary
 
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from .. import metrics
+from ..config import settings
 from ..db import SQLITE_BUSY_TIMEOUT_SECONDS
 
 logger = logging.getLogger("sentinel.worker")
 
-# Session locking. Every DB call here goes through asyncio.to_thread, and the
+# Session operations get their own threads, not asyncio's default executor.
+#
+# A camera's flush takes SQLite's single write lock and holds it until the
+# commit, and the commit is another thread hop. On the shared default pool
+# that hop queued behind YOLO/OCR calls waiting on the model locks, frame
+# waits and RTSP opens, all while the lock stayed held. Measured with 30 grid
+# cameras: detection transactions held the lock 37-67 s, and every other
+# writer (camera status, self-heal, the login audit row) sat out the 30 s
+# busy_timeout and retried, so a login took 121-149 s.
+#
+# One thread per pooled connection: every in-flight session operation holds
+# a connection, so this is never the bottleneck and a transaction holder's
+# next step starts immediately.
+_DB_EXECUTOR = ThreadPoolExecutor(
+    max_workers=settings.db_pool_size + settings.db_max_overflow,
+    thread_name_prefix="sentinel-db",
+)
+
+
+async def run_db(func: Callable[..., Any], *args: Any) -> Any:
+    """asyncio.to_thread, but on the DB executor. For session work that must
+    not wait behind inference, and for the few non-DB steps that sit inside
+    an open write transaction."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_DB_EXECUTOR, functools.partial(ctx.run, func, *args))
+
+# Session locking. Every DB call here goes through a worker thread (run_db), and the
 # thread keeps going if the awaiting task is cancelled. Cancelling a worker
 # mid-commit then ran `db.close()` on the loop thread while the other thread
 # was still in commit() (about 2 in 5 runs of the 12-worker stress test):
@@ -146,7 +177,7 @@ async def _safe_write(
     """Retry body shared by safe_commit and safe_flush (flush writes too, same
     failure, same fix).
 
-    Calls go through to_thread because they block on busy_timeout, which on
+    Calls go through run_db because they block on busy_timeout, which on
     the loop thread would stall every camera.
 
     on_result, if given, is awaited once before returning with
@@ -177,7 +208,7 @@ async def _attempt_loop(
     for attempt in range(1, attempts + 1):
         try:
             # under the session lock so close_session can wait for it
-            await asyncio.to_thread(_locked, db, op)
+            await run_db(_locked, db, op)
             if on_result is not None:
                 await on_result(attempt, attempts, True, ever_lock, time.monotonic() - started)
             return True
@@ -197,7 +228,7 @@ async def _attempt_loop(
             is_lock = False
 
         try:
-            await asyncio.to_thread(_locked, db, db.rollback)
+            await run_db(_locked, db, db.rollback)
         except Exception:
             logger.exception("%s: rollback after failed %s also failed", label, op_name)
             if on_result is not None:
@@ -226,20 +257,20 @@ async def locked_flush(db: Session) -> None:
     see correlate.upsert_vehicle_for_plate) from a lock; safe_flush swallows
     both.
     """
-    await asyncio.to_thread(_locked, db, db.flush)
+    await run_db(_locked, db, db.flush)
 
 
 async def locked_commit(db: Session) -> None:
     """db.commit() under the session lock, no retry, exceptions propagate.
     Same idea as locked_flush, and for making a write visible to other
     sessions right away (correlate's commit-on-create)."""
-    await asyncio.to_thread(_locked, db, db.commit)
+    await run_db(_locked, db, db.commit)
 
 
 async def locked_rollback(db: Session) -> None:
     """db.rollback() under the session lock. After a locked_* call raised,
     roll back through this, not bare db.rollback()."""
-    await asyncio.to_thread(_locked, db, db.rollback)
+    await run_db(_locked, db, db.rollback)
 
 
 async def safe_commit(

@@ -35,7 +35,7 @@ from .correlate import upsert_vehicle_for_plate, upsert_plate_sighting, upsert_t
 from . import plate_detector, plate_preprocess, plate_tracker
 from .rules_engine import evaluate, find_incident_for_alert
 from .timing import compute_source_timestamp
-from .db_retry import close_session
+from .db_retry import close_session, run_db
 from .frame_reader import FrameResult, LatestFrameReader
 from ..evidence_hash import sha256_file
 from ..self_heal import engine as self_heal
@@ -205,7 +205,14 @@ async def _anpr_ocr(
     raw_track_id = detection.get("track_id")
     if not settings.plate_pipeline_v2 or raw_track_id is None:
         raw, normalized, conf = await asyncio.to_thread(read_plate, crop)
-        return {"legacy_read": (raw, normalized, conf)}
+        # The snapshot _run_anpr will attach, saved now for the same reason as
+        # the OCR: inside the transaction this thread hop held the write lock
+        # while it queued behind other cameras' inference.
+        snapshot_path = (
+            await asyncio.to_thread(_save_snapshot, frame, camera_code)
+            if passes_anpr_gate(normalized, conf) else None
+        )
+        return {"legacy_read": (raw, normalized, conf), "snapshot_path": snapshot_path}
 
     track_id = str(raw_track_id)
     state = plate_tracker.touch(camera_id, track_id)
@@ -231,7 +238,23 @@ async def _anpr_ocr(
             # so an unreadable track (truck rear, plate out of frame) waits for
             # the reverify interval instead of retrying every cycle
             plate_tracker.mark_ocr_attempt(camera_id, track_id)
-    return {"state": state, "new_read": new_read}
+
+    # A new sighting gets one snapshot (see _run_anpr). Decided from tracker
+    # state only, the same conditions _run_anpr checks before it saves: a
+    # winning read, consensus if strict mode wants it, and no row yet (no row
+    # means should_persist is True).
+    snapshot_path = plate_crop_path = None
+    best = state.best()
+    if (
+        best is not None and state.plate_row_id is None
+        and (plate_tracker.has_consensus(camera_id, track_id) or not settings.plate_require_consensus)
+    ):
+        snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+        if settings.plate_debug_crops and state.last_plate_crop is not None:
+            plate_crop_path = await asyncio.to_thread(
+                _save_snapshot, state.last_plate_crop, f"{camera_code}_plate",
+            )
+    return {"state": state, "new_read": new_read, "snapshot_path": snapshot_path, "plate_crop_path": plate_crop_path}
 
 
 async def _run_anpr(
@@ -263,7 +286,7 @@ async def _run_anpr(
         raw, normalized, conf = ocr["legacy_read"]
         if not passes_anpr_gate(normalized, conf):
             return None, None, None
-        snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+        snapshot_path = ocr.get("snapshot_path") or await asyncio.to_thread(_save_snapshot, frame, camera_code)
         vehicle = await upsert_vehicle_for_plate(db, normalized, conf)
         plate_row = models.Plate(
             vehicle_id=vehicle.id, camera_id=camera_id, detection_id=det_row.id,
@@ -306,14 +329,18 @@ async def _run_anpr(
     snapshot_path = None
     plate_crop_path = None
     if state.plate_row_id is None:
-        # one snapshot per sighting, not per OCR frame
-        snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
-        # the plate region OCR actually read, so a reviewer can check it.
-        # opt-in, and a failure here mustn't cost the sighting
-        if settings.plate_debug_crops and state.last_plate_crop is not None:
-            plate_crop_path = await asyncio.to_thread(
-                _save_snapshot, state.last_plate_crop, f"{camera_code}_plate",
-            )
+        # one snapshot per sighting, not per OCR frame. Normally already saved
+        # by _anpr_ocr before the write transaction opened.
+        if "snapshot_path" in ocr:
+            snapshot_path, plate_crop_path = ocr["snapshot_path"], ocr.get("plate_crop_path")
+        if snapshot_path is None:
+            snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+            # the plate region OCR actually read, so a reviewer can check it.
+            # opt-in, and a failure here mustn't cost the sighting
+            if settings.plate_debug_crops and state.last_plate_crop is not None:
+                plate_crop_path = await asyncio.to_thread(
+                    _save_snapshot, state.last_plate_crop, f"{camera_code}_plate",
+                )
     metrics.PLATE_CONSENSUS_REACHED.labels(
         camera_code=camera_code, outcome="corroborated" if corroborated else "uncorroborated",
     ).inc()
@@ -444,10 +471,6 @@ async def _process_frame(
                         logger.exception("camera %s: track upsert failed for track %s", camera_code, track_key)
                         track_row = None
 
-            if not snapshot_path and vehicle is not None and bool(vehicle.watchlist_flag):
-                snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
-                det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
-
             # One commit per detection, not per frame. Tried per-frame to cut
             # WAL growth; holding the transaction across a whole frame's OCR and
             # snapshot awaits caused real "database is locked" with 2 cameras.
@@ -480,6 +503,17 @@ async def _process_frame(
                     _vehicle.plate_confidence = _confidence
 
             await _safe_commit(db, camera_code, reapply=_reapply_detection_commit)
+
+            # A watchlisted vehicle's detection needs a snapshot for the alert
+            # evaluate() is about to raise. Saved after the commit: taken
+            # between the flush and the commit, this thread hop held the write
+            # lock while it waited for a free thread.
+            if not snapshot_path and vehicle is not None and bool(vehicle.watchlist_flag):
+                snapshot_path = await asyncio.to_thread(_save_snapshot, frame, camera_code)
+                det_row.snapshot_path = snapshot_path  # type: ignore[assignment]
+                await _safe_commit(db, camera_code, reapply=lambda _det_row=det_row, _path=snapshot_path: (
+                    db.add(_det_row), setattr(_det_row, "snapshot_path", _path),
+                ))
             alerts = await evaluate(db, camera, det_row, w, h, vehicle)
             for alert in alerts:
                 # not a direct Incident.alert_id query: an alert correlated into
@@ -699,12 +733,21 @@ async def _camera_loop(camera_id: str) -> None:
                     st["read_failures"] += 1
                     if consecutive_failures < settings.read_failures_before_reconnect:
                         new_state = "DEGRADED"
+                        status_changed = camera.status != _DB_STATUS_FOR_GRID_STATE[new_state]
                         camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
                         _set_grid_state(camera_id, new_state)
-                        await _safe_commit(db, camera_code_cached, reapply=lambda: (
-                            setattr(camera, "status", _DB_STATUS_FOR_GRID_STATE[new_state]),
-                            setattr(camera, "error_count", read_fail_error_count),
-                        ))
+                        # The status change commits now. A failing stream then
+                        # retries every second, and committing each error_count
+                        # bump was one write transaction per second per camera
+                        # (29 degraded grid cameras, ~29/s); the count rides the
+                        # heartbeat cadence instead and lands with the next commit.
+                        now_fail = time.monotonic()
+                        if status_changed or now_fail - last_heartbeat_commit_at >= HEARTBEAT_MIN_INTERVAL_S:
+                            await _safe_commit(db, camera_code_cached, reapply=lambda: (
+                                setattr(camera, "status", _DB_STATUS_FOR_GRID_STATE[new_state]),
+                                setattr(camera, "error_count", read_fail_error_count),
+                            ))
+                            last_heartbeat_commit_at = now_fail
                         loop_sleep_s = 1.0
                     else:
                         # Stream really dropped, reconnect with backoff.
@@ -876,19 +919,25 @@ async def _camera_loop_supervised(camera_id: str) -> None:
             recovery_action="MARK_OFFLINE", attempt=1, max_attempts=1, status="FAILED",
         )
         try:
-            db: Session = SessionLocal()
-            try:
-                camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
-                new_state = "DISCONNECTED"
-                if camera:
-                    camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
-                    camera.error_count += 1  # type: ignore[assignment]
-                    db.commit()
-                # the task is dead, nothing else will correct grid_state, it'd
-                # sit at PROCESSING forever
-                _set_grid_state(camera_id, new_state)
-            finally:
-                db.close()
+            new_state = "DISCONNECTED"
+
+            def _mark_offline() -> None:
+                # off the event loop: a commit waiting on a locked database
+                # here froze every other camera for the busy_timeout
+                db: Session = SessionLocal()
+                try:
+                    camera = db.query(models.Camera).filter(models.Camera.id == camera_id).first()
+                    if camera:
+                        camera.status = _DB_STATUS_FOR_GRID_STATE[new_state]  # type: ignore[assignment]
+                        camera.error_count += 1  # type: ignore[assignment]
+                        db.commit()
+                finally:
+                    db.close()
+
+            await run_db(_mark_offline)
+            # the task is dead, nothing else will correct grid_state, it'd
+            # sit at PROCESSING forever
+            _set_grid_state(camera_id, new_state)
         except Exception:
             logger.exception("camera %s: could not mark offline after top-level crash", camera_id)
     finally:
