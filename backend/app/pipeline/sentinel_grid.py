@@ -14,6 +14,9 @@ it never starts AI.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
+import json
+from pathlib import Path
 import uuid
 
 import httpx
@@ -39,6 +42,22 @@ class GridCameraRecord:
     lat: float = 0.0
     lng: float = 0.0
     missing_fields: list[str] = field(default_factory=list)
+
+
+@lru_cache(maxsize=1)
+def _known_locations() -> dict:
+    path = Path(__file__).with_name("grid_locations.json")
+    return {k: v for k, v in json.loads(path.read_text(encoding="utf-8")).items() if not k.startswith("_")}
+
+
+def known_location(grid_id: str, name: str) -> tuple[float, float] | None:
+    """Looked-up position for a grid camera the catalogue gives none for.
+    Only when the name still matches, so a renumbered grid can't move a
+    camera onto someone else's spot."""
+    entry = _known_locations().get(grid_id)
+    if entry and entry["name"].strip().lower() == name.strip().lower():
+        return entry["lat"], entry["lng"]
+    return None
 
 
 def _normalize_grid_record(record: dict) -> "GridCameraRecord | None":
@@ -178,6 +197,12 @@ def upsert_grid_cameras(db: Session, raw_records: list[dict]) -> dict:
         camera.location = norm.location or camera.location
         camera.lat = norm.lat or camera.lat
         camera.lng = norm.lng or camera.lng
+        # catalogue has no coordinates; fill from the lookup table, but never
+        # over a position an operator set with PATCH
+        if not camera.lat and not camera.lng:
+            known = known_location(norm.grid_id, norm.name or norm.location)
+            if known:
+                camera.lat, camera.lng = known
         camera.catalog_codec = norm.codec or camera.catalog_codec
         camera.resolution = norm.resolution or camera.resolution
         camera.catalog_stale = False

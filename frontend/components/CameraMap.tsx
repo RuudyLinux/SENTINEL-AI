@@ -14,14 +14,27 @@ import { hasLocation } from "@/lib/geo";
 const ICON_BOX = 28; // >= the 24px WCAG minimum, with a little margin
 const DOT = 14;
 
-const cameraIcon = (color: string) =>
+// count > 1: several cameras share one position (three Bilimora cameras only
+// have the town). Stacked markers hid all but the top one, so they get one
+// marker with the number on it and a popup listing each.
+const cameraIcon = (color: string, count = 1) =>
   L.divIcon({
     className: "",
-    html: `<div style="width:${ICON_BOX}px;height:${ICON_BOX}px;display:flex;align-items:center;justify-content:center"><div style="width:${DOT}px;height:${DOT}px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6)"></div></div>`,
+    html: `<div style="width:${ICON_BOX}px;height:${ICON_BOX}px;display:flex;align-items:center;justify-content:center"><div style="width:${count > 1 ? DOT + 6 : DOT}px;height:${count > 1 ? DOT + 6 : DOT}px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,.6);color:#0b0f14;font:700 10px/1 sans-serif;display:flex;align-items:center;justify-content:center">${count > 1 ? count : ""}</div></div>`,
     // Leaflet centres a divIcon on its iconSize without an iconAnchor, so the
     // dot still sits on the coordinate
     iconSize: [ICON_BOX, ICON_BOX],
   });
+
+// same colours as StatusDot; degraded (reconnecting) used to draw grey like offline
+const STATUS_COLOR: Record<string, string> = { online: "#22c55e", degraded: "#f97316", offline: "#64748b" };
+const RANK = ["online", "degraded", "offline"];
+
+// a shared spot shows its best-off camera; the popup lists each one
+function groupColor(group: any[]): string {
+  const best = RANK.find((s) => group.some((c) => c.status === s)) || "offline";
+  return STATUS_COLOR[best];
+}
 
 export default function CameraMap({
   cameras, route, center, activeIndex,
@@ -69,6 +82,31 @@ export default function CameraMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Only the positions: refit when what's on the map moves (a different
+  // vehicle's route), not on every camera status poll, which would keep
+  // yanking the view back while the operator pans.
+  const fitKey = useMemo(() => JSON.stringify([
+    located.map((c) => [c.lat, c.lng]),
+    routeOnMap.map((r) => [r.lat, r.lng]),
+  ]), [located, routeOnMap]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || center) return;
+    const points: [number, number][] = [
+      ...located.map((c) => [c.lat, c.lng] as [number, number]),
+      ...routeOnMap.map((r) => [r.lat, r.lng] as [number, number]),
+    ];
+    if (points.length === 0) return;
+    // the container may have been sized after the map was made (tabs)
+    map.invalidateSize();
+    // cameras span the state (Ahmedabad to Junagadh to Navsari); a fixed
+    // zoom 12 on the first one showed a single city
+    if (points.length === 1) map.setView(points[0], 15);
+    else map.fitBounds(L.latLngBounds(points), { padding: [30, 30], maxZoom: 16 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitKey]);
+
   const signature = useMemo(() => JSON.stringify([
     located.map((c) => [c.id, c.lat, c.lng, c.camera_code, c.name, c.location, c.status, c.resolution]),
     routeOnMap.map((r) => [r.i, r.lat, r.lng, r.label]),
@@ -79,17 +117,29 @@ export default function CameraMap({
     const layer = overlays.current;
     if (!layer) return;
     layer.clearLayers();
+    const spots = new Map<string, any[]>();
     for (const c of located) {
-      L.marker([c.lat, c.lng], {
-        title: `${c.camera_code} — ${c.name} (${c.status})`,
-        alt: `Camera ${c.camera_code}`,
-        icon: cameraIcon(c.status === "online" ? "#22c55e" : "#64748b"),
+      const key = `${c.lat.toFixed(5)},${c.lng.toFixed(5)}`;
+      spots.set(key, [...(spots.get(key) || []), c]);
+    }
+    for (const group of Array.from(spots.values())) {
+      const online = group.filter((c) => c.status === "online").length;
+      const lines = group.length === 1
+        ? [
+          { text: `${group[0].camera_code} — ${group[0].name}`, bold: true },
+          { text: group[0].location || "" },
+          { text: `${group[0].status} · ${group[0].resolution || "—"}` },
+        ]
+        : [
+          { text: `${group.length} cameras here (${online} online)`, bold: true },
+          ...group.map((c) => ({ text: `${c.camera_code} — ${c.name} · ${c.status}` })),
+        ];
+      L.marker([group[0].lat, group[0].lng], {
+        title: group.map((c) => `${c.camera_code} — ${c.name} (${c.status})`).join("\n"),
+        alt: group.length === 1 ? `Camera ${group[0].camera_code}` : `${group.length} cameras`,
+        icon: cameraIcon(groupColor(group), group.length),
       })
-        .bindPopup(popupContent([
-          { text: `${c.camera_code} — ${c.name}`, bold: true },
-          { text: c.location || "" },
-          { text: `${c.status} · ${c.resolution || "—"}` },
-        ]))
+        .bindPopup(popupContent(lines))
         .addTo(layer);
     }
     if (routeOnMap.length > 0) {
@@ -126,6 +176,16 @@ export default function CameraMap({
         <div role="status" className="absolute top-2 right-2 z-[1000] max-w-[70%] rounded bg-panel2/90 border border-border px-2 py-1 text-xs text-slate-300">
           {unlocated > 0 && <div>{unlocated} camera{unlocated === 1 ? "" : "s"} not shown: location unavailable</div>}
           {routeOffMap > 0 && <div>{routeOffMap} sighting{routeOffMap === 1 ? "" : "s"} not drawn: camera location unavailable</div>}
+        </div>
+      )}
+      {located.length > 0 && (
+        <div className="absolute bottom-6 left-2 z-[1000] flex gap-3 rounded bg-panel2/90 border border-border px-2 py-1 text-xs text-slate-300">
+          {RANK.map((s) => (
+            <span key={s} className="flex items-center gap-1">
+              <span className="h-2.5 w-2.5 rounded-full border border-white" style={{ background: STATUS_COLOR[s] }} />
+              {s}
+            </span>
+          ))}
         </div>
       )}
       <div ref={container} style={{ height: "100%", width: "100%", background: "#0b0f14" }} />

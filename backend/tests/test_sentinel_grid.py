@@ -96,6 +96,54 @@ def test_upsert_new_camera_defaults_ai_on(db_session):
     assert cam.ai_anpr is True
 
 
+def _fake_locations(monkeypatch, table):
+    from app.pipeline import sentinel_grid
+    monkeypatch.setattr(sentinel_grid, "_known_locations", lambda: table)
+
+
+def _grid_cam(db_session, grid_id):
+    return db_session.query(models.Camera).filter(models.Camera.external_catalog_id == f"grid:{grid_id}").first()
+
+
+def test_a_camera_with_no_catalogue_position_gets_its_looked_up_one(db_session, monkeypatch):
+    _fake_locations(monkeypatch, {"cam-loc-a": {"name": "13 CN Vidhyalaya", "lat": 23.01898, "lng": 72.55169}})
+    upsert_grid_cameras(db_session, [{"id": "cam-loc-a", "name": "13 CN Vidhyalaya", "location": "13 CN Vidhyalaya"}])
+    cam = _grid_cam(db_session, "cam-loc-a")
+    assert (cam.lat, cam.lng) == (23.01898, 72.55169)
+
+
+def test_a_renamed_grid_id_does_not_inherit_the_old_cameras_position(db_session, monkeypatch):
+    # the grid renumbered: cam-loc-b is now a different place
+    _fake_locations(monkeypatch, {"cam-loc-b": {"name": "13 CN Vidhyalaya", "lat": 23.01898, "lng": 72.55169}})
+    upsert_grid_cameras(db_session, [{"id": "cam-loc-b", "name": "40 Somewhere Else", "location": "40 Somewhere Else"}])
+    cam = _grid_cam(db_session, "cam-loc-b")
+    assert (cam.lat, cam.lng) == (0.0, 0.0)
+
+
+def test_an_operator_set_position_survives_a_re_sync(db_session, monkeypatch):
+    _fake_locations(monkeypatch, {"cam-loc-c": {"name": "Gate", "lat": 23.0, "lng": 72.0}})
+    records = [{"id": "cam-loc-c", "name": "Gate", "location": "Gate"}]
+    upsert_grid_cameras(db_session, records)
+    cam = _grid_cam(db_session, "cam-loc-c")
+    cam.lat, cam.lng = 23.5, 72.5  # corrected by hand
+    db_session.commit()
+    upsert_grid_cameras(db_session, records)
+    db_session.refresh(cam)
+    assert (cam.lat, cam.lng) == (23.5, 72.5)
+
+
+def test_the_shipped_location_table_is_all_in_gujarat():
+    from app.pipeline.sentinel_grid import _known_locations
+    table = _known_locations()
+    assert table
+    for grid_id, entry in table.items():
+        assert entry["name"].strip(), grid_id
+        # Gujarat's bounding box; a swapped lat/lng or a same-name town
+        # elsewhere in India lands outside it
+        assert 20.0 <= entry["lat"] <= 24.8 and 68.0 <= entry["lng"] <= 74.6, grid_id
+        assert entry["precision"] in {"landmark", "neighbourhood", "town"}, grid_id
+
+
 def test_a_re_synced_camera_keeps_its_operator_set_ai_flags(db_session):
     """A re-sync doesn't turn AI back on for a camera an operator switched
     off; only the create branch sets the flags."""
